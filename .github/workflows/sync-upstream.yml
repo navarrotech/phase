@@ -1,0 +1,61 @@
+name: Sync main with upstream
+
+# Keeps navarrotech/phase@main byte-identical to phase-rs/phase@main.
+#
+# The sync is strictly fast-forward: the fork's main is only ever moved to a
+# commit that already contains it. Work lives on feature branches, never on
+# main, so this branch (fork-automation) is the fork's default branch and
+# holds nothing but this workflow. GitHub only schedules workflows from the
+# default branch, which is why the automation cannot live on main itself.
+
+on:
+  schedule:
+    # Mondays at 07:17 UTC. Off-the-hour to avoid GitHub's top-of-hour backlog.
+    - cron: '17 7 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+
+jobs:
+  fast-forward:
+    name: Fast-forward main
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      FORK_REPO: ${{ github.repository }}
+      UPSTREAM_REPO: phase-rs/phase
+      BRANCH: main
+    steps:
+      # No checkout: forks share an object store with their parent on GitHub,
+      # so moving the ref is a two-call API operation and needs no clone.
+      - name: Fast-forward ${{ github.repository }}@main to phase-rs/phase@main
+        run: |
+          set -euo pipefail
+
+          head=$(gh api "repos/$UPSTREAM_REPO/commits/$BRANCH" --jq .sha)
+          status=$(gh api "repos/$FORK_REPO/compare/$BRANCH...${UPSTREAM_REPO%%/*}:$BRANCH" --jq .status)
+
+          case "$status" in
+            identical)
+              summary="Already in sync at \`$head\`."
+              ;;
+            behind)
+              # force=false makes GitHub reject any non-fast-forward update, so
+              # an unexpected commit on the fork's main can never be discarded
+              # here — the job fails instead.
+              gh api -X PATCH "repos/$FORK_REPO/git/refs/heads/$BRANCH" \
+                -f sha="$head" -F force=false >/dev/null
+              summary="Fast-forwarded \`$BRANCH\` to \`$head\`."
+              ;;
+            *)
+              echo "::error::$FORK_REPO@$BRANCH is '$status' relative to $UPSTREAM_REPO@$BRANCH. Refusing to rewrite it; reset the branch by hand."
+              exit 1
+              ;;
+          esac
+
+          echo "$summary"
+          echo "$summary" >> "$GITHUB_STEP_SUMMARY"
