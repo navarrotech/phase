@@ -248,5 +248,25 @@
       "preferBorderless": "Prefer Borderless",
       "preferExtended": "Prefer Extended Art"
     }
+  },
+  "reasoningOpponent": {
+    "title": "Reasoning Opponent",
+    "description": "Play against a Claude model instead of the built-in AI. It sees your opponent's deck in full and picks from the moves the engine says are legal, so it can play well but never illegally.",
+    "costNote": "Requests are billed to your own Anthropic account. The engine still answers routine decisions itself, so only real choices reach the model.",
+    "signInFirst": "Sign in under Cloud Sync first — the credential is stored on your account.",
+    "inputLabel": "Anthropic credential",
+    "inputHint": "An API key from console.anthropic.com, or the token printed by `claude setup-token`. It is encrypted before it is stored and never leaves your account.",
+    "save": "Save credential",
+    "remove": "Remove credential",
+    "kind": {
+      "api_key": "API key",
+      "oauth_token": "Setup token"
+    }
+  },
+  "llmOpponent": {
+    "errors": {
+      "signedOut": "Sign in first to store a credential.",
+      "sealFailed": "Could not secure the credential. Try again."
+    }
   }
 }

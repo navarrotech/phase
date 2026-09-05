@@ -10,6 +10,7 @@ import type {
   GameAction,
   GameState,
   LegalActionsResult,
+  LlmDecisionResponse,
   MatchConfig,
   ObjectId,
   PersistedGameState,
@@ -452,6 +453,33 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
       // The `state` field needs the same client-side unwrap as `getFilteredState`
       // to normalize serde-wasm-bindgen oddities (Map-as-Object conversion etc).
       return { ...wrapped, state: unwrapClientGameState(wrapped.state) };
+    } catch (err) {
+      throw await classifyEngineErrorAsync(err, this.takePanic);
+    }
+  }
+
+  /**
+   * Ask the engine whether the pending decision is worth an external reasoner.
+   *
+   * The adapter forwards the verdict untouched: escalation is an engine policy,
+   * and re-deciding it here would put game logic in the transport layer.
+   */
+  async getLlmDecisionBrief(playerId: number): Promise<LlmDecisionResponse | null> {
+    this.assertInitialized();
+    try {
+      if (this.engine) return await this.engine.getLlmDecisionBrief(playerId);
+      return await this.fallback!.getLlmDecisionBrief(playerId);
+    } catch (err) {
+      throw await classifyEngineErrorAsync(err, this.takePanic);
+    }
+  }
+
+  /** The seat's decklist as the engine knows it — see `get_deck_card_names`. */
+  async getDeckCardNames(playerId: number): Promise<string[]> {
+    this.assertInitialized();
+    try {
+      if (this.engine) return await this.engine.getDeckCardNames(playerId);
+      return await this.fallback!.getDeckCardNames(playerId);
     } catch (err) {
       throw await classifyEngineErrorAsync(err, this.takePanic);
     }
@@ -1080,6 +1108,8 @@ interface MainThreadFallback {
   getCardFaceData(cardName: string): Promise<unknown>;
   getCardParseDetails(cardName: string): Promise<unknown>;
   getCardRulings(cardName: string): Promise<unknown>;
+  getLlmDecisionBrief(playerId: number): Promise<LlmDecisionResponse | null>;
+  getDeckCardNames(playerId: number): Promise<string[]>;
 }
 
 /**
@@ -1299,5 +1329,11 @@ async function createMainThreadFallback(): Promise<MainThreadFallback> {
 
     getCardRulings: (cardName: string) =>
       enqueue(() => wasm.get_card_rulings(cardName)),
+
+    getLlmDecisionBrief: (playerId: number) =>
+      enqueue(() => wasm.get_llm_decision_brief(playerId) as LlmDecisionResponse | null),
+
+    getDeckCardNames: (playerId: number) =>
+      enqueue(() => (wasm.get_deck_card_names(playerId) as string[] | null) ?? []),
   };
 }

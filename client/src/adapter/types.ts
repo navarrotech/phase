@@ -3849,6 +3849,59 @@ export interface AiActionProposal {
   action: GameAction;
 }
 
+/**
+ * The engine's verdict on whether a pending decision is worth routing to an
+ * external reasoner, and the brief describing it when it is.
+ *
+ * `defer` is the common case by design — the engine declines to escalate
+ * priority passes, mana bookkeeping, and forced single-option prompts. A
+ * deferral is a routing answer, not permission to leave the prompt unanswered:
+ * the caller must fall back to `getAiActionProposal`.
+ */
+export type LlmDecisionResponse =
+  | { verdict: "defer"; reason: LlmDeferReason }
+  | {
+      verdict: "consult";
+      /** Same registry as `AiActionProposal.token`; any state change voids it. */
+      token: string;
+      semanticOwner: PlayerId;
+      actor: PlayerId;
+      brief: LlmDecisionBrief;
+    };
+
+export type LlmDeferReason =
+  | "noCandidates"
+  | "singleCandidate"
+  | "mechanicalPriority"
+  | "mechanicalPayment";
+
+/**
+ * Engine-authored projection of one decision. The frontend forwards this
+ * verbatim and never derives from it — every field here is already the engine's
+ * answer, and re-interpreting any of it in the client would be game logic in
+ * the display layer.
+ */
+export interface LlmDecisionBrief {
+  semanticOwner: PlayerId;
+  authorizedActor: PlayerId;
+  turnNumber: number;
+  activePlayer: PlayerId;
+  phase: string;
+  prompt: string;
+  promptPayload: unknown;
+  players: unknown[];
+  stack: unknown[];
+  combat: unknown;
+  candidates: LlmCandidate[];
+}
+
+/** One legal action, addressed by the index the reasoner returns. */
+export interface LlmCandidate {
+  index: number;
+  label: string;
+  action: GameAction;
+}
+
 /** Local-only explanation bound to an opaque AI proposal token. */
 export interface AiDecisionDiagnosticReceipt {
   semanticOwner: PlayerId;
@@ -3933,6 +3986,15 @@ export interface EngineAdapter {
   getSnapshot(): Promise<EngineSnapshot>;
   /** Returns an opaque, exact member of the current engine-issued decision domain. */
   getAiActionProposal?(difficulty: string, playerId: number): Promise<AiActionProposal | null> | AiActionProposal | null;
+  /**
+   * Returns the engine's escalation verdict for the pending decision, with a
+   * brief when it judges the decision worth an external reasoner. Transports
+   * without a local engine omit this capability, which disables LLM seats
+   * rather than degrading them silently.
+   */
+  getLlmDecisionBrief?(playerId: number): Promise<LlmDecisionResponse | null> | LlmDecisionResponse | null;
+  /** The seat's decklist as the engine knows it, for the reasoner's static context. */
+  getDeckCardNames?(playerId: number): Promise<string[]> | string[];
   /** Applies a proposal only if its authority token and exact action remain current. */
   submitAiActionProposal?(proposal: AiActionProposal): Promise<AiProposalSubmission> | AiProposalSubmission;
   resolveAll?(

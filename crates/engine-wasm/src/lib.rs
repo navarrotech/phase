@@ -3012,6 +3012,82 @@ pub fn submit_ai_action_proposal(token: &str, actor: u8, action: JsValue) -> JsV
     }
 }
 
+/// Distinct card names owned by `player_id`, sorted.
+///
+/// This is the seat's decklist as the engine actually knows it — the union of
+/// every zone, so a card already drawn or discarded is still reported. It backs
+/// the static context an external reasoner is given once per game, which is why
+/// the order is sorted rather than zone order: the caller caches the rendered
+/// block upstream, and an unstable ordering would silently defeat that cache.
+#[wasm_bindgen]
+pub fn get_deck_card_names(player_id: u8) -> JsValue {
+    match with_state(|state| {
+        let owner = PlayerId(player_id);
+        let mut names: Vec<&str> = state
+            .objects
+            .values()
+            .filter(|object| object.owner == owner)
+            // Tokens are created during play and never printed in a deck
+            // (CR 111.1); including them would put a name in the decklist the
+            // player never registered.
+            .filter(|object| !object.name.is_empty())
+            .map(|object| object.name.as_str())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        to_js(&names)
+    }) {
+        Ok(value) => value,
+        Err(_) => JsValue::NULL,
+    }
+}
+
+/// Issue a decision brief for an external reasoner, or defer to the local AI.
+///
+/// Returns `{ verdict: "defer", reason }` when the engine judges the pending
+/// decision not worth an outside consult — the overwhelming majority of prompts
+/// in a real game. The caller must then take the ordinary
+/// [`get_ai_action_proposal`] path; a deferral is a routing verdict, never
+/// permission to leave a prompt unanswered.
+///
+/// Returns `{ verdict: "consult", token, semanticOwner, actor, brief }`
+/// otherwise. `brief.candidates[i].action` is submitted verbatim through
+/// [`submit_ai_action_proposal`] with this same `token`, which re-validates it
+/// against the issued contract. The reasoner therefore chooses an index and
+/// nothing more: it cannot name an action outside the engine's finite domain,
+/// and a hallucinated or tampered payload is rejected at the action boundary
+/// rather than applied.
+///
+/// The token shares the registry that every state mutation invalidates, so a
+/// brief that goes stale while the reasoner is thinking fails closed.
+#[wasm_bindgen]
+pub fn get_llm_decision_brief(player_id: u8) -> Result<JsValue, JsValue> {
+    with_state_mut(|state| {
+        engine::game::layers::flush_layers(state);
+        // Same authority rule as the local chooser: the live prompt owns
+        // semantic ownership, not the caller's seat argument.
+        let semantic_owner = ai_semantic_owner(state, PlayerId(player_id));
+        let contract = AiDecisionContract::issue(state, semantic_owner);
+        match engine::ai_support::prepare_llm_decision(state, &contract) {
+            engine::ai_support::LlmConsult::Defer { reason } => Ok(to_js(&serde_json::json!({
+                "verdict": "defer",
+                "reason": reason,
+            }))),
+            engine::ai_support::LlmConsult::Consult { brief } => {
+                let actor = contract.authorized_actor;
+                let token = AI_PROPOSALS.with(|registry| registry.borrow_mut().insert(contract));
+                Ok(to_js(&serde_json::json!({
+                    "verdict": "consult",
+                    "token": token,
+                    "semanticOwner": semantic_owner.0,
+                    "actor": actor.0,
+                    "brief": brief,
+                })))
+            }
+        }
+    })?
+}
+
 /// Batch-resolve the stack by auto-passing priority for the requesting player
 /// and delegating to the AI for opponent decisions. Runs entirely inside WASM
 /// with no JS round-trips between resolutions — collapses the O(N) priority

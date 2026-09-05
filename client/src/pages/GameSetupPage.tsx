@@ -194,9 +194,10 @@ export function GameSetupPage() {
     // every seat's engine difficulty resolves to "CEDH" (the per-seat value is
     // preserved in prefs for when cEDH is turned off).
     const cedhMode = prefs.cedhMode;
-    const aiSeats = prefSeats.map((s) => ({
-      difficulty: effectiveAiDifficulty(s.difficulty, cedhMode),
-      deckId: s.deckId === "Random" ? null : s.deckId,
+    const aiSeats = prefSeats.map((seat) => ({
+      difficulty: effectiveAiDifficulty(seat.difficulty, cedhMode),
+      deckId: seat.deckId === "Random" ? null : seat.deckId,
+      useReasoner: seat.useReasoner,
     }));
     const headDifficulty = aiSeats[0]?.difficulty ?? "Medium";
     // The native server owns a fresh AI session and v1 deliberately has no

@@ -47,6 +47,8 @@ import init, {
   get_card_face_data,
   get_card_parse_details,
   get_card_rulings,
+  get_llm_decision_brief,
+  get_deck_card_names,
 } from "@wasm/engine";
 
 import type { AiActionProposal, GameAction } from "./types";
@@ -89,6 +91,8 @@ type EngineRequest =
   | { type: "getLegalActionsForViewer"; id: number; viewerId: number }
   | { type: "getViewerSnapshot"; id: number; viewerId: number }
   | { type: "getAiActionProposal"; id: number; difficulty: string; playerId: number }
+  | { type: "getLlmDecisionBrief"; id: number; playerId: number }
+  | { type: "getDeckCardNames"; id: number; playerId: number }
   | { type: "getAiActionProposalWithDiagnostics"; id: number; difficulty: string; playerId: number }
   | { type: "getAiTacticalActionProposal"; id: number; difficulty: string; playerId: number }
   | { type: "getAiTacticalActionProposalWithDiagnostics"; id: number; difficulty: string; playerId: number }
@@ -415,6 +419,16 @@ self.onmessage = async (e: MessageEvent<EngineRequest>) => {
       case "getAiActionProposal": {
         const proposal = get_ai_action_proposal(msg.difficulty, msg.playerId);
         result(msg.id, proposal ?? null);
+        break;
+      }
+
+      case "getLlmDecisionBrief": {
+        result(msg.id, get_llm_decision_brief(msg.playerId) ?? null);
+        break;
+      }
+
+      case "getDeckCardNames": {
+        result(msg.id, get_deck_card_names(msg.playerId) ?? []);
         break;
       }
 

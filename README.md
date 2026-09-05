@@ -56,6 +56,7 @@ I'm not trying to make money off this. There are no ads. I'm just a dude who lik
 - **Rules engine** — Turns, priority, stack, combat, state-based actions, layers, triggers, replacement effects
 - **34,300+ cards** — Parsed from MTGJSON with format support (Commander, Modern, Pioneer, Standard, and more)
 - **AI opponent** — Per-card decision logic, game tree search, and evaluation heuristics
+- **Reasoning opponent** — Hand any AI seat to a Claude model on your own API key; it picks from the engine's legal moves, so it plays well but never illegally ([docs](docs/llm-opponent.md))
 - **Game UI** — Battlefield, hand, stack, targeting overlays, mana payment, animations, and ambient audio
 - **Multiplayer** — WebSocket server with hidden information, lobby system, and WebRTC peer-to-peer
 - **Metagame feeds** — Automated scraping of top decks from MTGGoldfish, updated daily

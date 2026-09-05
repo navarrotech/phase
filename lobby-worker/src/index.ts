@@ -1,5 +1,8 @@
 import { LobbyDO } from "./lobby-do";
 import { handleImportDeck, type ImportDeckEnv } from "./import-deck";
+import { handleLlmCredential } from "./llm-credential";
+import { handleLlmDecide } from "./llm-decide";
+import { type LlmEnv } from "./llm-session";
 import { handleTurnCredentials, type TurnEnv } from "./turn";
 import { sanitizeTelemetryBatch, toDataPoint } from "./telemetry";
 
@@ -7,7 +10,7 @@ import { sanitizeTelemetryBatch, toDataPoint } from "./telemetry";
 // instantiate it for the binding declared in wrangler.toml.
 export { LobbyDO };
 
-interface Env extends TurnEnv, ImportDeckEnv {
+interface Env extends TurnEnv, ImportDeckEnv, LlmEnv {
   LOBBY: DurableObjectNamespace;
   // Analytics Engine binding for client telemetry. Optional so deploys without
   // the binding keep working — ingest just drops the writes.
@@ -80,6 +83,17 @@ export default {
     // catch-all so it never touches the lobby DO. Write-only + fire-and-forget.
     if (url.pathname === "/telemetry") {
       return handleTelemetry(request, env);
+    }
+
+    // LLM opponent. Both routes require a Supabase session and hold no state:
+    // /llm/credential seals a player's own model API key so the database only
+    // ever stores ciphertext, and /llm/decide unseals it for the duration of
+    // one upstream call to pick an action from an engine-issued candidate list.
+    if (url.pathname === "/llm/credential") {
+      return handleLlmCredential(request, env);
+    }
+    if (url.pathname === "/llm/decide") {
+      return handleLlmDecide(request, env);
     }
 
     // Single global lobby: every other request routes to the one DO instance

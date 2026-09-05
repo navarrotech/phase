@@ -25,7 +25,7 @@ describe("preferencesStore", () => {
         musicMuted: false,
         masterMuted: false,
         multiplayerBoardLayout: "focused",
-        aiSeats: [{ difficulty: "Medium", deckId: "Random" }],
+        aiSeats: [{ difficulty: "Medium", deckId: "Random", useReasoner: false }],
         aiBracketFilter: [],
       });
     });
@@ -41,7 +41,9 @@ describe("preferencesStore", () => {
     expect(state.logDefaultState).toBe("closed");
     expect(state.boardBackground).toBe("auto-wubrg");
     expect(state.multiplayerBoardLayout).toBe("focused");
-    expect(state.aiSeats).toEqual([{ difficulty: "Medium", deckId: "Random" }]);
+    expect(state.aiSeats).toEqual([
+      { difficulty: "Medium", deckId: "Random", useReasoner: false },
+    ]);
     expect(state.priorityPassingMode).toBe("Standard");
   });
 
@@ -339,7 +341,11 @@ describe("preferencesStore", () => {
     });
 
     const state = usePreferencesStore.getState();
-    expect(state.aiSeats).toEqual([{ difficulty: "Hard", deckId: "saved:Dimir Control" }]);
+    // A migrated legacy seat keeps the built-in AI: these prefs predate the
+    // reasoner seat, so there is no stored intent to opt into it.
+    expect(state.aiSeats).toEqual([
+      { difficulty: "Hard", deckId: "saved:Dimir Control", useReasoner: false },
+    ]);
     expect(state.cardSize).toBe("large");
     // Legacy flat keys must not leak onto the state object.
     expect((state as unknown as { aiDifficulty?: unknown }).aiDifficulty).toBeUndefined();
@@ -365,8 +371,8 @@ describe("preferencesStore", () => {
     });
 
     expect(usePreferencesStore.getState().aiSeats).toEqual([
-      { difficulty: "Easy", deckId: "Random" },
-      { difficulty: "Hard", deckId: "saved:Dimir Control" },
+      { difficulty: "Easy", deckId: "Random", useReasoner: false },
+      { difficulty: "Hard", deckId: "saved:Dimir Control", useReasoner: false },
     ]);
   });
 

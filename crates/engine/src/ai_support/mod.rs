@@ -4,6 +4,7 @@ mod context;
 mod copy;
 mod evoke;
 pub mod filter;
+pub mod llm_brief;
 mod payment_continuation;
 mod prospective_mana;
 mod shortcut_efficacy;
@@ -56,6 +57,9 @@ pub use evoke::{
 };
 pub use filter::{
     BasicLegalityFilter, CandidateFilter, FilterCost, FilterPipeline, SimulationFilter,
+};
+pub use llm_brief::{
+    describe_action, prepare_llm_decision, CandidateBrief, DecisionBrief, DeferReason, LlmConsult,
 };
 pub use payment_continuation::{
     classify_payment_continuation, witness_payment_continuation, AcceptedPaymentSuccessor,

@@ -7,6 +7,7 @@ import { AI_DIFFICULTIES, type AIDifficulty } from "../../constants/ai";
 import type { AiDeckCandidate } from "../../services/aiDeckCatalog";
 import { filterByBracket, useAiDeckCatalog } from "../../services/aiDeckCatalog";
 import { CEDH_BRACKET } from "../../services/cedhLock";
+import { isLlmOpponentAvailable } from "../../services/llmOpponent/credentials";
 import { isCommanderFamilyFormat } from "../../types/bracket";
 import {
   AI_DECK_RANDOM,
@@ -71,6 +72,11 @@ export function AiOpponentConfig({
   const setCedhMode = usePreferencesStore((s) => s.setCedhMode);
   const setAiSeatDifficulty = usePreferencesStore((s) => s.setAiSeatDifficulty);
   const setAiSeatDeckId = usePreferencesStore((s) => s.setAiSeatDeckId);
+  const setAiSeatUseReasoner = usePreferencesStore((s) => s.setAiSeatUseReasoner);
+  // Build-time capability, not user state: a deployment without Supabase has
+  // nowhere to keep a credential, so the toggle is hidden rather than shown
+  // and then failing.
+  const reasonerAvailable = isLlmOpponentAvailable();
   const ensureAiSeatCount = usePreferencesStore((s) => s.ensureAiSeatCount);
   const archetypeFilter = usePreferencesStore((s) => s.aiArchetypeFilter);
   const setArchetypeFilter = usePreferencesStore((s) => s.setAiArchetypeFilter);
@@ -203,7 +209,9 @@ export function AiOpponentConfig({
             collapsible={isMulti}
             onToggle={() => setExpandedIndex((cur) => (cur === i ? null : i))}
             onDeckChange={(id) => setAiSeatDeckId(i, id)}
-            onDifficultyChange={(d) => setAiSeatDifficulty(i, d)}
+            onDifficultyChange={(difficulty) => setAiSeatDifficulty(i, difficulty)}
+            reasonerAvailable={reasonerAvailable}
+            onUseReasonerChange={(useReasoner) => setAiSeatUseReasoner(i, useReasoner)}
           />
         ))}
       </div>
@@ -281,7 +289,7 @@ export function AiOpponentConfig({
 
 interface AiSeatPanelProps {
   index: number;
-  seat: { difficulty: AIDifficulty; deckId: AiDeckSelection };
+  seat: { difficulty: AIDifficulty; deckId: AiDeckSelection; useReasoner: boolean };
   /** Table-wide cEDH mode. When on, the per-seat difficulty is overridden by
    *  cEDH, so the dropdown is disabled and badged (the remembered value is kept
    *  for when cEDH is turned back off). */
@@ -295,7 +303,10 @@ interface AiSeatPanelProps {
   collapsible: boolean;
   onToggle: () => void;
   onDeckChange: (name: AiDeckSelection) => void;
-  onDifficultyChange: (d: AIDifficulty) => void;
+  onDifficultyChange: (difficulty: AIDifficulty) => void;
+  /** False when this build has no Supabase project to store a credential in. */
+  reasonerAvailable: boolean;
+  onUseReasonerChange: (useReasoner: boolean) => void;
 }
 
 function AiSeatPanel({
@@ -310,6 +321,8 @@ function AiSeatPanel({
   onToggle,
   onDeckChange,
   onDifficultyChange,
+  reasonerAvailable,
+  onUseReasonerChange,
 }: AiSeatPanelProps) {
   const { t } = useTranslation("menu");
   const isRandom = seat.deckId === AI_DECK_RANDOM;
@@ -335,9 +348,11 @@ function AiSeatPanel({
   const summaryDeck = isRandom
     ? t("aiOpponent.deckRandomCount", { count: filteredDecks.length })
     : (selectedCandidate?.name ?? t("aiOpponent.deckRandom"));
-  const summaryDifficulty = cedhMode
-    ? t("aiOpponent.cedhToggle.badge")
-    : t(`aiDifficulty.levels.${seat.difficulty}`);
+  const summaryDifficulty = seat.useReasoner
+    ? t("aiOpponent.reasoner.badge")
+    : cedhMode
+      ? t("aiOpponent.cedhToggle.badge")
+      : t(`aiDifficulty.levels.${seat.difficulty}`);
 
   const formatDeckLabel = (candidate: AiDeckCandidate): string => {
     const suffix = [sourceLabel(candidate), candidate.archetype, candidate.coveragePct != null ? `${candidate.coveragePct}%` : null]
@@ -415,6 +430,21 @@ function AiSeatPanel({
           )}
         </div>
       </label>
+
+      {reasonerAvailable && (
+        <label className="flex cursor-pointer items-start gap-2">
+          <input
+            type="checkbox"
+            checked={seat.useReasoner}
+            onChange={(event) => onUseReasonerChange(event.target.checked)}
+            className="mt-0.5 h-4 w-4 flex-shrink-0 accent-violet-500"
+          />
+          <span className="flex flex-col gap-0.5">
+            <span className="text-xs text-slate-200">{t("aiOpponent.reasoner.label")}</span>
+            <span className="text-[10px] text-slate-500">{t("aiOpponent.reasoner.hint")}</span>
+          </span>
+        </label>
+      )}
     </div>
   );
 

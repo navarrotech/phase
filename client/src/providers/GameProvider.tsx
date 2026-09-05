@@ -100,6 +100,9 @@ function resolveAiSeatBindings(
   return Array.from({ length: opponentCount }, (_, i) => ({
     playerId: i + 1,
     difficulty: snapshot?.[i]?.difficulty ?? fallback,
+    // Absent on games saved before reasoner seats existed, which correctly
+    // reads as the built-in AI.
+    useReasoner: snapshot?.[i]?.useReasoner ?? false,
   }));
 }
 

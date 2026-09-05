@@ -93,6 +93,23 @@ ALLOWED_ORIGINS = "*"
 # Until both TURN_KEY_ID and the secret are set, /turn-credentials returns 503
 # and the client falls back to STUN-only (relay disabled for symmetric NAT).
 
+# --- Reasoning opponent (/llm/credential, /llm/decide) ---
+# Both of these are PUBLIC values: the Worker calls Supabase's /auth/v1/user to
+# verify a caller's session, and Row-Level Security is the actual access
+# control. Point them at the same project supabase/schema.sql was applied to.
+# SUPABASE_URL = "https://<project>.supabase.co"
+# SUPABASE_ANON_KEY = "sb_publishable_…"
+#
+# The sealing key is a SECRET — never put it here. Generate and set it with:
+#   head -c 32 /dev/urandom | base64 | npx wrangler secret put LLM_SEAL_KEY
+# It encrypts each player's own model API credential (AES-256-GCM, bound to
+# their account id) so the database only ever holds ciphertext. Rotating it
+# invalidates every stored credential and users re-enter theirs — there is
+# deliberately no key-id envelope, since keeping the retired key available
+# would defeat the point of rotating. Until it is set, /llm/credential returns
+# 503 and every AI seat plays with the built-in AI.
+# See docs/llm-opponent.md.
+
 # Test first on the automatic *.workers.dev URL (no config needed — just
 # `wrangler deploy`). When ready to serve from your own domain (the phase-rs.dev
 # zone is already on Cloudflare), uncomment this: `custom_domain = true` makes

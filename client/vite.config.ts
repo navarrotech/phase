@@ -437,6 +437,12 @@ export default defineConfig(({ mode }) => ({
         target: process.env.VITE_IMPORT_DECK_PROXY ?? "http://localhost:8787",
         changeOrigin: true,
       },
+      // Same arrangement for the reasoning-opponent routes: relative in dev,
+      // absolute (VITE_LLM_API_URL) in the production build.
+      "/llm": {
+        target: process.env.VITE_IMPORT_DECK_PROXY ?? "http://localhost:8787",
+        changeOrigin: true,
+      },
     },
   },
   build: {

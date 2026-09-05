@@ -244,5 +244,25 @@
       "preferBorderless": "Preferir sin marco",
       "preferExtended": "Preferir ilustración extendida"
     }
+  },
+  "reasoningOpponent": {
+    "title": "Oponente razonador",
+    "description": "Juega contra un modelo Claude en lugar de la IA integrada. Ve su mazo por completo y elige entre las jugadas que el motor declara legales, así que puede jugar bien pero nunca de forma ilegal.",
+    "costNote": "Las solicitudes se cobran a tu propia cuenta de Anthropic. El motor sigue resolviendo por sí mismo las decisiones rutinarias, de modo que solo las decisiones reales llegan al modelo.",
+    "signInFirst": "Inicia sesión primero en Sincronización en la nube: la credencial se guarda en tu cuenta.",
+    "inputLabel": "Credencial de Anthropic",
+    "inputHint": "Una clave de API de console.anthropic.com, o el token que imprime `claude setup-token`. Se cifra antes de guardarse y nunca sale de tu cuenta.",
+    "save": "Guardar credencial",
+    "remove": "Eliminar credencial",
+    "kind": {
+      "api_key": "Clave de API",
+      "oauth_token": "Token de configuración"
+    }
+  },
+  "llmOpponent": {
+    "errors": {
+      "signedOut": "Inicia sesión primero para guardar una credencial.",
+      "sealFailed": "No se pudo proteger la credencial. Inténtalo de nuevo."
+    }
   }
 }

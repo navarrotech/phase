@@ -1,7 +1,10 @@
 import { AI_BASE_DELAY_MS, AI_DELAY_VARIANCE_MS, PLAYER_ID } from "../../constants/game";
 import { useGameStore } from "../../stores/gameStore";
-import type { AiActionProposal, GameAction, GameState, WaitingFor } from "../../adapter/types";
+import type { AiActionProposal, EngineAdapter, GameAction, GameState, WaitingFor } from "../../adapter/types";
 import { AdapterError, AdapterErrorCode } from "../../adapter/types";
+import type { SealedLlmCredential } from "../../services/llmOpponent/credentials";
+import { loadSealedLlmCredential } from "../../services/llmOpponent/credentials";
+import { buildDeckContext, requestLlmChoice } from "../../services/llmOpponent/decide";
 import { pressureMultiplier } from "../../utils/stackPressure";
 import { effectiveStackPressure } from "../../utils/stackThroughput";
 import { debugLog } from "../debugLog";
@@ -23,6 +26,23 @@ const MAX_TOTAL_FAILURES = 6;
 export interface AISeatBinding {
   playerId: number;
   difficulty: string;
+  /**
+   * Play this seat with an external reasoner rather than the built-in AI.
+   *
+   * Deliberately NOT a value of `difficulty`. That field is the engine's
+   * `AiDifficulty` contract, and widening it here would repeat the mistake the
+   * cEDH note in `constants/ai.ts` documents: a property that is not a skill
+   * level smuggled in as one. A reasoner seat still carries a difficulty,
+   * because the engine's own chooser answers every decision it declines to
+   * escalate — which is most of them.
+   */
+  useReasoner?: boolean;
+}
+
+/** Per-seat material the reasoner path needs, resolved once per game. */
+interface LlmSeatRuntime {
+  credential: SealedLlmCredential;
+  deckContext: string;
 }
 
 export interface AIControllerConfig {
@@ -98,8 +118,88 @@ export function createAIController(config: AIControllerConfig): AIController {
   let lastDispatchError: string | null = null;
   const MAX_CONSECUTIVE_FAILURES = 3;
 
-  const difficultyByPlayerId = new Map(config.seats.map((s) => [s.playerId, s.difficulty]));
+  const difficultyByPlayerId = new Map(config.seats.map((seat) => [seat.playerId, seat.difficulty]));
   const aiPlayerIds = new Set(difficultyByPlayerId.keys());
+  const reasonerPlayerIds = new Set(
+    config.seats.filter((seat) => seat.useReasoner).map((seat) => seat.playerId),
+  );
+  // Resolved lazily and memoized per seat: the credential read and the deck
+  // context build are both once-per-game costs, and paying them on the first
+  // decision keeps controller construction synchronous.
+  const llmRuntimeByPlayerId = new Map<number, Promise<LlmSeatRuntime | null>>();
+
+  function ensureLlmRuntime(
+    adapter: EngineAdapter,
+    playerId: number,
+  ): Promise<LlmSeatRuntime | null> {
+    const cached = llmRuntimeByPlayerId.get(playerId);
+    if (cached) return cached;
+
+    const pending = (async () => {
+      const credential = await loadSealedLlmCredential();
+      if (!credential) {
+        debugLog(`No model credential stored; player ${playerId + 1} falls back to the built-in AI`, "warn");
+        return null;
+      }
+      // The decklist is the engine's answer, not a snapshot of what the setup
+      // page picked: a resumed game has no setup page to ask.
+      const deckCardNames = (await adapter.getDeckCardNames?.(playerId)) ?? [];
+      return { credential, deckContext: await buildDeckContext(deckCardNames) };
+    })().catch((error) => {
+      debugLog(`Could not prepare the reasoning opponent for player ${playerId + 1}: ${error}`, "warn");
+      return null;
+    });
+
+    llmRuntimeByPlayerId.set(playerId, pending);
+    return pending;
+  }
+
+  /**
+   * Produce one engine-bounded proposal for `playerId`.
+   *
+   * A reasoner-driven seat gets first refusal, but only when the ENGINE judges
+   * the decision worth escalating — that verdict is `getLlmDecisionBrief`'s, not
+   * this function's. Every other path, including every failure of the reasoner
+   * path, lands on the ordinary local chooser. The reasoner can therefore make
+   * the seat play better or leave it exactly as it was, and nothing in between:
+   * it never blocks a decision from being made.
+   */
+  async function resolveProposal(
+    adapter: EngineAdapter,
+    difficulty: string,
+    playerId: number,
+  ): Promise<AiActionProposal | null> {
+    const localProposal = () => adapter.getAiActionProposal?.(difficulty, playerId) ?? null;
+
+    if (!reasonerPlayerIds.has(playerId) || !adapter.getLlmDecisionBrief) {
+      return localProposal();
+    }
+
+    const runtime = await ensureLlmRuntime(adapter, playerId);
+    if (!runtime) return localProposal();
+
+    const decision = await adapter.getLlmDecisionBrief(playerId);
+    if (decision?.verdict !== "consult") {
+      return localProposal();
+    }
+
+    const choice = await requestLlmChoice(runtime.credential, runtime.deckContext, decision.brief);
+    if (!choice) return localProposal();
+
+    debugLog(
+      `Player ${playerId + 1} reasoned: ${choice.candidate.label}${choice.reasoning ? ` — ${choice.reasoning}` : ""}`,
+      "info",
+    );
+    // The token and actor come from the engine's own contract; only the index
+    // came from outside. `submit_ai_action_proposal` re-validates the pair, so
+    // a tampered or stale answer is refused at the action boundary.
+    return {
+      token: decision.token,
+      semanticOwner: decision.semanticOwner,
+      actor: decision.actor,
+      action: choice.candidate.action,
+    };
+  }
 
   /**
    * Stable identity key for a WaitingFor — type + player so Priority{0} ≠ Priority{1}.
@@ -294,12 +394,13 @@ export function createAIController(config: AIControllerConfig): AIController {
     const waitingForType = gameState?.waiting_for?.type;
     const scheduledWaitingFor = gameState?.waiting_for ?? null;
     if (!scheduledWaitingFor) return;
-    const getProposal = adapter?.getAiActionProposal;
-    if (!getProposal) return;
+    if (!adapter?.getAiActionProposal) return;
     const attempt = beginAttempt(scheduledWaitingFor, playerId);
-    const proposalPromise: Promise<AiActionProposal | null> = Promise.resolve(
-      getProposal.call(adapter, difficulty, playerId),
-    );
+    // A reasoner-driven seat resolves through the same promise as an ordinary
+    // one, so the delay below still overlaps computation rather than adding to
+    // it — which matters far more when the computation is a network round-trip.
+    const proposalPromise: Promise<AiActionProposal | null> =
+      resolveProposal(adapter, difficulty, playerId);
     // Suppress unhandled-rejection warnings if stop() cancels the timeout
     // before it fires and nothing else awaits this promise.
     proposalPromise.catch(() => {});
@@ -352,9 +453,8 @@ export function createAIController(config: AIControllerConfig): AIController {
           try {
             if (!isAttemptCurrent(attempt)) return;
             const retryAdapter = useGameStore.getState().adapter;
-            const retryGetProposal = retryAdapter?.getAiActionProposal;
-            if (!retryGetProposal) return;
-            proposal = await retryGetProposal.call(retryAdapter, difficulty, playerId);
+            if (!retryAdapter?.getAiActionProposal) return;
+            proposal = await resolveProposal(retryAdapter, difficulty, playerId);
           } catch (retryErr) {
             if (!isAttemptCurrent(attempt)) return;
             if (isEnginePanic(retryErr)) {

@@ -47,6 +47,7 @@ import { MenuSelect } from "../ui/MenuSelect";
 import { downloadBackup, importBackupFromFile, type ImportMode } from "../../services/backup.ts";
 import { isTauri } from "../../services/platform.ts";
 import { useCloudSyncStore } from "../../stores/cloudSyncStore.ts";
+import { ReasoningOpponentSection } from "./ReasoningOpponentSection";
 import { DiscordIcon, GoogleIcon } from "../ui/ProviderIcons";
 
 export type SettingsHighlight = "board-background";
@@ -776,6 +777,7 @@ export function PreferencesModal({
               {activeTab === "data" && (
         <>
           <CloudSyncSection />
+          <ReasoningOpponentSection wrapper={SettingsSection} />
           <DataSection />
         </>
       )}

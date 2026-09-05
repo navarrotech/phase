@@ -39,6 +39,15 @@ export const DEFAULT_AI_COVERAGE_FLOOR = 90;
 export interface AiSeatPref {
   difficulty: AIDifficulty;
   deckId: AiDeckSelection;
+  /**
+   * Play this seat with an external reasoning model instead of the built-in AI.
+   *
+   * Separate from `difficulty` on purpose: that field is the engine's
+   * `AiDifficulty` contract and still applies here, because the engine declines
+   * to escalate most decisions and its own chooser answers those. This flag
+   * selects who answers the rest.
+   */
+  useReasoner: boolean;
 }
 
 export type ArtChainEntry =
@@ -234,7 +243,7 @@ function cloneFlexLayout(config: FlexLayoutConfig): FlexLayoutConfig {
 }
 
 function defaultAiSeat(): AiSeatPref {
-  return { difficulty: DEFAULT_AI_DIFFICULTY, deckId: AI_DECK_RANDOM };
+  return { difficulty: DEFAULT_AI_DIFFICULTY, deckId: AI_DECK_RANDOM, useReasoner: false };
 }
 
 function clamp(value: number, min: number, max: number): number {
@@ -473,6 +482,7 @@ interface PreferencesActions {
   setShowCardPreviewFooter: (show: boolean) => void;
   setAiSeatDifficulty: (index: number, difficulty: AIDifficulty) => void;
   setAiSeatDeckId: (index: number, id: AiDeckSelection) => void;
+  setAiSeatUseReasoner: (index: number, useReasoner: boolean) => void;
   /** Grow or shrink `aiSeats` to `count` slots. New slots inherit defaults;
    *  shrinking truncates trailing slots. Called whenever the player count
    *  changes so the UI always has exactly `playerCount - 1` panels to render. */
@@ -556,6 +566,9 @@ function migrateAiSeat(seat: LegacyAiSeatPref): AiSeatPref {
   return {
     difficulty: seat.difficulty ?? DEFAULT_AI_DIFFICULTY,
     deckId,
+    // Predates the reasoner seat entirely; the built-in AI is the only
+    // opponent these prefs ever described.
+    useReasoner: false,
   };
 }
 
@@ -648,6 +661,16 @@ export const usePreferencesStore = create<PreferencesState & PreferencesActions>
           if (index < 0 || index >= state.aiSeats.length) return state;
           const next = state.aiSeats.slice();
           next[index] = { ...next[index], deckId };
+          return { aiSeats: next };
+        }),
+      setAiSeatUseReasoner: (index, useReasoner) =>
+        set((state) => {
+          if (index < 0 || index >= state.aiSeats.length) {
+            console.debug("setAiSeatUseReasoner ignored out-of-range index", { index });
+            return state;
+          }
+          const next = state.aiSeats.slice();
+          next[index] = { ...next[index], useReasoner };
           return { aiSeats: next };
         }),
       ensureAiSeatCount: (count) =>
@@ -785,7 +808,7 @@ export const usePreferencesStore = create<PreferencesState & PreferencesActions>
     }),
     {
       name: "phase-preferences",
-      version: 29,
+      version: 30,
       // v0 → v1: flat aiDifficulty + aiDeckName become aiSeats[0].
       // v1 → v2: discrete animationSpeed/combatPacing enums become numeric
       //          animationSpeedMultiplier/combatPacingMultiplier.
@@ -859,6 +882,7 @@ export const usePreferencesStore = create<PreferencesState & PreferencesActions>
             deckId: legacy.aiDeckName === AI_DECK_RANDOM || !legacy.aiDeckName
               ? AI_DECK_RANDOM
               : legacyAiDeckNameToId(legacy.aiDeckName),
+            useReasoner: false,
           };
           const { aiDifficulty: _d, aiDeckName: _n, ...rest } = legacy;
           void _d;
@@ -949,6 +973,17 @@ export const usePreferencesStore = create<PreferencesState & PreferencesActions>
               mode === "auto" || mode === "autoExceptSacrificialMana" || mode === "manual"
                 ? mode
                 : "auto",
+          };
+        }
+
+        if (version < 30) {
+          // `useReasoner` is new; every existing seat keeps the built-in AI.
+          const seats = (migrated as { aiSeats?: AiSeatPref[] }).aiSeats;
+          migrated = {
+            ...migrated,
+            aiSeats: Array.isArray(seats)
+              ? seats.map((seat) => ({ ...seat, useReasoner: seat.useReasoner ?? false }))
+              : [defaultAiSeat()],
           };
         }
 

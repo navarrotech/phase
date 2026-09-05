@@ -13,6 +13,7 @@ import type {
   GameAction,
   GameState,
   LegalActionsResult,
+  LlmDecisionResponse,
   MatchConfig,
   ReplayHeader,
   SubmitResult,
@@ -339,6 +340,20 @@ export class EngineWorkerClient {
     return this.request<AiActionProposal | null>(
       { type: "getAiActionProposal", difficulty, playerId },
       ENGINE_AI_TIMEOUT_MS,
+    );
+  }
+
+  async getLlmDecisionBrief(playerId: number): Promise<LlmDecisionResponse | null> {
+    return this.request<LlmDecisionResponse | null>(
+      { type: "getLlmDecisionBrief", playerId },
+      ENGINE_AI_TIMEOUT_MS,
+    );
+  }
+
+  async getDeckCardNames(playerId: number): Promise<string[]> {
+    return this.request<string[]>(
+      { type: "getDeckCardNames", playerId },
+      ENGINE_REQUEST_TIMEOUT_MS,
     );
   }
 

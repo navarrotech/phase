@@ -244,5 +244,25 @@
       "preferBorderless": "Randlos bevorzugen",
       "preferExtended": "Erweitertes Artwork bevorzugen"
     }
+  },
+  "reasoningOpponent": {
+    "title": "Denkender Gegner",
+    "description": "Spiele gegen ein Claude-Modell statt gegen die eingebaute KI. Es sieht das gegnerische Deck vollständig und wählt nur aus Zügen, die die Engine als legal ausweist — es kann also stark spielen, aber nie regelwidrig.",
+    "costNote": "Die Anfragen werden deinem eigenen Anthropic-Konto berechnet. Routineentscheidungen beantwortet die Engine weiterhin selbst, sodass nur echte Entscheidungen das Modell erreichen.",
+    "signInFirst": "Melde dich zuerst unter Cloud-Synchronisierung an — die Zugangsdaten werden in deinem Konto gespeichert.",
+    "inputLabel": "Anthropic-Zugangsdaten",
+    "inputHint": "Ein API-Schlüssel von console.anthropic.com oder das von `claude setup-token` ausgegebene Token. Es wird vor dem Speichern verschlüsselt und verlässt dein Konto nie.",
+    "save": "Zugangsdaten speichern",
+    "remove": "Zugangsdaten entfernen",
+    "kind": {
+      "api_key": "API-Schlüssel",
+      "oauth_token": "Setup-Token"
+    }
+  },
+  "llmOpponent": {
+    "errors": {
+      "signedOut": "Melde dich zuerst an, um Zugangsdaten zu speichern.",
+      "sealFailed": "Die Zugangsdaten konnten nicht gesichert werden. Versuche es erneut."
+    }
   }
 }

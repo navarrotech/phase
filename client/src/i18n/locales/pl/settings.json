@@ -244,5 +244,25 @@
       "preferBorderless": "Preferuj bez ramki",
       "preferExtended": "Preferuj grafikę rozszerzoną"
     }
+  },
+  "reasoningOpponent": {
+    "title": "Rozumujący przeciwnik",
+    "description": "Zagraj przeciwko modelowi Claude zamiast wbudowanej SI. Widzi swoją talię w całości i wybiera spośród ruchów, które silnik uznaje za legalne — może więc grać dobrze, ale nigdy niezgodnie z zasadami.",
+    "costNote": "Zapytania są rozliczane z twojego własnego konta Anthropic. Rutynowe decyzje silnik nadal rozstrzyga sam, więc do modelu trafiają tylko prawdziwe wybory.",
+    "signInFirst": "Najpierw zaloguj się w Synchronizacji w chmurze — dane logowania są przechowywane na twoim koncie.",
+    "inputLabel": "Poświadczenie Anthropic",
+    "inputHint": "Klucz API z console.anthropic.com albo token wypisany przez `claude setup-token`. Jest szyfrowany przed zapisaniem i nigdy nie opuszcza twojego konta.",
+    "save": "Zapisz poświadczenie",
+    "remove": "Usuń poświadczenie",
+    "kind": {
+      "api_key": "Klucz API",
+      "oauth_token": "Token konfiguracyjny"
+    }
+  },
+  "llmOpponent": {
+    "errors": {
+      "signedOut": "Zaloguj się, aby zapisać poświadczenie.",
+      "sealFailed": "Nie udało się zabezpieczyć poświadczenia. Spróbuj ponownie."
+    }
   }
 }

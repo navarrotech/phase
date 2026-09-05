@@ -244,5 +244,25 @@
       "preferBorderless": "Préférer sans bordure",
       "preferExtended": "Préférer l'illustration étendue"
     }
+  },
+  "reasoningOpponent": {
+    "title": "Adversaire raisonneur",
+    "description": "Affrontez un modèle Claude plutôt que l'IA intégrée. Il voit son deck en entier et choisit parmi les coups que le moteur déclare légaux : il peut donc bien jouer, mais jamais tricher.",
+    "costNote": "Les requêtes sont facturées à votre propre compte Anthropic. Le moteur tranche toujours lui-même les décisions de routine, si bien que seuls les vrais choix atteignent le modèle.",
+    "signInFirst": "Connectez-vous d'abord sous Synchronisation cloud : l'identifiant est conservé sur votre compte.",
+    "inputLabel": "Identifiant Anthropic",
+    "inputHint": "Une clé d'API de console.anthropic.com, ou le jeton affiché par `claude setup-token`. Il est chiffré avant d'être stocké et ne quitte jamais votre compte.",
+    "save": "Enregistrer l'identifiant",
+    "remove": "Supprimer l'identifiant",
+    "kind": {
+      "api_key": "Clé d'API",
+      "oauth_token": "Jeton de configuration"
+    }
+  },
+  "llmOpponent": {
+    "errors": {
+      "signedOut": "Connectez-vous d'abord pour enregistrer un identifiant.",
+      "sealFailed": "Impossible de sécuriser l'identifiant. Réessayez."
+    }
   }
 }

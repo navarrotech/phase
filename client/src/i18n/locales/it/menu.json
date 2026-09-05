@@ -106,6 +106,11 @@
     "load": "Carica"
   },
   "aiOpponent": {
+    "reasoner": {
+      "label": "Avversario ragionante",
+      "hint": "Questo posto è giocato da un modello Claude con la tua chiave API. Turni più lenti, e ogni partita ti costa denaro.",
+      "badge": "Ragionante"
+    },
     "heading": "Avversario IA",
     "headingMulti": "Avversari IA ({{count}})",
     "analyzingDecks": "Analisi mazzi…",

@@ -179,6 +179,17 @@ export function get_card_parse_details(name: string): any;
 export function get_card_rulings(name: string): any;
 
 /**
+ * Distinct card names owned by `player_id`, sorted.
+ *
+ * This is the seat's decklist as the engine actually knows it — the union of
+ * every zone, so a card already drawn or discarded is still reported. It backs
+ * the static context an external reasoner is given once per game, which is why
+ * the order is sorted rather than zone order: the caller caches the rendered
+ * block upstream, and an unstable ordering would silently defeat that cache.
+ */
+export function get_deck_card_names(player_id: number): any;
+
+/**
  * Filtered-viewer variant of `get_game_state`. Runs the viewer filter
  * first (hides opponent hand/library per standard multiplayer redaction),
  * then derives views over the filtered state so the wire shape is
@@ -209,6 +220,28 @@ export function get_legal_actions_for_viewer_js(player_id: number): any;
  * Returns `{ actions: GameAction[], autoPassRecommended: boolean, spellCosts: Record<string, ManaCost> }`.
  */
 export function get_legal_actions_js(): any;
+
+/**
+ * Issue a decision brief for an external reasoner, or defer to the local AI.
+ *
+ * Returns `{ verdict: "defer", reason }` when the engine judges the pending
+ * decision not worth an outside consult — the overwhelming majority of prompts
+ * in a real game. The caller must then take the ordinary
+ * [`get_ai_action_proposal`] path; a deferral is a routing verdict, never
+ * permission to leave a prompt unanswered.
+ *
+ * Returns `{ verdict: "consult", token, semanticOwner, actor, brief }`
+ * otherwise. `brief.candidates[i].action` is submitted verbatim through
+ * [`submit_ai_action_proposal`] with this same `token`, which re-validates it
+ * against the issued contract. The reasoner therefore chooses an index and
+ * nothing more: it cannot name an action outside the engine's finite domain,
+ * and a hallucinated or tampered payload is rejected at the action boundary
+ * rather than applied.
+ *
+ * The token shares the registry that every state mutation invalidates, so a
+ * brief that goes stale while the reasoner is thinking fails closed.
+ */
+export function get_llm_decision_brief(player_id: number): any;
 
 /**
  * Current stack pressure bucket for animation pacing (Normal/Elevated/Rapid/Instant).
@@ -405,6 +438,21 @@ export function replay_length_js(): number;
  */
 export function replay_seek_js(target: number): any;
 
+/**
+ * Batch-resolve the stack by auto-passing priority for the requesting player
+ * and delegating to the AI for opponent decisions. Runs entirely inside WASM
+ * with no JS round-trips between resolutions — collapses the O(N) priority
+ * pass cycle into a single call.
+ *
+ * `requester` is the human player seat (whose "Resolve All" click initiated
+ * this). `ai_seats_json` is a JSON array of `{ playerId, difficulty }` for
+ * each AI opponent.
+ *
+ * Returns a compact `BatchResolveResult` with the final `WaitingFor` and a
+ * count of items resolved. The Resolve All UI does not animate individual
+ * events, so the WASM boundary intentionally returns empty event/log arrays
+ * instead of serializing thousands of records for pathological stacks.
+ */
 export function resolve_all(requester: number, ai_seats_json: string, max_resolutions: number): any;
 
 /**
@@ -556,8 +604,10 @@ export interface InitOutput {
     readonly get_card_face_data: (a: number, b: number) => any;
     readonly get_card_parse_details: (a: number, b: number) => any;
     readonly get_card_rulings: (a: number, b: number) => any;
+    readonly get_deck_card_names: (a: number) => any;
     readonly get_filtered_game_state: (a: number) => any;
     readonly get_legal_actions_for_viewer_js: (a: number) => any;
+    readonly get_llm_decision_brief: (a: number) => [number, number, number];
     readonly get_viewer_snapshot_js: (a: number) => any;
     readonly has_replay_recording: () => number;
     readonly initialize_game: (a: any, b: number, c: number, d: any, e: any, f: number, g: number) => any;

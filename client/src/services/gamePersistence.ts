@@ -22,6 +22,9 @@ export interface AiSeatMeta {
   difficulty: string;
   deckId?: string | null;
   deckName?: string | null;
+  /** Seat is played by an external reasoning model. Absent on games saved
+   *  before the feature existed, which read as the built-in AI. */
+  useReasoner?: boolean;
 }
 
 /**

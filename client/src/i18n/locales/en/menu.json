@@ -106,6 +106,11 @@
     "load": "Load"
   },
   "aiOpponent": {
+    "reasoner": {
+      "label": "Reasoning opponent",
+      "hint": "This seat is played by a Claude model using your own API key. Slower turns, and each game costs you money.",
+      "badge": "Reasoning"
+    },
     "heading": "AI Opponent",
     "headingMulti": "AI Opponents ({{count}})",
     "analyzingDecks": "Analyzing decks…",

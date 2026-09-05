@@ -36,10 +36,27 @@ vi.mock("../../engineRecovery", () => ({
 }));
 vi.mock("../../debugLog", () => ({ debugLog: vi.fn() }));
 
+const llmMocks = vi.hoisted(() => ({
+  loadSealedLlmCredential: vi.fn(),
+  requestLlmChoice: vi.fn(),
+  buildDeckContext: vi.fn(),
+}));
+vi.mock("../../../services/llmOpponent/credentials", () => ({
+  loadSealedLlmCredential: llmMocks.loadSealedLlmCredential,
+}));
+vi.mock("../../../services/llmOpponent/decide", () => ({
+  requestLlmChoice: llmMocks.requestLlmChoice,
+  buildDeckContext: llmMocks.buildDeckContext,
+}));
+
 let storeState: {
   gameState: GameState | null;
   waitingFor: WaitingFor | null;
-  adapter: { getAiActionProposal?: (difficulty: string, playerId: number) => Promise<AiActionProposal | null> } | null;
+  adapter: {
+    getAiActionProposal?: (difficulty: string, playerId: number) => Promise<AiActionProposal | null>;
+    getLlmDecisionBrief?: (playerId: number) => Promise<unknown>;
+    getDeckCardNames?: (playerId: number) => Promise<string[]>;
+  } | null;
   gameSessionGeneration: number;
   isResolvingAll: boolean;
 };
@@ -102,6 +119,11 @@ beforeEach(() => {
   isEnginePanic.mockReset();
   isEnginePanic.mockReturnValue(false);
   routePanic.mockReset();
+  llmMocks.loadSealedLlmCredential.mockReset();
+  llmMocks.loadSealedLlmCredential.mockResolvedValue({ sealed: "sealed-blob", kind: "api_key" });
+  llmMocks.requestLlmChoice.mockReset();
+  llmMocks.buildDeckContext.mockReset();
+  llmMocks.buildDeckContext.mockResolvedValue("deck context");
   const state = priorityState();
   storeState = {
     gameState: state,
@@ -478,6 +500,153 @@ describe("AI proposal controller", () => {
     expect(attemptStateRehydrate).not.toHaveBeenCalled();
     expect(notifyEngineLost).not.toHaveBeenCalled();
     expect(dispatchAiActionProposal).not.toHaveBeenCalled();
+    controller.dispose();
+  });
+});
+
+describe("reasoner seats", () => {
+  const CAST = { type: "CastSpell", data: { object_id: 42 } } as GameAction;
+
+  /** Adapter whose engine consults, offering `PassPriority` and `CastSpell`. */
+  function consultingAdapter(local: AiActionProposal) {
+    const getAiActionProposal = vi.fn(async () => local);
+    const getLlmDecisionBrief = vi.fn(async () => ({
+      verdict: "consult" as const,
+      token: "engine-bound",
+      semanticOwner: 1,
+      actor: 1,
+      brief: {
+        candidates: [
+          { index: 0, label: "Pass priority", action: PASS },
+          { index: 1, label: "Cast spell: Lightning Bolt", action: CAST },
+        ],
+      },
+    }));
+    const getDeckCardNames = vi.fn(async () => ["Lightning Bolt"]);
+    return { getAiActionProposal, getLlmDecisionBrief, getDeckCardNames };
+  }
+
+  it("submits the reasoner's pick paired with the engine's own token", async () => {
+    const adapter = consultingAdapter(proposal(PASS));
+    llmMocks.requestLlmChoice.mockResolvedValue({
+      candidate: { index: 1, label: "Cast spell: Lightning Bolt", action: CAST },
+      reasoning: "Bolt the blocker.",
+    });
+    dispatchAiActionProposal.mockResolvedValue({ status: "applied" });
+    storeState.adapter = adapter;
+
+    const controller = createAIController({
+      seats: [{ playerId: 1, difficulty: "Medium", useReasoner: true }],
+    });
+    controller.start();
+    await runOnce();
+
+    // The action is the candidate the reasoner chose; the token, semantic owner,
+    // and actor all come from the engine's contract, never from the model.
+    expect(dispatchAiActionProposal).toHaveBeenCalledWith({
+      token: "engine-bound",
+      semanticOwner: 1,
+      actor: 1,
+      action: CAST,
+    });
+    expect(adapter.getAiActionProposal).not.toHaveBeenCalled();
+    controller.dispose();
+  });
+
+  it("falls back to the built-in AI when the engine defers the decision", async () => {
+    const local = proposal(PASS);
+    const adapter = consultingAdapter(local);
+    adapter.getLlmDecisionBrief.mockResolvedValue({
+      verdict: "defer",
+      reason: "mechanicalPriority",
+    } as never);
+    dispatchAiActionProposal.mockResolvedValue({ status: "applied" });
+    storeState.adapter = adapter;
+
+    const controller = createAIController({
+      seats: [{ playerId: 1, difficulty: "Medium", useReasoner: true }],
+    });
+    controller.start();
+    await runOnce();
+
+    expect(llmMocks.requestLlmChoice).not.toHaveBeenCalled();
+    expect(dispatchAiActionProposal).toHaveBeenCalledWith(local);
+    controller.dispose();
+  });
+
+  it("falls back to the built-in AI when the reasoner returns no usable choice", async () => {
+    const local = proposal(PASS);
+    const adapter = consultingAdapter(local);
+    // Covers every remote failure at once: the service collapses a bad
+    // credential, a network error, a refusal, and an out-of-range index to null.
+    llmMocks.requestLlmChoice.mockResolvedValue(null);
+    dispatchAiActionProposal.mockResolvedValue({ status: "applied" });
+    storeState.adapter = adapter;
+
+    const controller = createAIController({
+      seats: [{ playerId: 1, difficulty: "Medium", useReasoner: true }],
+    });
+    controller.start();
+    await runOnce();
+
+    expect(dispatchAiActionProposal).toHaveBeenCalledWith(local);
+    controller.dispose();
+  });
+
+  it("falls back to the built-in AI when the account has no stored credential", async () => {
+    const local = proposal(PASS);
+    const adapter = consultingAdapter(local);
+    llmMocks.loadSealedLlmCredential.mockResolvedValue(null);
+    dispatchAiActionProposal.mockResolvedValue({ status: "applied" });
+    storeState.adapter = adapter;
+
+    const controller = createAIController({
+      seats: [{ playerId: 1, difficulty: "Medium", useReasoner: true }],
+    });
+    controller.start();
+    await runOnce();
+
+    expect(adapter.getLlmDecisionBrief).not.toHaveBeenCalled();
+    expect(dispatchAiActionProposal).toHaveBeenCalledWith(local);
+    controller.dispose();
+  });
+
+  it("leaves an ordinary seat entirely on the built-in AI", async () => {
+    const local = proposal(PASS);
+    const adapter = consultingAdapter(local);
+    dispatchAiActionProposal.mockResolvedValue({ status: "applied" });
+    storeState.adapter = adapter;
+
+    const controller = createAIController({ seats: [{ playerId: 1, difficulty: "Medium" }] });
+    controller.start();
+    await runOnce();
+
+    expect(adapter.getLlmDecisionBrief).not.toHaveBeenCalled();
+    expect(llmMocks.loadSealedLlmCredential).not.toHaveBeenCalled();
+    expect(dispatchAiActionProposal).toHaveBeenCalledWith(local);
+    controller.dispose();
+  });
+
+  it("resolves the credential and deck context once per seat, not once per decision", async () => {
+    const adapter = consultingAdapter(proposal(PASS));
+    llmMocks.requestLlmChoice.mockResolvedValue({
+      candidate: { index: 0, label: "Pass priority", action: PASS },
+      reasoning: "",
+    });
+    dispatchAiActionProposal.mockResolvedValue({ status: "applied" });
+    storeState.adapter = adapter;
+
+    const controller = createAIController({
+      seats: [{ playerId: 1, difficulty: "Medium", useReasoner: true }],
+    });
+    controller.start();
+    await runOnce();
+    storeSubscriber?.();
+    await runOnce();
+
+    expect(llmMocks.loadSealedLlmCredential).toHaveBeenCalledTimes(1);
+    expect(llmMocks.buildDeckContext).toHaveBeenCalledTimes(1);
+    expect(llmMocks.buildDeckContext).toHaveBeenCalledWith(["Lightning Bolt"]);
     controller.dispose();
   });
 });
