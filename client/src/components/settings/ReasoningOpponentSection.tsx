@@ -1,22 +1,20 @@
 // Settings panel for the reasoning-opponent credential.
 //
-// The credential is the player's own and is never stored in plaintext: it is
-// posted once to the lobby Worker, which seals it, and only the sealed blob is
-// kept. This component therefore never holds the value after submit, and never
-// reads one back — the summary it shows is a kind plus the last four
-// characters, which is all the server will return.
+// The credential is the player's own and stays on this device. There is no
+// account and nothing to sign in to. This component drops the plaintext from
+// its own state the moment it is stored, and never reads it back — the summary
+// it renders is a kind plus the last four characters.
 
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 
-import type { StoredLlmCredential } from "../../services/llmOpponent/credentials";
+import type { LlmCredentialSummary } from "../../services/llmOpponent/credentials";
 import {
   deleteLlmCredential,
   isLlmOpponentAvailable,
   loadLlmCredentialSummary,
   saveLlmCredential,
 } from "../../services/llmOpponent/credentials";
-import { useCloudSyncStore } from "../../stores/cloudSyncStore.ts";
 
 const BUTTON_CLASS =
   "rounded-[14px] border border-white/10 bg-white/5 px-4 py-2 text-sm font-medium text-slate-100 transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-50";
@@ -32,9 +30,8 @@ interface Props {
 export function ReasoningOpponentSection(props: Props) {
   const { t } = useTranslation("settings");
   const Wrapper = props.wrapper;
-  const identity = useCloudSyncStore((state) => state.identity);
 
-  const [stored, setStored] = useState<StoredLlmCredential | null>(null);
+  const [stored, setStored] = useState<LlmCredentialSummary | null>(null);
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -50,15 +47,9 @@ export function ReasoningOpponentSection(props: Props) {
   }, []);
 
   useEffect(() => {
-    if (!identity) {
-      setStored(null);
-      return;
-    }
     void refresh();
-  }, [identity, refresh]);
+  }, [refresh]);
 
-  // Hidden on deployments with no Supabase project — there is nowhere to keep
-  // a credential, and the built-in AI remains the opponent.
   if (!isLlmOpponentAvailable()) return null;
 
   async function onSave() {
@@ -66,13 +57,12 @@ export function ReasoningOpponentSection(props: Props) {
     setError(null);
     try {
       setStored(await saveLlmCredential(draft.trim()));
-      // Drop the plaintext from component state the moment it is sealed.
+      // Drop the plaintext from component state the moment it is stored.
       setDraft("");
     }
     catch (saveError) {
       const message = saveError instanceof Error ? saveError.message : String(saveError);
-      // The service throws either a translation key it authored or a message
-      // the Worker wrote to be shown verbatim.
+      // The service throws a translation key it authored.
       setError(message.startsWith("llmOpponent.") ? t(message) : message);
     }
     finally {
@@ -99,10 +89,9 @@ export function ReasoningOpponentSection(props: Props) {
     <Wrapper title={t("reasoningOpponent.title")}>
       <p className="text-xs text-slate-400">{t("reasoningOpponent.description")}</p>
       <p className="text-xs text-slate-500">{t("reasoningOpponent.costNote")}</p>
+      <p className="text-xs text-slate-500">{t("reasoningOpponent.deviceNote")}</p>
 
-      {!identity ? (
-        <p className="text-xs text-slate-500">{t("reasoningOpponent.signInFirst")}</p>
-      ) : stored ? (
+      {stored ? (
         <div className="flex flex-wrap items-center justify-between gap-3">
           <span className="text-sm text-slate-200">
             {t(`reasoningOpponent.kind.${stored.kind}`)} · ····{stored.hint}

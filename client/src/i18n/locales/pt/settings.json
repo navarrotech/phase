@@ -249,9 +249,9 @@
     "title": "Oponente pensante",
     "description": "Jogue contra um modelo Claude em vez da IA integrada. Vê o seu próprio baralho por completo e escolhe entre as jogadas que o motor declara legais, por isso pode jogar bem mas nunca de forma ilegal.",
     "costNote": "Os pedidos são cobrados à sua própria conta Anthropic. O motor continua a resolver sozinho as decisões de rotina, pelo que só as escolhas reais chegam ao modelo.",
-    "signInFirst": "Inicie sessão primeiro em Sincronização na nuvem — a credencial fica guardada na sua conta.",
+    "deviceNote": "A chave fica guardada apenas neste dispositivo. Não é sincronizada, não entra nas cópias de segurança e perde-se se limpar os dados do site.",
     "inputLabel": "Credencial Anthropic",
-    "inputHint": "Uma chave de API de console.anthropic.com, ou o token impresso por `claude setup-token`. É cifrada antes de ser guardada e nunca sai da sua conta.",
+    "inputHint": "Uma chave de API de console.anthropic.com, ou o token impresso por `claude setup-token`.",
     "save": "Guardar credencial",
     "remove": "Remover credencial",
     "kind": {
@@ -261,8 +261,7 @@
   },
   "llmOpponent": {
     "errors": {
-      "signedOut": "Inicie sessão primeiro para guardar uma credencial.",
-      "sealFailed": "Não foi possível proteger a credencial. Tente novamente."
+      "malformed": "Isto não parece uma chave Anthropic. Deve começar por sk-ant-."
     }
   }
 }

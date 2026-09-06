@@ -1,20 +1,21 @@
 // Storage for the player's own model API credential.
 //
-// The credential never exists in plaintext anywhere this module can reach. The
-// browser posts it once to the lobby Worker (`/llm/credential`), which seals it
-// under a key only the Worker holds and bound to this account; only the sealed
-// blob comes back, and only the sealed blob is stored.
+// The credential lives in IndexedDB, on this device only, and belongs to the
+// player rather than to this deployment. There is no account, no server-side
+// copy, and nothing to sign in to: the game asks for a key, keeps it locally,
+// and forwards it to the lobby Worker for the duration of one upstream call.
 //
-// It lives in its own `llm_credentials` table rather than in preferences, and
-// that placement is load-bearing. `buildBackup()` snapshots every user-owned
-// localStorage key into the cloud-sync envelope AND into the file the "export
-// backup" button downloads — anything reachable from preferences ends up in a
-// plaintext JSON file the user may hand to someone else. A credential must
-// never take that path.
+// IndexedDB rather than localStorage is load-bearing. `buildBackup()` snapshots
+// every user-owned localStorage key into the cloud-sync envelope AND into the
+// file the "export backup" button downloads, so anything stored there ends up
+// in a plaintext JSON file the player may hand to someone else. IndexedDB is
+// explicitly outside that envelope (see the header of `services/backup.ts`),
+// which is exactly the property a credential needs.
+//
+// The tradeoff, stated plainly for the settings copy: the key does not follow
+// the player to another device, and clearing site data removes it.
 
-import type { Session } from "@supabase/supabase-js";
-
-import { getSupabaseClient, isSupabaseConfigured } from "../cloudSync/supabaseClient";
+import { createStore, del, get, set } from "idb-keyval";
 
 /**
  * Worker base URL. Mirrors `deckUrlImport`: production points at the official
@@ -26,152 +27,117 @@ const LLM_API_BASE =
   ?? import.meta.env.VITE_IMPORT_DECK_URL
   ?? (import.meta.env.DEV ? "" : "https://lobby.phase-rs.dev");
 
-const CREDENTIALS_TABLE = "llm_credentials";
+/** Its own database, so clearing it cannot disturb another cache. */
+let credentialStore: ReturnType<typeof createStore> | undefined;
+function getCredentialStore(): ReturnType<typeof createStore> {
+  if (!credentialStore) {
+    credentialStore = createStore("phase-llm-credential", "phase-llm-credential");
+  }
+  return credentialStore;
+}
 
-/** The only provider wired today. Widening this is a Worker + schema change. */
-export const LLM_PROVIDER = "anthropic" as const;
+const CREDENTIAL_KEY = "anthropic";
 
 /**
- * Which credential family the Worker classified the input as. An `sk-ant-oat…`
- * token from `claude setup-token` authenticates differently from a console API
- * key, and the Worker needs to know which without unsealing.
+ * Which credential family the player supplied.
+ *
+ * The two are not interchangeable at the wire level — an API key goes on
+ * `x-api-key`, an OAuth token on `Authorization: Bearer` with a beta header —
+ * so the kind is classified once, here, and stored alongside the credential.
+ * The Worker uses it to pick the auth header rather than re-sniffing the prefix
+ * on every decision, which keeps the classification rule in one place.
  */
 export type LlmCredentialKind = "api_key" | "oauth_token";
 
-/** What the settings screen shows about a stored credential. */
+/** What is kept on disk. `hint` exists so the settings row is identifiable. */
 export interface StoredLlmCredential {
+  credential: string;
   kind: LlmCredentialKind;
-  /** Last four characters, so two keys are distinguishable. */
+  /** Last four characters, enough to tell two keys apart and useless alone. */
   hint: string;
   updatedAt: string;
 }
 
-/** The sealed material plus the routing kind, as sent on every decision. */
-export interface SealedLlmCredential {
-  sealed: string;
-  kind: LlmCredentialKind;
-}
+/** The settings row's view: everything except the secret itself. */
+export type LlmCredentialSummary = Omit<StoredLlmCredential, "credential">;
+
+/** `claude setup-token` mints an OAuth access token; the console mints a key. */
+const OAUTH_TOKEN_PREFIX = "sk-ant-oat";
+const API_KEY_PREFIX = "sk-ant-";
+
+const MIN_CREDENTIAL_LENGTH = 20;
+const MAX_CREDENTIAL_LENGTH = 512;
 
 /**
- * True when this build can offer an LLM opponent at all. Requires Supabase
- * (the credential's home) — self-hosted builds without it fall back to the
- * built-in AI, which is the whole product without this feature.
+ * True when this build can offer a reasoning opponent.
+ *
+ * Always, now that the credential is device-local: the feature needs a Worker
+ * to proxy to Anthropic and nothing else, so self-hosted builds get it too.
+ * Kept as a function so the settings panel has a single place to gate on if a
+ * future deployment needs to switch it off.
  */
 export function isLlmOpponentAvailable(): boolean {
-  return isSupabaseConfigured();
-}
-
-async function requireSession(): Promise<Session> {
-  const { data } = await getSupabaseClient().auth.getSession();
-  if (!data.session) {
-    throw new Error("llmOpponent.errors.signedOut");
-  }
-  return data.session;
+  return true;
 }
 
 /**
- * Seal `credential` at the Worker and store the result on this account.
+ * Validate and store a credential on this device.
  *
- * Throws with a translation key for conditions the UI should explain, or with
- * the Worker's own message when it authored one worth showing verbatim (an
- * unrecognized key prefix, for instance).
+ * Throws with a translation key the settings panel resolves. Rejecting an
+ * obviously wrong paste here rather than at the first decision means the player
+ * finds out while they are looking at the field.
  */
-export async function saveLlmCredential(credential: string): Promise<StoredLlmCredential> {
-  const session = await requireSession();
-
-  const response = await fetch(`${LLM_API_BASE}/llm/credential`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${session.access_token}`,
-    },
-    body: JSON.stringify({ provider: LLM_PROVIDER, credential }),
-  });
-
-  const body = (await response.json().catch(() => null)) as
-    | { sealed?: string; kind?: LlmCredentialKind; hint?: string; error?: string }
-    | null;
-
-  if (!response.ok || !body?.sealed || !body.kind || body.hint === undefined) {
-    console.debug("saveLlmCredential rejected by worker", { status: response.status });
-    throw new Error(body?.error ?? "llmOpponent.errors.sealFailed");
+export async function saveLlmCredential(input: string): Promise<LlmCredentialSummary> {
+  const credential = input.trim();
+  if (credential.length < MIN_CREDENTIAL_LENGTH || credential.length > MAX_CREDENTIAL_LENGTH) {
+    console.debug("saveLlmCredential rejected an implausible length", { length: credential.length });
+    throw new Error("llmOpponent.errors.malformed");
+  }
+  if (!credential.startsWith(API_KEY_PREFIX)) {
+    console.debug("saveLlmCredential rejected an unrecognized prefix");
+    throw new Error("llmOpponent.errors.malformed");
   }
 
-  const updatedAt = new Date().toISOString();
-  const { error } = await getSupabaseClient()
-    .from(CREDENTIALS_TABLE)
-    .upsert(
-      {
-        user_id: session.user.id,
-        provider: LLM_PROVIDER,
-        kind: body.kind,
-        sealed: body.sealed,
-        hint: body.hint,
-        updated_at: updatedAt,
-      },
-      { onConflict: "user_id,provider" },
-    );
-  if (error) throw error;
+  // Order matters: every OAuth token also carries the API-key prefix, so the
+  // narrower test runs first.
+  const kind: LlmCredentialKind = credential.startsWith(OAUTH_TOKEN_PREFIX)
+    ? "oauth_token"
+    : "api_key";
 
-  return { kind: body.kind, hint: body.hint, updatedAt };
-}
-
-/**
- * Read the stored credential's display metadata, or null when this account has
- * none. Deliberately does not select `sealed` — the settings screen has no use
- * for it, and a column it never reads is a column it cannot leak.
- */
-export async function loadLlmCredentialSummary(): Promise<StoredLlmCredential | null> {
-  if (!isLlmOpponentAvailable()) return null;
-
-  const { data, error } = await getSupabaseClient()
-    .from(CREDENTIALS_TABLE)
-    .select("kind, hint, updated_at")
-    .eq("provider", LLM_PROVIDER)
-    .maybeSingle();
-  if (error) throw error;
-  if (!data) return null;
-
-  return {
-    kind: data.kind as LlmCredentialKind,
-    hint: data.hint as string,
-    updatedAt: data.updated_at as string,
+  const stored: StoredLlmCredential = {
+    credential,
+    kind,
+    hint: credential.slice(-4),
+    updatedAt: new Date().toISOString(),
   };
+  await set(CREDENTIAL_KEY, stored, getCredentialStore());
+
+  return { kind: stored.kind, hint: stored.hint, updatedAt: stored.updatedAt };
+}
+
+/** The settings row's metadata, or null when this device has no credential. */
+export async function loadLlmCredentialSummary(): Promise<LlmCredentialSummary | null> {
+  const stored = await get<StoredLlmCredential>(CREDENTIAL_KEY, getCredentialStore());
+  if (!stored) return null;
+  return { kind: stored.kind, hint: stored.hint, updatedAt: stored.updatedAt };
 }
 
 /**
- * Fetch the sealed blob for a game about to use an LLM seat.
+ * The credential itself, for a game about to use a reasoning seat.
  *
- * Read once per game and held for its duration rather than re-read per
- * decision: RLS makes the read safe but not free, and a decision already costs
- * a model round-trip.
+ * Read once per game and held for its duration rather than per decision — a
+ * decision already costs a model round-trip, and re-reading buys nothing.
  */
-export async function loadSealedLlmCredential(): Promise<SealedLlmCredential | null> {
-  if (!isLlmOpponentAvailable()) return null;
-
-  const { data, error } = await getSupabaseClient()
-    .from(CREDENTIALS_TABLE)
-    .select("sealed, kind")
-    .eq("provider", LLM_PROVIDER)
-    .maybeSingle();
-  if (error) throw error;
-  if (!data) return null;
-
-  return { sealed: data.sealed as string, kind: data.kind as LlmCredentialKind };
+export async function loadLlmCredential(): Promise<StoredLlmCredential | null> {
+  return (await get<StoredLlmCredential>(CREDENTIAL_KEY, getCredentialStore())) ?? null;
 }
 
-/** Remove the stored credential for this account. */
+/** Remove the credential from this device. */
 export async function deleteLlmCredential(): Promise<void> {
-  const session = await requireSession();
-  const { error } = await getSupabaseClient()
-    .from(CREDENTIALS_TABLE)
-    .delete()
-    .eq("user_id", session.user.id)
-    .eq("provider", LLM_PROVIDER);
-  if (error) throw error;
+  await del(CREDENTIAL_KEY, getCredentialStore());
 }
 
-/** Base URL for the decision route, so it and the credential route agree. */
+/** Base URL for the decision route, so it and this module agree. */
 export function llmApiBase(): string {
   return LLM_API_BASE;
 }

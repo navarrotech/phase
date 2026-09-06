@@ -9,10 +9,8 @@
 // one weaker move, never a stuck game.
 
 import type { LlmCandidate, LlmDecisionBrief } from "../../adapter/types";
-import type { SealedLlmCredential } from "./credentials";
-import type { Session } from "@supabase/supabase-js";
+import type { StoredLlmCredential } from "./credentials";
 
-import { getSupabaseClient } from "../cloudSync/supabaseClient";
 import { getSharedAdapter } from "../../adapter/wasm-adapter";
 import { llmApiBase } from "./credentials";
 
@@ -33,27 +31,10 @@ export interface LlmChoice {
 const DECISION_TIMEOUT_MS = 180_000;
 
 export async function requestLlmChoice(
-  credential: SealedLlmCredential,
+  credential: StoredLlmCredential,
   deckContext: string,
   brief: LlmDecisionBrief,
 ): Promise<LlmChoice | null> {
-  // `getSupabaseClient` throws on an unconfigured build. Reaching here without
-  // Supabase should be impossible — a credential could not have been loaded —
-  // but a thrown error here would count as a controller failure rather than
-  // falling back, so it is handled like every other unavailability.
-  let session: Session | null = null;
-  try {
-    session = (await getSupabaseClient().auth.getSession()).data.session;
-  }
-  catch (error) {
-    console.debug("requestLlmChoice could not read a Supabase session", { error });
-    return null;
-  }
-  if (!session) {
-    console.debug("requestLlmChoice has no Supabase session; deferring to local AI");
-    return null;
-  }
-
   const abort = new AbortController();
   const timeout = setTimeout(() => abort.abort(), DECISION_TIMEOUT_MS);
 
@@ -61,12 +42,11 @@ export async function requestLlmChoice(
     const response = await fetch(`${llmApiBase()}/llm/decide`, {
       method: "POST",
       signal: abort.signal,
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${session.access_token}`,
-      },
+      headers: { "Content-Type": "application/json" },
+      // The credential goes over TLS to the Worker, which holds it in memory
+      // for one upstream call and persists nothing.
       body: JSON.stringify({
-        sealed: credential.sealed,
+        credential: credential.credential,
         kind: credential.kind,
         deckContext,
         brief,

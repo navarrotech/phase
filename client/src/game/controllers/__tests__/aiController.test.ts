@@ -37,12 +37,12 @@ vi.mock("../../engineRecovery", () => ({
 vi.mock("../../debugLog", () => ({ debugLog: vi.fn() }));
 
 const llmMocks = vi.hoisted(() => ({
-  loadSealedLlmCredential: vi.fn(),
+  loadLlmCredential: vi.fn(),
   requestLlmChoice: vi.fn(),
   buildDeckContext: vi.fn(),
 }));
 vi.mock("../../../services/llmOpponent/credentials", () => ({
-  loadSealedLlmCredential: llmMocks.loadSealedLlmCredential,
+  loadLlmCredential: llmMocks.loadLlmCredential,
 }));
 vi.mock("../../../services/llmOpponent/decide", () => ({
   requestLlmChoice: llmMocks.requestLlmChoice,
@@ -119,8 +119,13 @@ beforeEach(() => {
   isEnginePanic.mockReset();
   isEnginePanic.mockReturnValue(false);
   routePanic.mockReset();
-  llmMocks.loadSealedLlmCredential.mockReset();
-  llmMocks.loadSealedLlmCredential.mockResolvedValue({ sealed: "sealed-blob", kind: "api_key" });
+  llmMocks.loadLlmCredential.mockReset();
+  llmMocks.loadLlmCredential.mockResolvedValue({
+    credential: "sk-ant-api03-test",
+    kind: "api_key",
+    hint: "test",
+    updatedAt: "2026-01-01T00:00:00.000Z",
+  });
   llmMocks.requestLlmChoice.mockReset();
   llmMocks.buildDeckContext.mockReset();
   llmMocks.buildDeckContext.mockResolvedValue("deck context");
@@ -596,7 +601,7 @@ describe("reasoner seats", () => {
   it("falls back to the built-in AI when the account has no stored credential", async () => {
     const local = proposal(PASS);
     const adapter = consultingAdapter(local);
-    llmMocks.loadSealedLlmCredential.mockResolvedValue(null);
+    llmMocks.loadLlmCredential.mockResolvedValue(null);
     dispatchAiActionProposal.mockResolvedValue({ status: "applied" });
     storeState.adapter = adapter;
 
@@ -622,7 +627,7 @@ describe("reasoner seats", () => {
     await runOnce();
 
     expect(adapter.getLlmDecisionBrief).not.toHaveBeenCalled();
-    expect(llmMocks.loadSealedLlmCredential).not.toHaveBeenCalled();
+    expect(llmMocks.loadLlmCredential).not.toHaveBeenCalled();
     expect(dispatchAiActionProposal).toHaveBeenCalledWith(local);
     controller.dispose();
   });
@@ -644,7 +649,7 @@ describe("reasoner seats", () => {
     storeSubscriber?.();
     await runOnce();
 
-    expect(llmMocks.loadSealedLlmCredential).toHaveBeenCalledTimes(1);
+    expect(llmMocks.loadLlmCredential).toHaveBeenCalledTimes(1);
     expect(llmMocks.buildDeckContext).toHaveBeenCalledTimes(1);
     expect(llmMocks.buildDeckContext).toHaveBeenCalledWith(["Lightning Bolt"]);
     controller.dispose();

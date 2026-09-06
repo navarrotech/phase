@@ -1,8 +1,6 @@
 import { LobbyDO } from "./lobby-do";
 import { handleImportDeck, type ImportDeckEnv } from "./import-deck";
-import { handleLlmCredential } from "./llm-credential";
-import { handleLlmDecide } from "./llm-decide";
-import { type LlmEnv } from "./llm-session";
+import { handleLlmDecide, type LlmEnv } from "./llm-decide";
 import { handleTurnCredentials, type TurnEnv } from "./turn";
 import { sanitizeTelemetryBatch, toDataPoint } from "./telemetry";
 
@@ -85,13 +83,9 @@ export default {
       return handleTelemetry(request, env);
     }
 
-    // LLM opponent. Both routes require a Supabase session and hold no state:
-    // /llm/credential seals a player's own model API key so the database only
-    // ever stores ciphertext, and /llm/decide unseals it for the duration of
-    // one upstream call to pick an action from an engine-issued candidate list.
-    if (url.pathname === "/llm/credential") {
-      return handleLlmCredential(request, env);
-    }
+    // Reasoning opponent. Stateless: the player's own Anthropic credential
+    // arrives with the request, is used for one upstream call to pick an action
+    // from an engine-issued candidate list, and is never stored.
     if (url.pathname === "/llm/decide") {
       return handleLlmDecide(request, env);
     }

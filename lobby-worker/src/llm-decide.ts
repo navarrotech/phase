@@ -8,11 +8,22 @@
 // brief. If anything at all goes wrong — bad credential, upstream 5xx, an
 // answer that is not a valid index — it says so and the client falls back to
 // the built-in AI, so a failure costs a worse move rather than a stuck game.
+//
+// Every caller brings their OWN Anthropic credential, so there is no account
+// here and nothing to sign in to. The credential arrives over TLS, is used for
+// one upstream call, and is never written down. Consequently this endpoint
+// cannot leak one player's key to another — but it can be pointed at by anyone
+// who finds the URL, which is a request-quota concern rather than a credential
+// one. `ALLOWED_ORIGINS` and the per-IP bucket below are the answer to that.
 
-import type { CredentialKind } from "./llm-credential";
-import type { LlmEnv } from "./llm-session";
+/** Which auth header the credential needs; classified client-side on save. */
+export type CredentialKind = "api_key" | "oauth_token";
 
-import { llmCorsHeaders, resolveUserId, unseal } from "./llm-session";
+/** Bindings this route reads. */
+export interface LlmEnv {
+  /** Comma-separated origin allowlist, or "*" (default) to allow any. */
+  ALLOWED_ORIGINS?: string;
+}
 
 /**
  * Anthropic's model id. Pinned rather than floating: a silent model change
@@ -48,7 +59,7 @@ type Effort = "low" | "medium" | "high" | "xhigh" | "max";
 const EFFORT: Effort = "high";
 
 type RequestBody = {
-  sealed?: unknown;
+  credential?: unknown;
   kind?: unknown;
   /** Static, cached prefix: the rules framing plus the seat's own decklist. */
   deckContext?: unknown;
@@ -103,9 +114,16 @@ export async function handleLlmDecide(request: Request, env: LlmEnv): Promise<Re
     return Response.json({ error: "Method not allowed" }, { status: 405, headers: cors });
   }
 
-  const userId = await resolveUserId(request, env);
-  if (!userId) {
-    return Response.json({ error: "Not signed in" }, { status: 401, headers: cors });
+  if (!isOriginAllowed(request, env)) {
+    console.debug({ event: "llm_decide_origin_rejected", origin: request.headers.get("Origin") });
+    return Response.json({ error: "Origin not allowed" }, { status: 403, headers: cors });
+  }
+  if (!withinRateLimit(request)) {
+    console.warn({ event: "llm_decide_rate_limited", ip: clientAddress(request) });
+    return Response.json(
+      { error: "Too many requests", fallback: true },
+      { status: 429, headers: cors },
+    );
   }
 
   let body: RequestBody;
@@ -117,10 +135,15 @@ export async function handleLlmDecide(request: Request, env: LlmEnv): Promise<Re
     return Response.json({ error: "Malformed request body" }, { status: 400, headers: cors });
   }
 
-  if (typeof body.sealed !== "string" || (body.kind !== "api_key" && body.kind !== "oauth_token")) {
+  if (
+    typeof body.credential !== "string"
+    || !body.credential.startsWith("sk-ant-")
+    || (body.kind !== "api_key" && body.kind !== "oauth_token")
+  ) {
     console.debug({ event: "llm_decide_missing_credential" });
-    return Response.json({ error: "Missing sealed credential" }, { status: 400, headers: cors });
+    return Response.json({ error: "Missing credential" }, { status: 400, headers: cors });
   }
+  const credential: string = body.credential;
   const kind: CredentialKind = body.kind;
 
   const candidateCount = countCandidates(body.brief);
@@ -135,17 +158,6 @@ export async function handleLlmDecide(request: Request, env: LlmEnv): Promise<Re
     return Response.json(
       { error: "Position too large to reason about", fallback: true },
       { status: 413, headers: cors },
-    );
-  }
-
-  const credential = await unseal(env, userId, body.sealed);
-  if (!credential) {
-    // Covers a rotated sealing key and a blob from another account alike. The
-    // user-facing fix is the same: re-enter the credential.
-    console.debug({ event: "llm_decide_unseal_failed" });
-    return Response.json(
-      { error: "Stored credential could not be opened. Re-enter it in settings." },
-      { status: 401, headers: cors },
     );
   }
 
@@ -241,6 +253,91 @@ export async function handleLlmDecide(request: Request, env: LlmEnv): Promise<Re
   });
 
   return Response.json(choice, { status: 200, headers: cors });
+}
+
+/**
+ * CORS headers, with the origin allowlist applied.
+ *
+ * Mirrors `turn.ts` so both HTTP routes answer preflights the same way.
+ */
+export function llmCorsHeaders(request: Request, env: LlmEnv): Record<string, string> {
+  const allow = (env.ALLOWED_ORIGINS ?? "*").trim();
+  let allowOrigin = "*";
+  if (allow !== "*") {
+    const origin = request.headers.get("Origin") ?? "";
+    const list = allow.split(",").map((entry) => entry.trim()).filter(Boolean);
+    allowOrigin = list.includes(origin) ? origin : (list[0] ?? "");
+  }
+  return {
+    "Access-Control-Allow-Origin": allowOrigin,
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    Vary: "Origin",
+  };
+}
+
+/**
+ * Whether the caller's `Origin` is on the allowlist.
+ *
+ * A browser cannot forge `Origin`, so this genuinely stops another site from
+ * driving this endpoint from a user's browser. It does NOT stop a direct
+ * non-browser client, which can send any header it likes — that is what the
+ * rate limit below is for. Default "*" keeps self-hosted deployments working
+ * without configuration.
+ */
+export function isOriginAllowed(request: Request, env: LlmEnv): boolean {
+  const allow = (env.ALLOWED_ORIGINS ?? "*").trim();
+  if (allow === "*") return true;
+  const origin = request.headers.get("Origin");
+  // A same-origin or non-browser request may omit Origin entirely; the rate
+  // limit still applies to it.
+  if (!origin) return true;
+  return allow.split(",").map((entry) => entry.trim()).includes(origin);
+}
+
+/** Requests one address may make per window before it is turned away. */
+const RATE_LIMIT_REQUESTS = 30;
+const RATE_LIMIT_WINDOW_MS = 60_000;
+
+/**
+ * Per-address request budget.
+ *
+ * Deliberately modest in what it claims: the counters live in the isolate's
+ * memory, so they reset when Cloudflare recycles it and are not shared between
+ * the isolates a busy deployment runs. That makes this a speed bump against
+ * casual abuse, not a quota. A deployment that needs a real limit should bind
+ * Cloudflare's rate-limiting binding or route through the lobby Durable Object,
+ * both of which hold state across isolates. Sized well above honest play, which
+ * escalates a few dozen decisions per game with a model round-trip between them.
+ */
+const requestBudget = new Map<string, { count: number; resetAt: number }>();
+
+export function withinRateLimit(
+  request: Request,
+  now: number = Date.now(),
+): boolean {
+  const address = clientAddress(request);
+  const entry = requestBudget.get(address);
+
+  if (!entry || now >= entry.resetAt) {
+    requestBudget.set(address, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+    // Drop windows that have already lapsed so a long-lived isolate does not
+    // accumulate an entry per address it has ever seen.
+    if (requestBudget.size > 1000) {
+      for (const [key, value] of requestBudget) {
+        if (now >= value.resetAt) requestBudget.delete(key);
+      }
+    }
+    return true;
+  }
+
+  if (entry.count >= RATE_LIMIT_REQUESTS) return false;
+  entry.count += 1;
+  return true;
+}
+
+function clientAddress(request: Request): string {
+  return request.headers.get("CF-Connecting-IP") ?? "unknown";
 }
 
 function authHeaders(credential: string, kind: CredentialKind): Record<string, string> {

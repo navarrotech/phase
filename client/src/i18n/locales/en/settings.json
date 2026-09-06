@@ -251,11 +251,11 @@
   },
   "reasoningOpponent": {
     "title": "Reasoning Opponent",
-    "description": "Play against a Claude model instead of the built-in AI. It sees your opponent's deck in full and picks from the moves the engine says are legal, so it can play well but never illegally.",
+    "description": "Play against a Claude model instead of the built-in AI. It sees its own deck in full and picks from the moves the engine says are legal, so it can play well but never illegally.",
     "costNote": "Requests are billed to your own Anthropic account. The engine still answers routine decisions itself, so only real choices reach the model.",
-    "signInFirst": "Sign in under Cloud Sync first — the credential is stored on your account.",
+    "deviceNote": "The key is stored on this device only. It is not synced, not included in backups, and is lost if you clear site data.",
     "inputLabel": "Anthropic credential",
-    "inputHint": "An API key from console.anthropic.com, or the token printed by `claude setup-token`. It is encrypted before it is stored and never leaves your account.",
+    "inputHint": "An API key from console.anthropic.com, or the token printed by `claude setup-token`.",
     "save": "Save credential",
     "remove": "Remove credential",
     "kind": {
@@ -265,8 +265,7 @@
   },
   "llmOpponent": {
     "errors": {
-      "signedOut": "Sign in first to store a credential.",
-      "sealFailed": "Could not secure the credential. Try again."
+      "malformed": "That does not look like an Anthropic key. It should start with sk-ant-."
     }
   }
 }

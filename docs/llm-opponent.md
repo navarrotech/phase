@@ -27,8 +27,7 @@ aiController                 engine (WASM)              lobby Worker         Ant
      │                             │                          │                  │
      │◄─ consult{token, brief} ────┤                          │                  │
      ├── POST /llm/decide ─────────┼─────────────────────────►│                  │
-     │                             │                    unseal credential        │
-     │                             │                          ├── /v1/messages ─►│
+     │      (credential + brief)   │                          ├── /v1/messages ─►│
      │                             │                          │◄── {"index": N} ─┤
      │◄── {index, reasoning} ──────┼──────────────────────────┤                  │
      ├── submitAiActionProposal ──►│                          │                  │
@@ -36,8 +35,8 @@ aiController                 engine (WASM)              lobby Worker         Ant
 ```
 
 Every failure edge falls back to `getAiActionProposal`. A missing credential, a
-network error, a refusal, an unparseable answer, and an out-of-range index all
-resolve to the built-in AI taking that one decision.
+network error, a refusal, an unparseable answer, a rate-limit rejection, and an
+out-of-range index all resolve to the built-in AI taking that one decision.
 
 ## Escalation
 
@@ -79,60 +78,72 @@ walks the payload guessing which integers are ids.
 
 ## Credential handling
 
-The credential is the **player's own** and is never stored in plaintext.
+The credential is the **player's own** and lives on their device. There is no
+account, no sign-in, and no server-side copy.
 
-1. The browser posts it once to `POST /llm/credential`.
-2. The Worker seals it with AES-256-GCM under the `LLM_SEAL_KEY` secret, using
-   the authenticated Supabase user id as Additional Authenticated Data.
-3. Only the sealed blob is returned, and only the sealed blob is written to
-   `public.llm_credentials` (RLS-scoped to `auth.uid()`).
-4. On each decision the Worker unseals in memory, calls Anthropic, and persists
-   nothing.
+1. The player pastes a key into Settings → Data → Reasoning Opponent.
+2. It is validated and written to IndexedDB (`phase-llm-credential`) via
+   `idb-keyval`.
+3. Each escalated decision sends it to `POST /llm/decide` over TLS. The Worker
+   uses it for one upstream call and persists nothing.
 
-The AAD binding means a blob lifted out of another account's row fails to open:
-GCM authenticates the AAD, and the Worker only ever passes the id of the caller
-it just verified. RLS already prevents that read; this makes the stolen bytes
-worthless anyway.
+IndexedDB rather than localStorage is deliberate. `buildBackup()` snapshots
+every user-owned localStorage key into cloud sync *and* into the file the
+"export backup" button downloads, so anything stored there ends up in a
+plaintext JSON file the player may share. IndexedDB is explicitly outside that
+envelope — see the header of `client/src/services/backup.ts`.
 
-Credentials live **outside** the `user_backups` envelope on purpose.
-`buildBackup()` snapshots every user-owned localStorage key into cloud sync
-*and* into the file the "export backup" button downloads. Anything reachable
-from preferences ends up in a plaintext file the user may share.
+The tradeoff, stated in the settings copy: the key does not follow the player to
+another device, and clearing site data removes it.
 
-Both Anthropic credential families work. The Worker classifies once at seal
-time and stores the kind alongside the blob:
+Both Anthropic credential families work. The client classifies once at save time
+and stores the kind alongside the key, so the rule lives in one place:
 
 | Kind | Prefix | Auth |
 |---|---|---|
 | `api_key` | `sk-ant-` | `x-api-key: <key>` |
 | `oauth_token` | `sk-ant-oat` | `Authorization: Bearer <token>` + `anthropic-beta: oauth-2025-04-20` |
 
-The `oauth_token` form is what `claude setup-token` prints. Note that it
-authenticates as a Claude Code credential; billing and rate limits follow that
-account, not a console API key's.
+The `oauth_token` form is what `claude setup-token` prints. It authenticates as
+a Claude Code credential, so billing and rate limits follow that account rather
+than a console API key's. This is also why the Worker proxy exists at all: the
+browser CORS path is documented for API keys, and an OAuth bearer sent from a
+browser origin is not a supported shape.
+
+### What the Worker does and does not protect
+
+Every caller brings their own credential, so this endpoint cannot leak one
+player's key to another — there is nothing of one player's stored for another to
+reach. What it *can* do is serve anyone who finds the URL, which costs request
+quota rather than credentials.
+
+Two guards bound that, and neither is oversold:
+
+- **`ALLOWED_ORIGINS`** — a browser cannot forge `Origin`, so an allowlist
+  genuinely stops another site driving the endpoint from a user's browser. It
+  does nothing against a non-browser client. Default `"*"`; set it to the
+  deployment's own origin in production.
+- **Per-address rate limit** — 30 requests per minute, counted in the isolate's
+  memory. That resets when Cloudflare recycles the isolate and is not shared
+  between isolates, so it is a speed bump, not a quota. A deployment needing a
+  real limit should bind Cloudflare's rate-limiting binding or route through the
+  lobby Durable Object. The budget sits well above honest play, which escalates
+  a few dozen decisions per game with a model round-trip between each.
 
 ## Deploying
 
-Worker secrets and vars (`lobby-worker/`):
+Nothing to provision. The route needs no secret, no binding, and no database —
+`supabase/schema.sql` is untouched by this feature.
 
-```bash
-# 32 random bytes, base64. Rotating it invalidates every stored credential —
-# users re-enter theirs. There is deliberately no key-id envelope.
-head -c 32 /dev/urandom | base64 | wrangler secret put LLM_SEAL_KEY
+The one setting worth changing in `lobby-worker/wrangler.toml`:
 
-# Vars, both public values, in wrangler.toml or the dashboard:
-#   SUPABASE_URL       https://<project>.supabase.co
-#   SUPABASE_ANON_KEY  the publishable key
+```toml
+ALLOWED_ORIGINS = "https://phase-rs.dev"   # rather than the default "*"
 ```
 
-Database: run `supabase/schema.sql` — the `llm_credentials` section is
-idempotent and additive.
-
-Client: no build env is required. `VITE_LLM_API_URL` overrides the Worker base
-URL for self-hosters; it otherwise follows `VITE_IMPORT_DECK_URL` and then the
+Client: no build env required. `VITE_LLM_API_URL` overrides the Worker base URL
+for self-hosters; it otherwise follows `VITE_IMPORT_DECK_URL` and then the
 official Worker.
-
-Without Supabase the feature hides itself and the built-in AI is the opponent.
 
 ## Cost and pacing
 
@@ -147,8 +158,7 @@ static deck block is prompt-cached across the whole game.
 |---|---|
 | Escalation + brief | `crates/engine/src/ai_support/llm_brief.rs` |
 | WASM exports | `get_llm_decision_brief`, `get_deck_card_names` in `crates/engine-wasm/src/lib.rs` |
-| Worker routes | `lobby-worker/src/llm-credential.ts`, `llm-decide.ts`, `llm-session.ts` |
-| Schema | `supabase/schema.sql` |
+| Worker route | `lobby-worker/src/llm-decide.ts` |
 | Client service | `client/src/services/llmOpponent/` |
 | Seat routing | `client/src/game/controllers/aiController.ts` |
 | UI | `client/src/components/settings/ReasoningOpponentSection.tsx`, `components/menu/AiOpponentConfig.tsx` |

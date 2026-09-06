@@ -2,8 +2,8 @@ import { AI_BASE_DELAY_MS, AI_DELAY_VARIANCE_MS, PLAYER_ID } from "../../constan
 import { useGameStore } from "../../stores/gameStore";
 import type { AiActionProposal, EngineAdapter, GameAction, GameState, WaitingFor } from "../../adapter/types";
 import { AdapterError, AdapterErrorCode } from "../../adapter/types";
-import type { SealedLlmCredential } from "../../services/llmOpponent/credentials";
-import { loadSealedLlmCredential } from "../../services/llmOpponent/credentials";
+import type { StoredLlmCredential } from "../../services/llmOpponent/credentials";
+import { loadLlmCredential } from "../../services/llmOpponent/credentials";
 import { buildDeckContext, requestLlmChoice } from "../../services/llmOpponent/decide";
 import { pressureMultiplier } from "../../utils/stackPressure";
 import { effectiveStackPressure } from "../../utils/stackThroughput";
@@ -41,7 +41,7 @@ export interface AISeatBinding {
 
 /** Per-seat material the reasoner path needs, resolved once per game. */
 interface LlmSeatRuntime {
-  credential: SealedLlmCredential;
+  credential: StoredLlmCredential;
   deckContext: string;
 }
 
@@ -136,7 +136,7 @@ export function createAIController(config: AIControllerConfig): AIController {
     if (cached) return cached;
 
     const pending = (async () => {
-      const credential = await loadSealedLlmCredential();
+      const credential = await loadLlmCredential();
       if (!credential) {
         debugLog(`No model credential stored; player ${playerId + 1} falls back to the built-in AI`, "warn");
         return null;

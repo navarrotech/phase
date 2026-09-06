@@ -249,9 +249,9 @@
     "title": "Rozumujący przeciwnik",
     "description": "Zagraj przeciwko modelowi Claude zamiast wbudowanej SI. Widzi swoją talię w całości i wybiera spośród ruchów, które silnik uznaje za legalne — może więc grać dobrze, ale nigdy niezgodnie z zasadami.",
     "costNote": "Zapytania są rozliczane z twojego własnego konta Anthropic. Rutynowe decyzje silnik nadal rozstrzyga sam, więc do modelu trafiają tylko prawdziwe wybory.",
-    "signInFirst": "Najpierw zaloguj się w Synchronizacji w chmurze — dane logowania są przechowywane na twoim koncie.",
+    "deviceNote": "Klucz jest przechowywany tylko na tym urządzeniu. Nie jest synchronizowany, nie trafia do kopii zapasowych i przepada po wyczyszczeniu danych witryny.",
     "inputLabel": "Poświadczenie Anthropic",
-    "inputHint": "Klucz API z console.anthropic.com albo token wypisany przez `claude setup-token`. Jest szyfrowany przed zapisaniem i nigdy nie opuszcza twojego konta.",
+    "inputHint": "Klucz API z console.anthropic.com albo token wypisany przez `claude setup-token`.",
     "save": "Zapisz poświadczenie",
     "remove": "Usuń poświadczenie",
     "kind": {
@@ -261,8 +261,7 @@
   },
   "llmOpponent": {
     "errors": {
-      "signedOut": "Zaloguj się, aby zapisać poświadczenie.",
-      "sealFailed": "Nie udało się zabezpieczyć poświadczenia. Spróbuj ponownie."
+      "malformed": "To nie wygląda na klucz Anthropic. Powinien zaczynać się od sk-ant-."
     }
   }
 }
