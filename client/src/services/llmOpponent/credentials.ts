@@ -127,6 +127,40 @@ export async function loadLlmCredential(): Promise<StoredLlmCredential | null> {
   return (await get<StoredLlmCredential>(CREDENTIAL_KEY, getCredentialStore())) ?? null;
 }
 
+/** What `verifyLlmCredential` learned by actually calling Anthropic. */
+export type LlmCredentialCheck =
+  | { ok: true; model: string }
+  | { ok: false; message: string };
+
+/**
+ * Ask the Worker to spend one tiny request proving the credential works.
+ *
+ * The settings screen runs this on save so a bad key is caught while the player
+ * is looking at the field. Without it the first evidence is a reasoning seat
+ * that quietly falls back to the built-in AI on every decision, which reads as
+ * a fast opponent rather than a broken one — the exact failure this feature hit
+ * in testing.
+ */
+export async function verifyLlmCredential(credential: string): Promise<LlmCredentialCheck> {
+  try {
+    const response = await fetch(`${LLM_API_BASE}/llm/verify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ credential }),
+    });
+    const body = (await response.json().catch(() => null)) as
+      | { ok?: boolean; model?: string; error?: string }
+      | null;
+
+    if (body?.ok) return { ok: true, model: body.model ?? "" };
+    return { ok: false, message: body?.error ?? "llmOpponent.errors.checkFailed" };
+  }
+  catch (error) {
+    console.debug("verifyLlmCredential could not reach the worker", { error });
+    return { ok: false, message: "llmOpponent.errors.checkUnreachable" };
+  }
+}
+
 /** Remove the credential from this device. */
 export async function deleteLlmCredential(): Promise<void> {
   await del(CREDENTIAL_KEY, getCredentialStore());

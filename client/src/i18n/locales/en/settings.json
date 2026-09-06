@@ -258,12 +258,17 @@
     "inputHint": "An API key from console.anthropic.com. A `claude setup-token` credential will not work: Anthropic authorizes those for Claude Code only.",
     "save": "Save credential",
     "remove": "Remove credential",
-    "storedKey": "API key ····{{hint}}"
+    "storedKey": "API key ····{{hint}}",
+    "check": "Test key",
+    "checking": "Testing…",
+    "checkOk": "Working. {{model}} answered."
   },
   "llmOpponent": {
     "errors": {
       "malformed": "That does not look like an Anthropic key. It should start with sk-ant-.",
-      "subscriptionToken": "That is a Claude Code subscription token. Anthropic only authorizes those for Claude Code, so it cannot make API requests. Use an API key from console.anthropic.com."
+      "subscriptionToken": "That is a Claude Code subscription token. Anthropic only authorizes those for Claude Code, so it cannot make API requests. Use an API key from console.anthropic.com.",
+      "checkFailed": "The check did not complete.",
+      "checkUnreachable": "Could not reach the phase.rs service to run the check."
     }
   }
 }

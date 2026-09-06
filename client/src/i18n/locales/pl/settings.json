@@ -254,12 +254,17 @@
     "inputHint": "Klucz API z console.anthropic.com. Poświadczenie z `claude setup-token` nie zadziała: Anthropic autoryzuje je wyłącznie dla Claude Code.",
     "save": "Zapisz poświadczenie",
     "remove": "Usuń poświadczenie",
-    "storedKey": "Klucz API ····{{hint}}"
+    "storedKey": "Klucz API ····{{hint}}",
+    "check": "Sprawdź klucz",
+    "checking": "Sprawdzanie…",
+    "checkOk": "Działa. Odpowiedział {{model}}."
   },
   "llmOpponent": {
     "errors": {
       "malformed": "To nie wygląda na klucz Anthropic. Powinien zaczynać się od sk-ant-.",
-      "subscriptionToken": "To token subskrypcji Claude Code. Anthropic autoryzuje je wyłącznie dla Claude Code, więc nie może wykonywać zapytań do API. Użyj klucza API z console.anthropic.com."
+      "subscriptionToken": "To token subskrypcji Claude Code. Anthropic autoryzuje je wyłącznie dla Claude Code, więc nie może wykonywać zapytań do API. Użyj klucza API z console.anthropic.com.",
+      "checkFailed": "Sprawdzenie nie zostało ukończone.",
+      "checkUnreachable": "Nie udało się połączyć z usługą phase.rs, aby wykonać sprawdzenie."
     }
   }
 }

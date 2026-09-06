@@ -96,7 +96,12 @@ envelope — see the header of `client/src/services/backup.ts`.
 The tradeoff, stated in the settings copy: the key does not follow the player to
 another device, and clearing site data removes it.
 
-**Console API keys only** (`sk-ant-api03-…`), sent as `x-api-key`.
+**Console API keys only** (`sk-ant-api03-…`), sent as `x-api-key`. Saving one
+runs `POST /llm/verify`, which spends the smallest real request that proves the
+whole path — same endpoint, same header, same model — and reports back whether
+Anthropic accepted it. That check exists because a rejected credential does not
+announce itself during play: the seat just falls back to the built-in AI on
+every decision and reads as a fast opponent.
 
 A `claude setup-token` credential (`sk-ant-oat…`) does **not** work and is
 rejected by name at save time. Anthropic authorizes subscription OAuth
@@ -158,7 +163,7 @@ static deck block is prompt-cached across the whole game.
 |---|---|
 | Escalation + brief | `crates/engine/src/ai_support/llm_brief.rs` |
 | WASM exports | `get_llm_decision_brief`, `get_deck_card_names` in `crates/engine-wasm/src/lib.rs` |
-| Worker route | `lobby-worker/src/llm-decide.ts` |
+| Worker routes | `lobby-worker/src/llm-decide.ts`, `llm-verify.ts`, shared `llm-http.ts` |
 | Client service | `client/src/services/llmOpponent/` |
 | Seat routing | `client/src/game/controllers/aiController.ts` |
 | UI | `client/src/components/settings/ReasoningOpponentSection.tsx`, `components/menu/AiOpponentConfig.tsx` |

@@ -254,12 +254,17 @@
     "inputHint": "Ein API-Schlüssel von console.anthropic.com. Ein `claude setup-token`-Zugang funktioniert nicht: Anthropic lässt diese nur für Claude Code zu.",
     "save": "Zugangsdaten speichern",
     "remove": "Zugangsdaten entfernen",
-    "storedKey": "API-Schlüssel ····{{hint}}"
+    "storedKey": "API-Schlüssel ····{{hint}}",
+    "check": "Schlüssel testen",
+    "checking": "Wird getestet…",
+    "checkOk": "Funktioniert. {{model}} hat geantwortet."
   },
   "llmOpponent": {
     "errors": {
       "malformed": "Das sieht nicht nach einem Anthropic-Schlüssel aus. Er sollte mit sk-ant- beginnen.",
-      "subscriptionToken": "Das ist ein Claude-Code-Abo-Token. Anthropic lässt diese nur für Claude Code zu, daher kann es keine API-Anfragen stellen. Verwende einen API-Schlüssel von console.anthropic.com."
+      "subscriptionToken": "Das ist ein Claude-Code-Abo-Token. Anthropic lässt diese nur für Claude Code zu, daher kann es keine API-Anfragen stellen. Verwende einen API-Schlüssel von console.anthropic.com.",
+      "checkFailed": "Die Prüfung wurde nicht abgeschlossen.",
+      "checkUnreachable": "Der phase.rs-Dienst war für die Prüfung nicht erreichbar."
     }
   }
 }

@@ -12,8 +12,10 @@ import type { LlmCredentialSummary } from "../../services/llmOpponent/credential
 import {
   deleteLlmCredential,
   isLlmOpponentAvailable,
+  loadLlmCredential,
   loadLlmCredentialSummary,
   saveLlmCredential,
+  verifyLlmCredential,
 } from "../../services/llmOpponent/credentials";
 
 const BUTTON_CLASS =
@@ -35,6 +37,8 @@ export function ReasoningOpponentSection(props: Props) {
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [checking, setChecking] = useState(false);
+  const [checkResult, setCheckResult] = useState<{ ok: boolean; text: string } | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -52,18 +56,51 @@ export function ReasoningOpponentSection(props: Props) {
 
   if (!isLlmOpponentAvailable()) return null;
 
+  /** Resolve a service message: a translation key it authored, or server prose. */
+  function messageText(message: string): string {
+    return message.startsWith("llmOpponent.") ? t(message) : message;
+  }
+
+  async function runCheck(credential: string) {
+    setChecking(true);
+    setCheckResult(null);
+    try {
+      const result = await verifyLlmCredential(credential);
+      setCheckResult(
+        result.ok
+          ? { ok: true, text: t("reasoningOpponent.checkOk", { model: result.model }) }
+          : { ok: false, text: messageText(result.message) },
+      );
+    }
+    finally {
+      setChecking(false);
+    }
+  }
+
+  async function onCheckStored() {
+    const credential = await loadLlmCredential();
+    if (!credential) {
+      console.debug("onCheckStored found no stored credential");
+      return;
+    }
+    await runCheck(credential.credential);
+  }
+
   async function onSave() {
     setBusy(true);
     setError(null);
+    setCheckResult(null);
     try {
-      setStored(await saveLlmCredential(draft.trim()));
+      const credential = draft.trim();
+      setStored(await saveLlmCredential(credential));
       // Drop the plaintext from component state the moment it is stored.
       setDraft("");
+      // Prove it works now rather than three turns into a game.
+      await runCheck(credential);
     }
     catch (saveError) {
       const message = saveError instanceof Error ? saveError.message : String(saveError);
-      // The service throws a translation key it authored.
-      setError(message.startsWith("llmOpponent.") ? t(message) : message);
+      setError(messageText(message));
     }
     finally {
       setBusy(false);
@@ -76,6 +113,7 @@ export function ReasoningOpponentSection(props: Props) {
     try {
       await deleteLlmCredential();
       setStored(null);
+      setCheckResult(null);
     }
     catch (removeError) {
       setError(removeError instanceof Error ? removeError.message : String(removeError));
@@ -96,9 +134,18 @@ export function ReasoningOpponentSection(props: Props) {
           <span className="text-sm text-slate-200">
             {t("reasoningOpponent.storedKey", { hint: stored.hint })}
           </span>
-          <button className={BUTTON_CLASS} onClick={() => void onRemove()} disabled={busy}>
-            <span>{t("reasoningOpponent.remove")}</span>
-          </button>
+          <div className="flex gap-2">
+            <button
+              className={BUTTON_CLASS}
+              onClick={() => void onCheckStored()}
+              disabled={busy || checking}
+            >
+              <span>{checking ? t("reasoningOpponent.checking") : t("reasoningOpponent.check")}</span>
+            </button>
+            <button className={BUTTON_CLASS} onClick={() => void onRemove()} disabled={busy || checking}>
+              <span>{t("reasoningOpponent.remove")}</span>
+            </button>
+          </div>
         </div>
       ) : (
         <form
@@ -129,6 +176,14 @@ export function ReasoningOpponentSection(props: Props) {
         </form>
       )}
 
+      {checking && !checkResult && (
+        <p className="text-xs text-slate-400">{t("reasoningOpponent.checking")}</p>
+      )}
+      {checkResult && (
+        <p className={`text-xs ${checkResult.ok ? "text-emerald-400" : "text-amber-400"}`}>
+          {checkResult.text}
+        </p>
+      )}
       {error && <p className="text-xs text-rose-400">{error}</p>}
     </Wrapper>
   );

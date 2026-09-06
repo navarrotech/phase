@@ -1,6 +1,8 @@
 import { LobbyDO } from "./lobby-do";
 import { handleImportDeck, type ImportDeckEnv } from "./import-deck";
-import { handleLlmDecide, type LlmEnv } from "./llm-decide";
+import { handleLlmDecide } from "./llm-decide";
+import { handleLlmVerify } from "./llm-verify";
+import { type LlmEnv } from "./llm-http";
 import { handleTurnCredentials, type TurnEnv } from "./turn";
 import { sanitizeTelemetryBatch, toDataPoint } from "./telemetry";
 
@@ -84,8 +86,12 @@ export default {
     }
 
     // Reasoning opponent. Stateless: the player's own Anthropic credential
-    // arrives with the request, is used for one upstream call to pick an action
-    // from an engine-issued candidate list, and is never stored.
+    // arrives with the request, is used for one upstream call, and is never
+    // stored. /llm/verify is a one-shot credential check the settings screen
+    // runs; /llm/decide picks an action from an engine-issued candidate list.
+    if (url.pathname === "/llm/verify") {
+      return handleLlmVerify(request, env);
+    }
     if (url.pathname === "/llm/decide") {
       return handleLlmDecide(request, env);
     }

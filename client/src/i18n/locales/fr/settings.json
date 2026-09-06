@@ -254,12 +254,17 @@
     "inputHint": "Une clé d'API de console.anthropic.com. Un identifiant `claude setup-token` ne fonctionnera pas : Anthropic ne les autorise que pour Claude Code.",
     "save": "Enregistrer l'identifiant",
     "remove": "Supprimer l'identifiant",
-    "storedKey": "Clé d'API ····{{hint}}"
+    "storedKey": "Clé d'API ····{{hint}}",
+    "check": "Tester la clé",
+    "checking": "Test en cours…",
+    "checkOk": "Fonctionne. {{model}} a répondu."
   },
   "llmOpponent": {
     "errors": {
       "malformed": "Cela ne ressemble pas à une clé Anthropic. Elle doit commencer par sk-ant-.",
-      "subscriptionToken": "Ceci est un jeton d'abonnement Claude Code. Anthropic ne les autorise que pour Claude Code, il ne peut donc pas faire de requêtes API. Utilisez une clé d'API de console.anthropic.com."
+      "subscriptionToken": "Ceci est un jeton d'abonnement Claude Code. Anthropic ne les autorise que pour Claude Code, il ne peut donc pas faire de requêtes API. Utilisez une clé d'API de console.anthropic.com.",
+      "checkFailed": "La vérification n'a pas abouti.",
+      "checkUnreachable": "Impossible de joindre le service phase.rs pour la vérification."
     }
   }
 }

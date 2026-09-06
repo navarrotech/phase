@@ -254,12 +254,17 @@
     "inputHint": "Una clave de API de console.anthropic.com. Una credencial de `claude setup-token` no funcionará: Anthropic solo las autoriza para Claude Code.",
     "save": "Guardar credencial",
     "remove": "Eliminar credencial",
-    "storedKey": "Clave de API ····{{hint}}"
+    "storedKey": "Clave de API ····{{hint}}",
+    "check": "Probar clave",
+    "checking": "Probando…",
+    "checkOk": "Funciona. Respondió {{model}}."
   },
   "llmOpponent": {
     "errors": {
       "malformed": "Eso no parece una clave de Anthropic. Debería empezar por sk-ant-.",
-      "subscriptionToken": "Eso es un token de suscripción de Claude Code. Anthropic solo los autoriza para Claude Code, así que no puede hacer solicitudes a la API. Usa una clave de API de console.anthropic.com."
+      "subscriptionToken": "Eso es un token de suscripción de Claude Code. Anthropic solo los autoriza para Claude Code, así que no puede hacer solicitudes a la API. Usa una clave de API de console.anthropic.com.",
+      "checkFailed": "La comprobación no se completó.",
+      "checkUnreachable": "No se pudo contactar con el servicio de phase.rs para la comprobación."
     }
   }
 }
