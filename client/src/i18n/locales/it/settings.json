@@ -251,17 +251,15 @@
     "costNote": "Le richieste sono addebitate al tuo account Anthropic. Il motore continua a risolvere da sé le decisioni di routine, così al modello arrivano solo le scelte vere.",
     "deviceNote": "La chiave è salvata solo su questo dispositivo. Non viene sincronizzata, non entra nei backup e va persa se cancelli i dati del sito.",
     "inputLabel": "Credenziale Anthropic",
-    "inputHint": "Una chiave API da console.anthropic.com, oppure il token stampato da `claude setup-token`.",
+    "inputHint": "Una chiave API da console.anthropic.com. Una credenziale `claude setup-token` non funzionerà: Anthropic le autorizza solo per Claude Code.",
     "save": "Salva credenziale",
     "remove": "Rimuovi credenziale",
-    "kind": {
-      "api_key": "Chiave API",
-      "oauth_token": "Token di configurazione"
-    }
+    "storedKey": "Chiave API ····{{hint}}"
   },
   "llmOpponent": {
     "errors": {
-      "malformed": "Non sembra una chiave Anthropic. Dovrebbe iniziare con sk-ant-."
+      "malformed": "Non sembra una chiave Anthropic. Dovrebbe iniziare con sk-ant-.",
+      "subscriptionToken": "Questo è un token di abbonamento Claude Code. Anthropic li autorizza solo per Claude Code, quindi non può effettuare richieste API. Usa una chiave API da console.anthropic.com."
     }
   }
 }

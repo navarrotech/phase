@@ -96,19 +96,19 @@ envelope — see the header of `client/src/services/backup.ts`.
 The tradeoff, stated in the settings copy: the key does not follow the player to
 another device, and clearing site data removes it.
 
-Both Anthropic credential families work. The client classifies once at save time
-and stores the kind alongside the key, so the rule lives in one place:
+**Console API keys only** (`sk-ant-api03-…`), sent as `x-api-key`.
 
-| Kind | Prefix | Auth |
-|---|---|---|
-| `api_key` | `sk-ant-` | `x-api-key: <key>` |
-| `oauth_token` | `sk-ant-oat` | `Authorization: Bearer <token>` + `anthropic-beta: oauth-2025-04-20` |
+A `claude setup-token` credential (`sk-ant-oat…`) does **not** work and is
+rejected by name at save time. Anthropic authorizes subscription OAuth
+credentials for Claude Code and Claude.ai only and refuses them on
+`/v1/messages`; the observed failure is a persistent `rate_limit_error` with no
+`retry-after` and no `anthropic-ratelimit-*` headers, not a clean 401, so
+accepting one would produce an opponent that silently never plays. Rejecting it
+in the settings field with an explanation is the whole of the handling.
 
-The `oauth_token` form is what `claude setup-token` prints. It authenticates as
-a Claude Code credential, so billing and rate limits follow that account rather
-than a console API key's. This is also why the Worker proxy exists at all: the
-browser CORS path is documented for API keys, and an OAuth bearer sent from a
-browser origin is not a supported shape.
+Verified empirically against the live API: a fake `sk-ant-oat01-` token returns
+`401 OAuth access token is invalid`, while a real one returns `429
+rate_limit_error` unchanged across six attempts spaced 30s apart.
 
 ### What the Worker does and does not protect
 

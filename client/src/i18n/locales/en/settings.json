@@ -255,17 +255,15 @@
     "costNote": "Requests are billed to your own Anthropic account. The engine still answers routine decisions itself, so only real choices reach the model.",
     "deviceNote": "The key is stored on this device only. It is not synced, not included in backups, and is lost if you clear site data.",
     "inputLabel": "Anthropic credential",
-    "inputHint": "An API key from console.anthropic.com, or the token printed by `claude setup-token`.",
+    "inputHint": "An API key from console.anthropic.com. A `claude setup-token` credential will not work: Anthropic authorizes those for Claude Code only.",
     "save": "Save credential",
     "remove": "Remove credential",
-    "kind": {
-      "api_key": "API key",
-      "oauth_token": "Setup token"
-    }
+    "storedKey": "API key ····{{hint}}"
   },
   "llmOpponent": {
     "errors": {
-      "malformed": "That does not look like an Anthropic key. It should start with sk-ant-."
+      "malformed": "That does not look like an Anthropic key. It should start with sk-ant-.",
+      "subscriptionToken": "That is a Claude Code subscription token. Anthropic only authorizes those for Claude Code, so it cannot make API requests. Use an API key from console.anthropic.com."
     }
   }
 }

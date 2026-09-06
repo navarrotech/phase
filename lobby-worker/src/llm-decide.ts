@@ -16,9 +16,6 @@
 // who finds the URL, which is a request-quota concern rather than a credential
 // one. `ALLOWED_ORIGINS` and the per-IP bucket below are the answer to that.
 
-/** Which auth header the credential needs; classified client-side on save. */
-export type CredentialKind = "api_key" | "oauth_token";
-
 /** Bindings this route reads. */
 export interface LlmEnv {
   /** Comma-separated origin allowlist, or "*" (default) to allow any. */
@@ -33,12 +30,6 @@ const MODEL = "claude-opus-5";
 
 /** Wire version for the Messages API. */
 const ANTHROPIC_VERSION = "2023-06-01";
-
-/**
- * `claude setup-token` credentials authenticate as OAuth bearers and require
- * this beta opt-in; console API keys use `x-api-key` and must not send it.
- */
-const OAUTH_BETA = "oauth-2025-04-20";
 
 /**
  * Generous enough for a full reasoning pass plus the answer object. The reply
@@ -60,7 +51,6 @@ const EFFORT: Effort = "high";
 
 type RequestBody = {
   credential?: unknown;
-  kind?: unknown;
   /** Static, cached prefix: the rules framing plus the seat's own decklist. */
   deckContext?: unknown;
   /** The engine's `DecisionBrief`, forwarded verbatim. */
@@ -135,16 +125,26 @@ export async function handleLlmDecide(request: Request, env: LlmEnv): Promise<Re
     return Response.json({ error: "Malformed request body" }, { status: 400, headers: cors });
   }
 
-  if (
-    typeof body.credential !== "string"
-    || !body.credential.startsWith("sk-ant-")
-    || (body.kind !== "api_key" && body.kind !== "oauth_token")
-  ) {
+  if (typeof body.credential !== "string" || !body.credential.startsWith("sk-ant-")) {
     console.debug({ event: "llm_decide_missing_credential" });
     return Response.json({ error: "Missing credential" }, { status: 400, headers: cors });
   }
+  // Anthropic authorizes `claude setup-token` credentials for Claude Code and
+  // Claude.ai only, and refuses them here server-side. The client rejects them
+  // at save time; this is the boundary's own check, so a stale stored token or
+  // a hand-rolled request gets a legible answer instead of an opaque upstream
+  // rate-limit error.
+  if (body.credential.startsWith("sk-ant-oat")) {
+    console.debug({ event: "llm_decide_subscription_token" });
+    return Response.json(
+      {
+        error: "Claude subscription tokens cannot be used for API requests. "
+          + "Use a console API key from console.anthropic.com.",
+      },
+      { status: 400, headers: cors },
+    );
+  }
   const credential: string = body.credential;
-  const kind: CredentialKind = body.kind;
 
   const candidateCount = countCandidates(body.brief);
   if (candidateCount === null) {
@@ -167,7 +167,7 @@ export async function handleLlmDecide(request: Request, env: LlmEnv): Promise<Re
   try {
     upstream = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
-      headers: authHeaders(credential, kind),
+      headers: authHeaders(credential),
       body: JSON.stringify({
         model: MODEL,
         max_tokens: MAX_TOKENS,
@@ -205,6 +205,9 @@ export async function handleLlmDecide(request: Request, env: LlmEnv): Promise<Re
     console.error({
       event: "llm_decide_upstream_error",
       upstreamStatus: upstream.status,
+      // First characters only — enough to identify the credential class, far
+      // short of anything usable.
+      credentialPrefix: credential.slice(0, 12),
       // The body carries Anthropic's error message, never the credential.
       detail: detail.slice(0, 500),
     });
@@ -340,19 +343,12 @@ function clientAddress(request: Request): string {
   return request.headers.get("CF-Connecting-IP") ?? "unknown";
 }
 
-function authHeaders(credential: string, kind: CredentialKind): Record<string, string> {
-  const base = {
+function authHeaders(credential: string): Record<string, string> {
+  return {
     "Content-Type": "application/json",
     "anthropic-version": ANTHROPIC_VERSION,
+    "x-api-key": credential,
   };
-  if (kind === "oauth_token") {
-    return {
-      ...base,
-      Authorization: `Bearer ${credential}`,
-      "anthropic-beta": OAUTH_BETA,
-    };
-  }
-  return { ...base, "x-api-key": credential };
 }
 
 /**

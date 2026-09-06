@@ -38,21 +38,9 @@ function getCredentialStore(): ReturnType<typeof createStore> {
 
 const CREDENTIAL_KEY = "anthropic";
 
-/**
- * Which credential family the player supplied.
- *
- * The two are not interchangeable at the wire level — an API key goes on
- * `x-api-key`, an OAuth token on `Authorization: Bearer` with a beta header —
- * so the kind is classified once, here, and stored alongside the credential.
- * The Worker uses it to pick the auth header rather than re-sniffing the prefix
- * on every decision, which keeps the classification rule in one place.
- */
-export type LlmCredentialKind = "api_key" | "oauth_token";
-
 /** What is kept on disk. `hint` exists so the settings row is identifiable. */
 export interface StoredLlmCredential {
   credential: string;
-  kind: LlmCredentialKind;
   /** Last four characters, enough to tell two keys apart and useless alone. */
   hint: string;
   updatedAt: string;
@@ -61,9 +49,18 @@ export interface StoredLlmCredential {
 /** The settings row's view: everything except the secret itself. */
 export type LlmCredentialSummary = Omit<StoredLlmCredential, "credential">;
 
-/** `claude setup-token` mints an OAuth access token; the console mints a key. */
-const OAUTH_TOKEN_PREFIX = "sk-ant-oat";
+/**
+ * Console API keys carry this prefix. Only they work here.
+ *
+ * `claude setup-token` mints a subscription OAuth credential (`sk-ant-oat…`)
+ * that Anthropic authorizes for Claude Code and Claude.ai only; a direct
+ * Messages API call with one is refused server-side. It is rejected by name
+ * below rather than accepted and left to fail on the first decision, because
+ * the two prefixes look alike and the failure would otherwise surface as an
+ * opponent that silently never plays.
+ */
 const API_KEY_PREFIX = "sk-ant-";
+const SUBSCRIPTION_TOKEN_PREFIX = "sk-ant-oat";
 
 const MIN_CREDENTIAL_LENGTH = 20;
 const MAX_CREDENTIAL_LENGTH = 512;
@@ -93,33 +90,31 @@ export async function saveLlmCredential(input: string): Promise<LlmCredentialSum
     console.debug("saveLlmCredential rejected an implausible length", { length: credential.length });
     throw new Error("llmOpponent.errors.malformed");
   }
+  // Checked before the general prefix: a subscription token satisfies that too.
+  if (credential.startsWith(SUBSCRIPTION_TOKEN_PREFIX)) {
+    console.debug("saveLlmCredential rejected a Claude Code subscription token");
+    throw new Error("llmOpponent.errors.subscriptionToken");
+  }
   if (!credential.startsWith(API_KEY_PREFIX)) {
     console.debug("saveLlmCredential rejected an unrecognized prefix");
     throw new Error("llmOpponent.errors.malformed");
   }
 
-  // Order matters: every OAuth token also carries the API-key prefix, so the
-  // narrower test runs first.
-  const kind: LlmCredentialKind = credential.startsWith(OAUTH_TOKEN_PREFIX)
-    ? "oauth_token"
-    : "api_key";
-
   const stored: StoredLlmCredential = {
     credential,
-    kind,
     hint: credential.slice(-4),
     updatedAt: new Date().toISOString(),
   };
   await set(CREDENTIAL_KEY, stored, getCredentialStore());
 
-  return { kind: stored.kind, hint: stored.hint, updatedAt: stored.updatedAt };
+  return { hint: stored.hint, updatedAt: stored.updatedAt };
 }
 
 /** The settings row's metadata, or null when this device has no credential. */
 export async function loadLlmCredentialSummary(): Promise<LlmCredentialSummary | null> {
   const stored = await get<StoredLlmCredential>(CREDENTIAL_KEY, getCredentialStore());
   if (!stored) return null;
-  return { kind: stored.kind, hint: stored.hint, updatedAt: stored.updatedAt };
+  return { hint: stored.hint, updatedAt: stored.updatedAt };
 }
 
 /**

@@ -34,7 +34,8 @@ vi.mock("../../engineRecovery", () => ({
   notifyEngineLost: (...args: unknown[]) => notifyEngineLost(...args),
   routePanic: (reason: string, panic?: string) => routePanic(reason, panic),
 }));
-vi.mock("../../debugLog", () => ({ debugLog: vi.fn() }));
+const debugLog = vi.fn();
+vi.mock("../../debugLog", () => ({ debugLog: (...args: unknown[]) => debugLog(...args) }));
 
 const llmMocks = vi.hoisted(() => ({
   loadLlmCredential: vi.fn(),
@@ -119,10 +120,10 @@ beforeEach(() => {
   isEnginePanic.mockReset();
   isEnginePanic.mockReturnValue(false);
   routePanic.mockReset();
+  debugLog.mockReset();
   llmMocks.loadLlmCredential.mockReset();
   llmMocks.loadLlmCredential.mockResolvedValue({
     credential: "sk-ant-api03-test",
-    kind: "api_key",
     hint: "test",
     updatedAt: "2026-01-01T00:00:00.000Z",
   });
@@ -612,6 +613,32 @@ describe("reasoner seats", () => {
     await runOnce();
 
     expect(adapter.getLlmDecisionBrief).not.toHaveBeenCalled();
+    expect(dispatchAiActionProposal).toHaveBeenCalledWith(local);
+    controller.dispose();
+  });
+
+  it("announces a reasoner failure once per seat, then stays quiet", async () => {
+    // The per-decision fallback is deliberately silent so a flaky network does
+    // not spam the log. Without one announcement, a seat whose credential is
+    // rejected outright is indistinguishable from a fast opponent.
+    const local = proposal(PASS);
+    const adapter = consultingAdapter(local);
+    llmMocks.requestLlmChoice.mockResolvedValue(null);
+    dispatchAiActionProposal.mockResolvedValue({ status: "applied" });
+    storeState.adapter = adapter;
+
+    const controller = createAIController({
+      seats: [{ playerId: 1, difficulty: "Medium", useReasoner: true }],
+    });
+    controller.start();
+    await runOnce();
+    storeSubscriber?.();
+    await runOnce();
+
+    const warnings = debugLog.mock.calls.filter(
+      (call) => typeof call[0] === "string" && call[0].includes("reasoning opponent is unavailable"),
+    );
+    expect(warnings).toHaveLength(1);
     expect(dispatchAiActionProposal).toHaveBeenCalledWith(local);
     controller.dispose();
   });

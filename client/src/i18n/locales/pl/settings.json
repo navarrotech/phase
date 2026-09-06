@@ -251,17 +251,15 @@
     "costNote": "Zapytania są rozliczane z twojego własnego konta Anthropic. Rutynowe decyzje silnik nadal rozstrzyga sam, więc do modelu trafiają tylko prawdziwe wybory.",
     "deviceNote": "Klucz jest przechowywany tylko na tym urządzeniu. Nie jest synchronizowany, nie trafia do kopii zapasowych i przepada po wyczyszczeniu danych witryny.",
     "inputLabel": "Poświadczenie Anthropic",
-    "inputHint": "Klucz API z console.anthropic.com albo token wypisany przez `claude setup-token`.",
+    "inputHint": "Klucz API z console.anthropic.com. Poświadczenie z `claude setup-token` nie zadziała: Anthropic autoryzuje je wyłącznie dla Claude Code.",
     "save": "Zapisz poświadczenie",
     "remove": "Usuń poświadczenie",
-    "kind": {
-      "api_key": "Klucz API",
-      "oauth_token": "Token konfiguracyjny"
-    }
+    "storedKey": "Klucz API ····{{hint}}"
   },
   "llmOpponent": {
     "errors": {
-      "malformed": "To nie wygląda na klucz Anthropic. Powinien zaczynać się od sk-ant-."
+      "malformed": "To nie wygląda na klucz Anthropic. Powinien zaczynać się od sk-ant-.",
+      "subscriptionToken": "To token subskrypcji Claude Code. Anthropic autoryzuje je wyłącznie dla Claude Code, więc nie może wykonywać zapytań do API. Użyj klucza API z console.anthropic.com."
     }
   }
 }

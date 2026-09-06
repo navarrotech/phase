@@ -57,6 +57,15 @@ export function create_multiplayer_draft(pool_input_json: string, seats_json: st
 export function export_draft_session(): string;
 
 /**
+ * Narrow a limited-pool listing through the ENGINE's filtering authority
+ * (#7546 review): the display sends the listing and a typed `PoolFilter`;
+ * it renders exactly the returned instance ids. Each instance is classified
+ * inside draft-core, so wire-delivered groups (of any protocol vintage) are
+ * not an input. Stateless — usable by P2P guests.
+ */
+export function filter_pool_listing(listing_json: string, filter_json: string): any;
+
+/**
  * Get a bot's auto-built deck for match play.
  *
  * `bot_seat`: seat index 1-7 for the bot opponent.
@@ -82,8 +91,6 @@ export function get_draft_view_for_seat(seat_index: number): any;
 /**
  * Get the current DraftPlayerView without mutation.
  */
-export function filter_pool_listing(listing_json: string, filter_json: string): any;
-export function pool_filter_options(pool_json: string): any;
 export function get_view(): any;
 
 /**
@@ -113,6 +120,14 @@ export function init_panic_hook(): void;
  * Returns the number of cards loaded.
  */
 export function load_card_database(json_str: string): number;
+
+/**
+ * The complete engine-owned filter option lists for a pool, computed from
+ * the instances alone (review round 5): the stateless path a display uses
+ * when its delivered view predates the option fields, so legacy controls
+ * never come from the lossy exclusive presentation buckets.
+ */
+export function pool_filter_options(pool_json: string): any;
 
 /**
  * Mark a human seat as connected or disconnected. The host adapter calls
@@ -214,6 +229,7 @@ export interface InitOutput {
     readonly auto_pick: () => [number, number, number];
     readonly create_multiplayer_draft: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number, i: number, j: number, k: number, l: number) => [number, number, number];
     readonly export_draft_session: () => [number, number, number, number];
+    readonly filter_pool_listing: (a: number, b: number, c: number, d: number) => [number, number, number];
     readonly get_bot_deck: (a: number) => [number, number, number];
     readonly get_draft_status: () => [number, number, number];
     readonly get_draft_view_for_seat: (a: number) => [number, number, number];
@@ -221,6 +237,7 @@ export interface InitOutput {
     readonly get_view_for_seat: (a: number) => [number, number, number];
     readonly import_draft_session: (a: number, b: number, c: number) => [number, number, number];
     readonly load_card_database: (a: number, b: number) => [number, number, number];
+    readonly pool_filter_options: (a: number, b: number) => [number, number, number];
     readonly set_seat_connected: (a: number, b: number) => [number, number, number];
     readonly start_quick_cube_draft: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number];
     readonly start_quick_draft: (a: number, b: number, c: number, d: number) => [number, number, number];

@@ -47,7 +47,6 @@ export async function requestLlmChoice(
       // for one upstream call and persists nothing.
       body: JSON.stringify({
         credential: credential.credential,
-        kind: credential.kind,
         deckContext,
         brief,
       }),

@@ -3,7 +3,7 @@
 // The credential is the player's own and stays on this device. There is no
 // account and nothing to sign in to. This component drops the plaintext from
 // its own state the moment it is stored, and never reads it back — the summary
-// it renders is a kind plus the last four characters.
+// it renders is only the key's last four characters.
 
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -94,7 +94,7 @@ export function ReasoningOpponentSection(props: Props) {
       {stored ? (
         <div className="flex flex-wrap items-center justify-between gap-3">
           <span className="text-sm text-slate-200">
-            {t(`reasoningOpponent.kind.${stored.kind}`)} · ····{stored.hint}
+            {t("reasoningOpponent.storedKey", { hint: stored.hint })}
           </span>
           <button className={BUTTON_CLASS} onClick={() => void onRemove()} disabled={busy}>
             <span>{t("reasoningOpponent.remove")}</span>

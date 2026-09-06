@@ -251,17 +251,15 @@
     "costNote": "Les requêtes sont facturées à votre propre compte Anthropic. Le moteur tranche toujours lui-même les décisions de routine, si bien que seuls les vrais choix atteignent le modèle.",
     "deviceNote": "La clé est conservée sur cet appareil uniquement. Elle n'est pas synchronisée, pas incluse dans les sauvegardes, et perdue si vous effacez les données du site.",
     "inputLabel": "Identifiant Anthropic",
-    "inputHint": "Une clé d'API de console.anthropic.com, ou le jeton affiché par `claude setup-token`.",
+    "inputHint": "Une clé d'API de console.anthropic.com. Un identifiant `claude setup-token` ne fonctionnera pas : Anthropic ne les autorise que pour Claude Code.",
     "save": "Enregistrer l'identifiant",
     "remove": "Supprimer l'identifiant",
-    "kind": {
-      "api_key": "Clé d'API",
-      "oauth_token": "Jeton de configuration"
-    }
+    "storedKey": "Clé d'API ····{{hint}}"
   },
   "llmOpponent": {
     "errors": {
-      "malformed": "Cela ne ressemble pas à une clé Anthropic. Elle doit commencer par sk-ant-."
+      "malformed": "Cela ne ressemble pas à une clé Anthropic. Elle doit commencer par sk-ant-.",
+      "subscriptionToken": "Ceci est un jeton d'abonnement Claude Code. Anthropic ne les autorise que pour Claude Code, il ne peut donc pas faire de requêtes API. Utilisez une clé d'API de console.anthropic.com."
     }
   }
 }

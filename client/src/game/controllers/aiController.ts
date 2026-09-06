@@ -127,6 +127,22 @@ export function createAIController(config: AIControllerConfig): AIController {
   // context build are both once-per-game costs, and paying them on the first
   // decision keeps controller construction synchronous.
   const llmRuntimeByPlayerId = new Map<number, Promise<LlmSeatRuntime | null>>();
+  // Seats that have already announced a reasoner failure. The fallback is
+  // per-decision and silent by design — a flaky network must not spam the log —
+  // but total silence made a seat whose credential is rejected outright look
+  // like a fast opponent rather than a broken one. Announce the first failure
+  // per seat, then go quiet again.
+  const announcedReasonerFailure = new Set<number>();
+
+  function announceReasonerFallback(playerId: number, reason: string): void {
+    if (announcedReasonerFailure.has(playerId)) return;
+    announcedReasonerFailure.add(playerId);
+    debugLog(
+      `Player ${playerId + 1}'s reasoning opponent is unavailable (${reason}); `
+      + "the built-in AI is playing this seat. Later failures are not repeated.",
+      "warn",
+    );
+  }
 
   function ensureLlmRuntime(
     adapter: EngineAdapter,
@@ -176,7 +192,10 @@ export function createAIController(config: AIControllerConfig): AIController {
     }
 
     const runtime = await ensureLlmRuntime(adapter, playerId);
-    if (!runtime) return localProposal();
+    if (!runtime) {
+      announceReasonerFallback(playerId, "no usable credential");
+      return localProposal();
+    }
 
     const decision = await adapter.getLlmDecisionBrief(playerId);
     if (decision?.verdict !== "consult") {
@@ -184,7 +203,10 @@ export function createAIController(config: AIControllerConfig): AIController {
     }
 
     const choice = await requestLlmChoice(runtime.credential, runtime.deckContext, decision.brief);
-    if (!choice) return localProposal();
+    if (!choice) {
+      announceReasonerFallback(playerId, "the model request failed");
+      return localProposal();
+    }
 
     debugLog(
       `Player ${playerId + 1} reasoned: ${choice.candidate.label}${choice.reasoning ? ` — ${choice.reasoning}` : ""}`,

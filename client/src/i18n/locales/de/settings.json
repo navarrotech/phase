@@ -251,17 +251,15 @@
     "costNote": "Die Anfragen werden deinem eigenen Anthropic-Konto berechnet. Routineentscheidungen beantwortet die Engine weiterhin selbst, sodass nur echte Entscheidungen das Modell erreichen.",
     "deviceNote": "Der Schlüssel wird nur auf diesem Gerät gespeichert. Er wird nicht synchronisiert, nicht in Sicherungen aufgenommen und geht verloren, wenn du die Websitedaten löschst.",
     "inputLabel": "Anthropic-Zugangsdaten",
-    "inputHint": "Ein API-Schlüssel von console.anthropic.com oder das von `claude setup-token` ausgegebene Token.",
+    "inputHint": "Ein API-Schlüssel von console.anthropic.com. Ein `claude setup-token`-Zugang funktioniert nicht: Anthropic lässt diese nur für Claude Code zu.",
     "save": "Zugangsdaten speichern",
     "remove": "Zugangsdaten entfernen",
-    "kind": {
-      "api_key": "API-Schlüssel",
-      "oauth_token": "Setup-Token"
-    }
+    "storedKey": "API-Schlüssel ····{{hint}}"
   },
   "llmOpponent": {
     "errors": {
-      "malformed": "Das sieht nicht nach einem Anthropic-Schlüssel aus. Er sollte mit sk-ant- beginnen."
+      "malformed": "Das sieht nicht nach einem Anthropic-Schlüssel aus. Er sollte mit sk-ant- beginnen.",
+      "subscriptionToken": "Das ist ein Claude-Code-Abo-Token. Anthropic lässt diese nur für Claude Code zu, daher kann es keine API-Anfragen stellen. Verwende einen API-Schlüssel von console.anthropic.com."
     }
   }
 }
