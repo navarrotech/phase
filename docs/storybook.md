@@ -11,8 +11,10 @@ pnpm build-storybook    # static site in client/storybook-static/ (gitignored)
 ```
 
 Nothing else has to be built first. Storybook is not a Tilt resource: it is a
-tool you bring up when you want it, and `pnpm run type-check` and `pnpm lint`
-already cover the story files.
+tool you bring up when you want it. The story files are still ordinary client
+code, so the authoritative check on them is Tilt's `check-frontend` (lint and
+type-check) and `test-frontend`. Run `pnpm run type-check` or `pnpm lint`
+directly only when Tilt is down.
 
 ## Layout
 
@@ -65,6 +67,12 @@ The card-art double keeps the real hook's contract, which is what makes
 flight draws the skeleton, art resolved draws the `<img>`, and a name Scryfall
 does not know draws `CardArtFallback`. It does need network access; offline,
 every card falls back to its text tile.
+
+Checked-in art would remove that network dependency, and it is not an option:
+`DMCA.md` states that this repository bundles no card images or card art, and
+that images are fetched from Scryfall at runtime. The double does what the app
+does. A neutral placeholder is no substitute either — every card would render
+identically, which defeats a card catalog.
 
 ## Adding a story
 

@@ -36,11 +36,16 @@ export const Medium: Story = {
   args: { chevronSize: "md" },
 };
 
-/** The compact preset, for toolbars where the row height is fixed. */
+/**
+ * The compact preset, for toolbars where the row height is fixed. The classes
+ * are the ones `CardCoverageDashboard`'s filter row passes, so the story shows
+ * the real compact select rather than an invented one.
+ */
 export const Small: Story = {
   args: {
     chevronSize: "sm",
-    className: "w-40 rounded-md border border-white/15 bg-slate-950/70 px-2 py-1 text-xs text-white",
+    className:
+      "w-40 rounded-[12px] border border-white/10 bg-black/18 px-2 py-1.5 text-xs text-white outline-none focus:border-sky-400/40",
   },
 };
 

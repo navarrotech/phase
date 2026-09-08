@@ -12,6 +12,12 @@ import { CounterTooltip } from "./CounterTooltip.tsx";
  *
  * Each story hovers its own pill on load, so the catalog shows the tooltip
  * rather than the pill alone.
+ *
+ * The pill is a plain `span`, matching what `ArtCropCard` passes. That makes
+ * the tooltip hover-only in practice: `GameplayTooltip` also listens for
+ * `focusin`, but nothing in the battlefield tree is focusable to deliver it, so
+ * keyboard and touch users cannot open it. Giving the story a focusable trigger
+ * would hide that; it belongs to the counter pill in `ArtCropCard`.
  */
 const meta = {
   title: "UI/CounterTooltip",
