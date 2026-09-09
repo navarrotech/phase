@@ -29,10 +29,13 @@ interface DialogShellProps {
   previewObjectId?: ObjectId;
 }
 
+// Width caps apply only once the dialog is a centered card. Below `lg` it is
+// full-bleed, so a cap there would letterbox the prompt on a landscape phone —
+// the shape `ChoiceOverlay` already avoids.
 const SIZE_CLASS: Record<NonNullable<DialogShellProps["size"]>, string> = {
-  sm: "max-w-sm",
-  md: "max-w-md",
-  lg: "max-w-3xl",
+  sm: "lg:max-w-sm",
+  md: "lg:max-w-md",
+  lg: "lg:max-w-3xl",
 };
 
 export function DialogShell({
@@ -77,10 +80,21 @@ export function DialogShell({
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
+  // Below `lg` the card fills the viewport, matching `ChoiceOverlay`: border and
+  // radius are chrome for a floating card and only read as such once there is
+  // background around it. `min-h-0` lets the scroll container below shrink
+  // inside the flex column rather than pushing the footer off-screen.
+  //
+  // `100dvh` (not `100vh`) for the desktop cap: mobile browsers report `vh` as
+  // the *large* viewport, measured as if the URL bar were already retracted, so
+  // a `vh` cap makes the dialog taller than what is actually on screen and
+  // shears the footer off below the fold. `body.game-viewport-lock` in
+  // index.css already uses `dvh` for the same reason.
   const cardClass = [
-    "relative z-10 w-full overflow-hidden rounded-[16px] lg:rounded-[24px] border border-white/10 bg-[#0b1020]/96 shadow-[0_28px_80px_rgba(0,0,0,0.42)] backdrop-blur-md",
+    "relative z-10 flex h-full min-h-0 w-full flex-col overflow-hidden border-white/10 bg-[#0b1020]/96 shadow-[0_28px_80px_rgba(0,0,0,0.42)] backdrop-blur-md",
+    "lg:h-auto lg:rounded-[24px] lg:border",
     scrollable
-      ? "max-h-[calc(100vh_-_2rem_-_env(safe-area-inset-top)_-_env(safe-area-inset-bottom))] overflow-y-auto"
+      ? "lg:max-h-[calc(100dvh_-_2rem_-_env(safe-area-inset-top)_-_env(safe-area-inset-bottom))]"
       : "",
   ]
     .filter(Boolean)
@@ -89,13 +103,16 @@ export function DialogShell({
   // Wrapper class controls dialog width AND provides the positioning
   // context for the peek tab, which sits at the wrapper's right edge so
   // it stays attached to the card (which clips its own overflow).
-  const wrapperClass = ["relative z-10 w-full", SIZE_CLASS[size]].join(" ");
+  const wrapperClass = [
+    "relative z-10 flex h-full w-full min-h-0 flex-col lg:h-auto",
+    SIZE_CLASS[size],
+  ].join(" ");
 
   return (
     <AnimatePresence>
       <motion.div
         ref={constraintsRef}
-        className="fixed inset-0 z-50 flex items-center justify-center px-2 py-2 lg:px-4 lg:py-6"
+        className="fixed inset-0 z-50 flex flex-col px-0 py-0 lg:items-center lg:justify-center lg:px-4 lg:py-6"
         data-card-preview-dock="side"
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
@@ -133,9 +150,15 @@ export function DialogShell({
               onHandlePointerDown={startHeaderDrag}
             />
             {onClose ? <CloseButton onClose={onClose} /> : null}
-            {children}
+            {/* The content region owns the scroll so the header and footer stay
+                pinned when the dialog is full-bleed — the same split
+                `ChoiceOverlay` uses. `min-h-0` is what lets it actually shrink
+                inside the flex column instead of pushing the footer off. */}
+            <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
+              {children}
+            </div>
             {footer ? (
-              <div className="border-t border-white/5 px-3 py-3 lg:px-5 lg:py-4">
+              <div className="shrink-0 border-t border-white/5 px-3 py-3 lg:px-5 lg:py-4">
                 {footer}
               </div>
             ) : null}
@@ -185,7 +208,7 @@ export function DialogHeader({
   return (
     <div
       onPointerDown={onHandlePointerDown}
-      className={`relative border-b border-white/10 px-3 py-3 lg:px-5 lg:py-5 ${handleClass}`}
+      className={`relative shrink-0 border-b border-white/10 px-3 py-3 lg:px-5 lg:py-5 ${handleClass}`}
     >
       <div className={eyebrowClass}>{eyebrow}</div>
       <h2 id={titleId} className="mt-1 text-base font-semibold text-white lg:text-xl">
