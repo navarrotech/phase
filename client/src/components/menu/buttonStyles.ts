@@ -31,6 +31,19 @@ const GHOST_TONES: Record<MenuButtonTone, string> = {
   purple: "text-purple-300 hover:text-purple-200",
 };
 
+// Landscape phones get the same 500px height threshold `.modal-header-compact`
+// (index.css) and `useIsCompactHeight` already use, so a dialog's header and its
+// actions shrink together. Without this the header shrinks and the buttons do
+// not, and the actions eat the vertical budget the content needs (issue: modal
+// content unreadable on a landscape phone).
+//
+// Only padding and type scale down. `min-h-11` is the 44px touch-target floor
+// and is deliberately preserved at every viewport — compact means a tighter
+// button, never a smaller tap target. `icon`/`xs`/`chrome` are already at their
+// floor and are left alone.
+//
+// The variants are written as complete literal class strings because Tailwind
+// scans source text: a composed `${COMPACT}px-3` would never be generated.
 const SIZES: Record<MenuButtonSize, string> = {
   icon: "min-h-8 h-8 w-8 p-0 rounded-[8px] text-base",
   xs: "min-h-8 px-2.5 py-1 rounded-[7px] text-xs",
@@ -38,9 +51,9 @@ const SIZES: Record<MenuButtonSize, string> = {
   // a true 36×36 square — `min-h-9 h-9 min-w-9` together prevent any caller's
   // `h-*` override from being defeated by an upstream `min-h-*` baseline.
   chrome: "min-h-9 h-9 min-w-9 px-1.5 py-0 rounded-[8px] text-sm",
-  sm: "min-h-11 px-4 py-2 rounded-[9px] text-sm",
-  md: "min-h-11 px-6 py-3 rounded-[10px] text-base",
-  lg: "min-h-11 px-10 py-4 rounded-[12px] text-lg",
+  sm: "min-h-11 px-4 py-2 rounded-[9px] text-sm [@media(max-height:500px)]:px-3 [@media(max-height:500px)]:py-1 [@media(max-height:500px)]:text-xs",
+  md: "min-h-11 px-6 py-3 rounded-[10px] text-base [@media(max-height:500px)]:px-4 [@media(max-height:500px)]:py-1.5 [@media(max-height:500px)]:text-sm",
+  lg: "min-h-11 px-10 py-4 rounded-[12px] text-lg [@media(max-height:500px)]:px-5 [@media(max-height:500px)]:py-2 [@media(max-height:500px)]:text-base",
 };
 
 const DISABLED = "border-white/8 bg-white/5 text-white/30 cursor-not-allowed";
