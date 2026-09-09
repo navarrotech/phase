@@ -931,10 +931,13 @@ impl<'context, 'state> TriggerSourceRead<'context, 'state> {
         }
     }
 
-    pub fn class_level(self) -> Option<u8> {
+    /// CR 716.2d: the source's level, normalized through the shared
+    /// [`GameObject::level`] authority so a latched snapshot and a live object
+    /// answer identically, and so a source with no stored level reads as 1.
+    pub fn level(self) -> u8 {
         match self {
-            Self::ExactLive(object) => object.class_level,
-            Self::Latched(context) => context.class_level,
+            Self::ExactLive(object) => object.level(),
+            Self::Latched(context) => GameObject::level_from_stored(context.class_level),
         }
     }
 

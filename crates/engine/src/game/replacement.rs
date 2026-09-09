@@ -6563,17 +6563,20 @@ fn evaluate_replacement_condition(
                 .count();
             matching_count >= *minimum as usize
         }
-        // CR 611.3b + CR 716.2a + CR 614.1b: A Class-level static replacement applies
+        // CR 611.3b + CR 716.2a + CR 614.1: A Class-level static replacement applies
         // only while the source Class enchantment is on the battlefield and at the gated
         // level or higher. Unlike the shared `eval_class_level_ge` (used by
         // StaticCondition/TriggerCondition, where the functioning-abilities path already
         // constrains source availability), replacement effects can persist in lookup
         // tables beyond a source's zone change — so the battlefield zone guard here is
-        // load-bearing and must NOT be factored out into the shared helper.
+        // load-bearing and must NOT be factored out into the shared helper. The level
+        // itself still comes from the shared CR 716.2d accessor (`GameObject::level`):
+        // reading `class_level` raw made an absent level sort BELOW `Some(1)`, which
+        // silenced every level gate on a Class copy.
         ReplacementCondition::ClassLevelGE { level } => state
             .objects
             .get(&source_id)
-            .is_some_and(|obj| obj.zone == Zone::Battlefield && obj.class_level >= Some(*level)),
+            .is_some_and(|obj| obj.zone == Zone::Battlefield && obj.level() >= *level),
         // CR 611.2b: "for as long as you control [source]" — the replacement
         // applies only while the captured source object is on the battlefield AND
         // still controlled by the captured installing player. Either departure
