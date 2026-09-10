@@ -20,7 +20,7 @@
 //! the battlefield and command zone only. It now routes to
 //! `Effect::AddTargetReplacement { target: None }` instead, which installs it
 //! into the floating store at resolution under the resolving controller. Every
-//! row below therefore reads `expiry` off [`windowed_install`] rather than off
+//! row below therefore reads `expiry` off [`windowed_installs`] rather than off
 //! `parsed.replacements`; the invariant is unchanged and is still "nothing
 //! permanent escapes".
 //!
@@ -92,21 +92,53 @@ fn duration_this_turn_warnings(parsed: &ParsedAbilities) -> usize {
         .count()
 }
 
-/// CR 611.2a: the windowed clause's home — the resolution-install effect. Walks
-/// the whole chain (`sub_ability` included) because a card whose earlier line
-/// failed to parse can absorb the clause into that line's chain.
-fn windowed_install(parsed: &ParsedAbilities) -> Option<&ReplacementDefinition> {
-    fn walk(def: &AbilityDefinition) -> Option<&ReplacementDefinition> {
+/// CR 611.2a: every windowed clause's home — the resolution-install effects.
+///
+/// Returns ALL of them, never just the first. This file's load-bearing invariant
+/// is that NOTHING PERMANENT escapes, so an accessor that stopped at the first
+/// match would let a second install carrying `expiry: None` ride along unseen,
+/// passing the very assertion written to catch it. Callers pin the expected
+/// cardinality and then check every element.
+///
+/// Walks the whole chain (`sub_ability` included) because a card whose earlier
+/// line failed to parse can absorb the clause into that line's chain.
+fn windowed_installs(parsed: &ParsedAbilities) -> Vec<&ReplacementDefinition> {
+    fn walk<'a>(def: &'a AbilityDefinition, found: &mut Vec<&'a ReplacementDefinition>) {
         if let Effect::AddTargetReplacement {
             replacement,
             target: TargetFilter::None,
         } = &*def.effect
         {
-            return Some(replacement);
+            found.push(replacement);
         }
-        def.sub_ability.as_deref().and_then(walk)
+        if let Some(sub) = def.sub_ability.as_deref() {
+            walk(sub, found);
+        }
     }
-    parsed.abilities.iter().find_map(walk)
+
+    let mut found = Vec::new();
+    for def in &parsed.abilities {
+        walk(def, &mut found);
+    }
+    found
+}
+
+/// The one install this card must produce, with its cardinality pinned.
+///
+/// # Panics
+/// If the card produced anything other than exactly one install.
+fn sole_windowed_install<'a>(
+    parsed: &'a ParsedAbilities,
+    context: &str,
+) -> &'a ReplacementDefinition {
+    let installs = windowed_installs(parsed);
+    assert_eq!(
+        installs.len(),
+        1,
+        "{context}: expected exactly one resolution install, found {}",
+        installs.len()
+    );
+    installs[0]
 }
 
 fn permission_mode(def: &StaticDefinition) -> (&CastFrequency, &CardPlayMode) {
@@ -250,8 +282,7 @@ fn v3_antecedent_window_is_captured_and_stamped_onto_expiry() {
         "CR 604.2: a windowed definition is not a printed static and must not be \
          hosted on the card, where it could never apply"
     );
-    let def = windowed_install(&parsed)
-        .expect("U2: the antecedent window must not block the replacement");
+    let def = sole_windowed_install(&parsed, "U2: the antecedent window must not block it");
     assert_eq!(def.event, ReplacementEvent::Moved);
     assert_eq!(def.destination_zone, Some(Zone::Graveyard));
     assert_eq!(
@@ -282,7 +313,7 @@ fn v3_antecedent_window_is_captured_and_stamped_onto_expiry() {
         "CR 604.2: a clause stating no window must keep expiry: None"
     );
     assert!(
-        windowed_install(&guard).is_none(),
+        windowed_installs(&guard).is_empty(),
         "CR 604.2: a windowless clause must NOT be lifted to a resolution install"
     );
 }
@@ -375,8 +406,10 @@ fn v4_unbindable_window_is_declined_not_silently_shortened() {
     // 0 / no expiry; post-change it is 1 / Some(EndOfTurn). It proves the
     // window at this position is genuinely parsed.
     let reachable = parse_sorcery(CASE_B, "Window Probe");
-    let reachable = windowed_install(&reachable)
-        .expect("reach-guard: a BINDABLE window at this position is accepted");
+    let reachable = sole_windowed_install(
+        &reachable,
+        "reach-guard: a BINDABLE window at this position is accepted",
+    );
     assert_eq!(
         reachable.expiry,
         Some(RestrictionExpiry::EndOfTurn),
@@ -396,7 +429,7 @@ fn v4_unbindable_window_is_declined_not_silently_shortened() {
         "an unbindable window must decline the whole definition, not shorten it"
     );
     assert!(
-        windowed_install(&declined).is_none(),
+        windowed_installs(&declined).is_empty(),
         "and it must not reappear through the resolution-install route either"
     );
 }
@@ -410,7 +443,7 @@ fn v4a_this_combat_window_stamps_end_of_combat() {
         "If a card would be put into your graveyard from anywhere this combat, exile that card instead.",
         "Combat Window Probe",
     );
-    let def = windowed_install(&parsed).expect("a 'this combat' window is bindable");
+    let def = sole_windowed_install(&parsed, "a 'this combat' window is bindable");
     assert_eq!(
         def.expiry,
         Some(RestrictionExpiry::EndOfCombat),
@@ -435,17 +468,20 @@ fn v5_will_cycle_cards_remain_honestly_unsupported() {
     // sorcery, a sorcery preceded by a Suspend line, and a creature's activated
     // ability. All three must yield the SAME verdict, proving the outcome keys
     // on the body rather than on AbilityKind, cost presence, or line index.
-    for (text, name, types, expects_install) in [
+    // The install count is EXACT, not a presence flag: each card's line 2 is one
+    // clause and must install exactly one definition, so a duplicate install is
+    // as much a failure as a missing one.
+    for (text, name, types, expected_installs) in [
         // The two Sorceries expose their line-2 clause to the card-level line
         // dispatch; Magus does not, because its line 2 is inside an activated
         // ability's effect text.
-        (YAWGMOTHS_WILL, "Yawgmoth's Will", &["Sorcery"][..], true),
-        (GAEAS_WILL, "Gaea's Will", &["Sorcery"][..], true),
+        (YAWGMOTHS_WILL, "Yawgmoth's Will", &["Sorcery"][..], 1usize),
+        (GAEAS_WILL, "Gaea's Will", &["Sorcery"][..], 1usize),
         (
             MAGUS_OF_THE_WILL,
             "Magus of the Will",
             &["Creature"][..],
-            false,
+            0usize,
         ),
     ] {
         let parsed = parse_with_types(text, name, types);
@@ -479,20 +515,21 @@ fn v5_will_cycle_cards_remain_honestly_unsupported() {
         // activated ability's effect text, which the card-level line dispatch
         // does not reach.
         //
-        // The load-bearing invariant is not a count — it is that NOTHING
-        // PERMANENT escapes. Every replacement these cards produce, by either
-        // route, must carry a window.
+        // The load-bearing invariant is that NOTHING PERMANENT escapes. Every
+        // replacement these cards produce, by EITHER route and however many
+        // there turn out to be, must carry a window.
         assert_eq!(
             parsed.replacements.len(),
             0,
             "{name}: CR 604.2 — a windowed clause is never a printed static"
         );
+        let installs = windowed_installs(&parsed);
         assert_eq!(
-            windowed_install(&parsed).is_some(),
-            expects_install,
-            "{name}: resolution-install presence"
+            installs.len(),
+            expected_installs,
+            "{name}: resolution-install count"
         );
-        for r in parsed.replacements.iter().chain(windowed_install(&parsed)) {
+        for r in parsed.replacements.iter().chain(installs) {
             assert_eq!(
                 r.expiry,
                 Some(RestrictionExpiry::EndOfTurn),
@@ -525,8 +562,9 @@ fn v5_will_cycle_cards_remain_honestly_unsupported() {
     // exact sentence in isolation, so Magus's absence is a real absence rather
     // than a dead instrument.
     let live = parse_sorcery(CASE_B, "Window Probe");
-    assert!(
-        windowed_install(&live).is_some(),
+    assert_eq!(
+        windowed_installs(&live).len(),
+        1,
         "reach-guard: the install path is live for this clause standalone"
     );
 }
@@ -547,8 +585,10 @@ fn v5b_the_same_grammar_on_a_permanent_host_is_stamped_not_permanent() {
             "{host:?}: CR 604.2 — a windowed clause is not a printed static on \
              any host type"
         );
-        let def = windowed_install(&parsed)
-            .unwrap_or_else(|| panic!("{host:?}: the windowed clause must still be represented"));
+        let def = sole_windowed_install(
+            &parsed,
+            &format!("{host:?}: the windowed clause must still be represented"),
+        );
         assert_eq!(
             def.expiry,
             Some(RestrictionExpiry::EndOfTurn),

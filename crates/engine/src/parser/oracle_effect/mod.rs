@@ -15683,14 +15683,11 @@ fn parse_windowed_graveyard_redirect_ir(
 ) -> Option<EffectChainIr> {
     // Hot-path guard, mirroring the leading-"during " guard at the top of
     // `parse_ability_ir`: this recognizer runs for every ability of every card,
-    // and the grammar below opens with a mandatory `tag("if ")`, so only a body
-    // that literally starts with it can match. Paying the lowercase allocation
-    // for that handful of bodies rather than all ~30k cards' worth. The dispatch
-    // itself stays in the nom grammar; this is a cost gate, not a parse.
-    if !text
-        .get(.."if ".len())
-        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("if "))
-    {
+    // so the handful of bodies that can possibly match should not make all
+    // ~30k cards' worth pay for the reminder-strip and lowercase allocations.
+    // The gate is DERIVED from the grammar's own opening token rather than
+    // restating it, so it cannot drift; dispatch stays in the nom grammar.
+    if !super::oracle_replacement::body_may_be_graveyard_redirect(text) {
         return None;
     }
     let effect = super::oracle_replacement::parse_windowed_graveyard_redirect_install(text)?;

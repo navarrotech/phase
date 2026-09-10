@@ -46,6 +46,12 @@ const COSMIC_INTERVENTION: &str = "If a permanent you control would be put into 
 const COSMIC_INTERVENTION_FULL: &str = "If a permanent you control would be put into a graveyard from the battlefield this turn, exile it instead. Return it to the battlefield under its owner's control at the beginning of the next end step.\nForetell {1}{W} (During your turn, you may pay {2} and exile this card from your hand face down. Cast it on a later turn for its foretell cost.)";
 
 const DESTROY_TARGET_CREATURE: &str = "Destroy target creature.";
+const DESTROY_TARGET_ARTIFACT: &str = "Destroy target artifact.";
+
+/// Ugin's Nexus {5}, Legendary Artifact, BOTH printed lines verbatim (verified
+/// against the card export). Line 2 is this file's clause; line 1 rides along so
+/// the runtime test exercises the real card rather than a trimmed stand-in.
+const UGINS_NEXUS_FULL: &str = "If a player would begin an extra turn, that player skips that turn instead.\nIf Ugin's Nexus would be put into a graveyard from the battlefield, instead exile it and take an extra turn after this one.";
 
 /// Enough white mana for {3}{W} several times over; pool-funded casts auto-pay.
 fn fund(scenario: &mut GameScenario, player: PlayerId) {
@@ -63,6 +69,9 @@ struct Board {
     runner: GameRunner,
     intervention: ObjectId,
     removal: ObjectId,
+    /// A second removal spell, so one test can kill BOTH creatures under the
+    /// same installed shield and read the two outcomes against each other.
+    removal_b: ObjectId,
     mine: ObjectId,
     theirs: ObjectId,
 }
@@ -81,11 +90,15 @@ fn board() -> Board {
     let removal = scenario
         .add_spell_to_hand_from_oracle(P0, "Murder", true, DESTROY_TARGET_CREATURE)
         .id();
+    let removal_b = scenario
+        .add_spell_to_hand_from_oracle(P0, "Murder B", true, DESTROY_TARGET_CREATURE)
+        .id();
 
     Board {
         runner: scenario.build(),
         intervention,
         removal,
+        removal_b,
         mine,
         theirs,
     }
@@ -140,13 +153,29 @@ fn cosmic_intervention_does_not_shield_an_opponents_permanent() {
     let mut b = board();
     b.runner.cast(b.intervention).resolve();
 
-    let outcome = b.runner.cast(b.removal).target_object(b.theirs).resolve();
-
+    // THE NEGATIVE. On its own this is vacuous: a creature reaches the graveyard
+    // just as readily when no shield installed at all, which is precisely the
+    // pre-fix behavior this file exists to catch.
+    let theirs = b.runner.cast(b.removal).target_object(b.theirs).resolve();
     assert_eq!(
-        outcome.zone_of(b.theirs),
+        theirs.zone_of(b.theirs),
         Zone::Graveyard,
         "CR 614.1: the shield names permanents its caster controls, so an \
          opponent's creature still dies normally"
+    );
+
+    // PAIRED POSITIVE, same board and same installed shield, asserted AFTER the
+    // negative so it proves the shield was live at a moment no earlier than the
+    // observation above. Kill P0's own 2/2 and it must be exiled instead. If the
+    // definition never installed, THIS assertion fails and the vacuous reading
+    // of the negative is impossible.
+    let mine = b.runner.cast(b.removal_b).target_object(b.mine).resolve();
+    assert_eq!(
+        mine.zone_of(b.mine),
+        Zone::Exile,
+        "reach-guard: the same shield redirects the controller's own permanent, \
+         so the graveyard result above is a filter decision and not a missing \
+         replacement"
     );
 }
 
@@ -420,12 +449,67 @@ fn stated_origin_and_consequent_parse_on_a_printed_static() {
     );
     let def = parsed.replacements.first().expect("printed static");
     assert_eq!(def.destination_zone, Some(Zone::Graveyard));
+    // The consequent's IDENTITY, not merely its presence: `sub_ability.is_some()`
+    // is satisfied by any effect at all, so an unrelated or inert consequent
+    // would keep this green while the extra turn silently went missing.
+    let execute = def.execute.as_ref().expect("the redirect's execute chain");
+    let consequent = execute
+        .sub_ability
+        .as_deref()
+        .expect("CR 608.2c: the consequent must ride on the redirect");
     assert!(
-        def.execute
-            .as_ref()
-            .is_some_and(|execute| execute.sub_ability.is_some()),
-        "CR 608.2c: 'and take an extra turn after this one' is the redirect's \
-         consequent and must not be swallowed"
+        matches!(
+            &*consequent.effect,
+            Effect::ExtraTurn {
+                target: TargetFilter::Controller,
+                ..
+            }
+        ),
+        "CR 608.2c: 'and take an extra turn after this one' must lower to an \
+         ExtraTurn for the redirect's controller, got {:?}",
+        consequent.effect
+    );
+}
+
+/// CR 608.2c + CR 500.7: the consequent RUNS. The shape assertion above proves
+/// the effect is wired to the redirect; this proves the wiring fires, queueing
+/// the extra turn for the Nexus's controller when the redirect claims it.
+///
+/// Built from the card's FULL printed text, both lines. Line 1 ("If a player
+/// would begin an extra turn, that player skips that turn instead") is a
+/// card-hosted static that leaves the battlefield with the Nexus, so it does not
+/// reach the queued turn — and whether that skip later applies is a separate
+/// CR 614.6 question this test deliberately does not assert.
+#[test]
+fn ugins_nexus_redirect_queues_the_extra_turn_for_its_controller() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    fund(&mut scenario, P0);
+
+    let nexus = scenario
+        .add_artifact_from_oracle(P0, "Ugin's Nexus", UGINS_NEXUS_FULL)
+        .id();
+    let removal = scenario
+        .add_spell_to_hand_from_oracle(P0, "Shatter", true, DESTROY_TARGET_ARTIFACT)
+        .id();
+    let mut runner = scenario.build();
+
+    let queued_before = runner.state().extra_turns.len();
+    let outcome = runner.cast(removal).target_object(nexus).resolve();
+
+    // Positive reach-guard: the redirect actually claimed the Nexus. Without
+    // this, an unqueued extra turn could be blamed on the artifact never dying.
+    outcome.assert_zone(&[nexus], Zone::Exile);
+
+    let queued = &outcome.state().extra_turns[queued_before..];
+    assert_eq!(
+        queued.len(),
+        1,
+        "CR 500.7: the consequent queues exactly one extra turn"
+    );
+    assert_eq!(
+        queued[0].player, P0,
+        "CR 608.2c: the extra turn goes to the redirect's controller"
     );
 }
 

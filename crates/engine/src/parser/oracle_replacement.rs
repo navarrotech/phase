@@ -6780,6 +6780,25 @@ pub(crate) fn parse_windowed_graveyard_redirect_install(text: &str) -> Option<Ef
     })
 }
 
+/// The mandatory opening token of the graveyard-redirect grammar.
+///
+/// [`parse_graveyard_redirect_replacement`] opens with `tag(REDIRECT_LEAD)` and
+/// [`body_may_be_graveyard_redirect`] is derived from the same constant, so the
+/// cheap pre-check cannot drift away from the grammar it guards: change the
+/// opening token here and both move together.
+const REDIRECT_LEAD: &str = "if ";
+
+/// Could this body possibly match the graveyard-redirect grammar?
+///
+/// A cost gate, never a parse decision. The grammar opens with a mandatory
+/// `tag(REDIRECT_LEAD)`, so a body not starting with that token can never match
+/// and need not pay for the reminder-strip and lowercase allocations a full
+/// attempt would cost. The grammar remains the only authority on acceptance.
+pub(crate) fn body_may_be_graveyard_redirect(text: &str) -> bool {
+    text.get(..REDIRECT_LEAD.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(REDIRECT_LEAD))
+}
+
 /// The shared grammar behind both front doors above. Never called directly by
 /// the dispatcher: the CR 611.2a static-versus-created discrimination is what
 /// decides which of the two a given definition belongs to.
@@ -6847,7 +6866,9 @@ fn parse_graveyard_redirect_replacement(
     let ((scope, token_scope, outcome, subject, window, origin), consequent) =
         nom_on_lower(normalized, norm_lower, |i| {
             // Prefix: "if <subject> would be put into <scope> graveyard[ from <zone>][ <window>], "
-            let (i, _) = tag::<_, _, OracleError<'_>>("if ").parse(i)?;
+            // `REDIRECT_LEAD` is shared with `body_may_be_graveyard_redirect`,
+            // the cheap pre-check callers use to skip this parse entirely.
+            let (i, _) = tag::<_, _, OracleError<'_>>(REDIRECT_LEAD).parse(i)?;
             // Subject: accept any phrase up to " would be put into " — covers
             // "a card", "a nontoken creature", "~", "a creature an opponent controls", …
             // — and classify its token axis (CR 730.3e) from the captured slice.
