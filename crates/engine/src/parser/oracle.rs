@@ -63,8 +63,8 @@ use super::oracle_effect::sequence::try_parse_same_is_true_continuation;
 use super::oracle_effect::{
     ability_chain_grants_chosen_color_keyword, lower_ability_ir, parse_ability_ir_standalone,
     parse_ability_ir_with_context, parse_additional_cost_instead_condition_fragment,
-    parse_effect_chain, parse_effect_chain_with_context, rewrite_condition_keyword,
-    try_parse_temporal_delayed_trigger_ability,
+    parse_effect_chain, parse_effect_chain_with_context, parse_windowed_replacement_install_ir,
+    rewrite_condition_keyword, try_parse_temporal_delayed_trigger_ability,
 };
 use super::oracle_ir::ast::parsed_clause;
 use super::oracle_ir::context::ParseContext;
@@ -3109,9 +3109,16 @@ fn is_spell_resolution_instruction_line(
         return false;
     }
 
+    // The question this gate asks is "does this line stand on its own as a
+    // replacement?", and CR 611.2a gives that answer two shapes: a printed
+    // static hosted on the card, or a windowed definition INSTALLED at
+    // resolution. Both must be named here — reading only the printed-static
+    // route lets a windowed clause be swallowed into the preceding spell body
+    // (Yawgmoth's Will and Gaea's Will, whose line 2 states "this turn").
     if is_replacement_pattern(&effect_lower)
         && !(scan_contains(&effect_lower, "prevent") && scan_contains(&effect_lower, "damage"))
-        && parse_replacement_line(line, card_name).is_some()
+        && (parse_replacement_line(line, card_name).is_some()
+            || parse_windowed_replacement_install_ir(line).is_some())
     {
         return false;
     }
@@ -6732,6 +6739,20 @@ fn parse_normalized_oracle_ir(
                     i += 1;
                     continue;
                 }
+            }
+            // CR 604.2 + CR 611.2a: last resort inside the replacement tier.
+            // Every route above builds a CARD-HOSTED definition, and the printed-
+            // static front door declines any definition that states its own
+            // window ("… from anywhere this turn, …") — a printed static states
+            // none, so such a definition was created by a resolving spell or
+            // ability and belongs in the floating store instead. This line has no
+            // imperative lead, so it never reaches the effect-chain route above
+            // either; without the lift the clause would be recorded as a gap the
+            // parser can in fact represent.
+            if let Some(ir) = parse_windowed_replacement_install_ir(&line) {
+                emitter.ability_ir_at(item_line, ir);
+                i += 1;
+                continue;
             }
         }
 
