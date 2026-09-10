@@ -15681,15 +15681,11 @@ fn parse_windowed_graveyard_redirect_ir(
     kind: AbilityKind,
     ctx: &ParseContext,
 ) -> Option<EffectChainIr> {
-    // Hot-path guard, mirroring the leading-"during " guard at the top of
-    // `parse_ability_ir`: this recognizer runs for every ability of every card,
-    // so the handful of bodies that can possibly match should not make all
-    // ~30k cards' worth pay for the reminder-strip and lowercase allocations.
-    // The gate is DERIVED from the grammar's own opening token rather than
-    // restating it, so it cannot drift; dispatch stays in the nom grammar.
-    if !super::oracle_replacement::body_may_be_graveyard_redirect(text) {
-        return None;
-    }
+    // No pre-check here: the nom grammar's own mandatory opening `tag("if ")` is
+    // the single recognition authority, and a second hand-rolled one — however
+    // it is spelled — is a parallel dispatch path the parser's combinator rule
+    // does not admit. The lowercase allocation it used to save is unmeasurable
+    // against a full card-data run and never happens during gameplay.
     let effect = super::oracle_replacement::parse_windowed_graveyard_redirect_install(text)?;
 
     let mut builder = ClauseIrBuilder::new(text);

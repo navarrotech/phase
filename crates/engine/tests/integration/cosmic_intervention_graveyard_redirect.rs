@@ -4,9 +4,10 @@
 //! Two defects in one clause family:
 //!
 //! 1. **The antecedent's subject was dropped.** `parse_graveyard_exile_replacement`
-//!    read only the graveyard's owner and the CR 730.3e token axis, so Dryad
-//!    Militant ("an instant or sorcery card") and Samurai of the Pale Curtain
-//!    ("a permanent") both installed an unfiltered, board-wide Rest in Peace.
+//!    read only the graveyard's owner and the card/token axis (CR 108.2b +
+//!    CR 111.1), so Dryad Militant ("an instant or sorcery card") and Samurai of
+//!    the Pale Curtain ("a permanent") both installed an unfiltered, board-wide
+//!    Rest in Peace.
 //! 2. **A stated window made the whole line unparseable, or inert.** The
 //!    grammar accepted only "from anywhere", so "from the battlefield" failed
 //!    outright (Ugin's Nexus), and a windowed clause that did parse was hosted
@@ -24,10 +25,11 @@
 //! window, so a definition that states one was CREATED by a resolving spell or
 //! ability and must be installed into the floating store instead.
 
-use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
+use engine::game::scenario::{CastOutcome, GameRunner, GameScenario, P0, P1};
 use engine::parser::parse_oracle_text;
 use engine::types::ability::{Effect, FilterProp, TargetFilter, TypeFilter};
 use engine::types::actions::GameAction;
+use engine::types::events::GameEvent;
 use engine::types::game_state::WaitingFor;
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaType, ManaUnit};
@@ -412,7 +414,7 @@ fn permanent_subject_is_battlefield_scoped() {
     }));
 }
 
-/// CR 730.3e + CR 111.1: the bare card/token nouns ARE the token axis and
+/// CR 108.2b + CR 111.1: the bare card/token nouns ARE the token axis and
 /// constrain nothing else. Rest in Peace must keep its unfiltered board-wide
 /// redirect — the subject reader has to decline them, not re-express them.
 #[test]
@@ -511,6 +513,98 @@ fn ugins_nexus_redirect_queues_the_extra_turn_for_its_controller() {
         queued[0].player, P0,
         "CR 608.2c: the extra turn goes to the redirect's controller"
     );
+}
+
+/// CR 108.2b + CR 111.1: "tokens aren't considered cards", so a token-only
+/// antecedent must claim tokens and leave cards alone.
+///
+/// A RUNTIME card-versus-token regression, not a parse-shape test: the token
+/// axis is only meaningful once an object actually moves, and
+/// `game/filter.rs` resolves `FilterProp::Token` off `record.is_token` on the
+/// zone-change snapshot. Before the fix the subject was discarded entirely
+/// (`valid_card: None`) and the nontoken creature was exiled too, so the second
+/// assertion is the one that bites.
+///
+/// No printed card carries a token-only antecedent today — the five real cards
+/// whose subject mentions tokens all read "a card or token" (Rest in Peace,
+/// Necrodominance, Festival of Embers, Hades) or "a nontoken creature"
+/// (Anafenza). This guards a shape the GRAMMAR accepts, which is where the
+/// unfiltered redirect would come from.
+#[test]
+fn token_only_antecedent_claims_tokens_and_spares_cards() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    fund(&mut scenario, P0);
+
+    // Name shares no word with the clause, so self-reference normalization
+    // cannot rewrite the subject to `~` and silently change what is tested.
+    scenario.add_enchantment_from_oracle(
+        P0,
+        "Chronal Sieve",
+        "If a token would be put into a graveyard from anywhere, exile it instead.",
+    );
+
+    let token = scenario.add_creature(P0, "Spirit", 1, 1).id();
+    let card_creature = scenario.add_creature(P0, "Bear Cub", 2, 2).id();
+    let kill_token = scenario
+        .add_spell_to_hand_from_oracle(P0, "Murder", true, DESTROY_TARGET_CREATURE)
+        .id();
+    let kill_card = scenario
+        .add_spell_to_hand_from_oracle(P0, "Murder B", true, DESTROY_TARGET_CREATURE)
+        .id();
+    let mut runner = scenario.build();
+    // CR 111.1: the only difference between the two creatures is token identity,
+    // which is what the antecedent selects on.
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&token)
+        .expect("the token creature exists")
+        .is_token = true;
+
+    // POSITIVE REACH-GUARD: the shield is live and does claim a token.
+    // CR 111.7 removes a token from `objects` once it has left the battlefield,
+    // so its destination is read off the `ZoneChanged` event rather than
+    // `zone_of`, which would panic on the vanished id.
+    let token_outcome = runner.cast(kill_token).target_object(token).resolve();
+    assert_eq!(
+        token_destination(&token_outcome, token),
+        Some(Zone::Exile),
+        "CR 111.1: the token-only antecedent must claim the token"
+    );
+
+    // THE BITE. Before the fix the subject was discarded and `valid_card` was
+    // None, so this creature CARD was exiled along with the token.
+    let card_outcome = runner
+        .cast(kill_card)
+        .target_object(card_creature)
+        .resolve();
+    assert_eq!(
+        card_outcome.zone_of(card_creature),
+        Zone::Graveyard,
+        "CR 108.2b: tokens aren't cards, so a token-only antecedent must NOT \
+         redirect a nontoken creature card"
+    );
+    // The resolving instant is a card too (CR 608.2n). An unfiltered redirect
+    // swallowed it into exile, which is the same defect seen from the other end.
+    assert_eq!(
+        card_outcome.zone_of(kill_card),
+        Zone::Graveyard,
+        "CR 608.2n + CR 108.2b: the resolving spell card must reach its owner's \
+         graveyard, not be claimed by a token-only shield"
+    );
+}
+
+/// Where a token ended up, read from the zone-change event stream.
+///
+/// CR 111.7: a token that has left the battlefield ceases to exist and is
+/// dropped from `objects`, so `Outcome::zone_of` cannot answer for it. The
+/// `ZoneChanged` event is emitted before that cleanup and survives it.
+fn token_destination(outcome: &CastOutcome, token: ObjectId) -> Option<Zone> {
+    outcome.events().iter().find_map(|event| match event {
+        GameEvent::ZoneChanged { object_id, to, .. } if *object_id == token => Some(*to),
+        _ => None,
+    })
 }
 
 fn filter_mentions(filter: &TargetFilter, wanted: &TypeFilter) -> bool {
