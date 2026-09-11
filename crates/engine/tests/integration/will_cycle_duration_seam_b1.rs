@@ -29,6 +29,25 @@
 //! `v5_will_cycle_cards_remain_honestly_unsupported` pins that as a REGRESSION
 //! GUARD, not as a discriminating test.
 //!
+//! **One precision on that statement.** "These cards parse to
+//! `Effect::Unimplemented`" is only half true, and the nuance matters for
+//! anyone who later closes this gap. The CAST half of "you may play lands and
+//! cast spells from your graveyard" ALREADY lowers to `Effect::CastFromZone`,
+//! in `sub_ability` — a position the instrument originally used to write this
+//! file never read. Only the LAND half is refused, as the bare fragment
+//! `"play lands"`, which `try_parse_cast_effect`'s guard declines because a
+//! zone-less "play lands" genuinely is not a grant. So these cards are HALF
+//! parsed, and `v5` below asserts only that a refusal is still present.
+//!
+//! **Parsing the land half is NOT sufficient to support these cards.**
+//! MEASURED: `graveyard_lands_playable_by_permission` returns `[]` after
+//! resolving the real Yawgmoth's Will even when both halves parse, because
+//! `Effect::CastFromZone` is not a channel any land-permission consumer reads.
+//! The consumers (`casting::graveyard_permission_sources`) read
+//! `StaticMode::GraveyardCastPermission` instead. Closing this gap therefore
+//! needs a DELIVERY seam, not another parser arm — see the U1 note below, which
+//! is that seam's prerequisite.
+//!
 //! **Stack size.** `parse_oracle_text` overflows the default 8 MB test stack
 //! and prints a convincing PARTIAL negative on the way down. Every body that
 //! calls it therefore runs on a 256 MB thread via `on_big_stack`.
@@ -179,6 +198,31 @@ fn v1_leading_until_end_of_turn_head_no_longer_blocks_the_permission() {
     let (g_freq, g_mode) = permission_mode(&headless);
     assert_eq!(*g_freq, CastFrequency::Unlimited);
     assert_eq!(*g_mode, CardPlayMode::Play);
+
+    // THE WINDOW MUST NOT NARROW THE PERMISSION.
+    //
+    // This row was the gap that let a real bug through. The two assertions above
+    // compare `frequency` and `play_mode` between the windowed and headless
+    // forms, and both matched — while `affected`, the field that decides WHICH
+    // graveyard cards the permission actually offers, silently differed:
+    //
+    //     headless  -> Or[ Typed[Land], Typed[Card] ]   (play lands AND cast spells)
+    //     windowed  -> Typed[Land]                      (the cast half, gone)
+    //
+    // Cause: `try_parse_unlimited_combined_graveyard_permission` — the only
+    // branch that builds the two-part filter — requires a leading
+    // `"you may play "`, and the duration-head strip ran AFTER it. A windowed
+    // sentence fell through to the single-verb dispatch instead.
+    //
+    // Invisible to every parse-shape assertion in this suite, and only
+    // observable at runtime through `graveyard_permission_sources`, which reads
+    // `affected` to decide what a player may cast. Comparing the two forms'
+    // FULL definitions is what closes that class.
+    assert_eq!(
+        def.affected, headless.affected,
+        "CR 611.2a: a stated window scopes the permission, it must not narrow which \
+         cards the permission covers — windowed and headless must agree"
+    );
 }
 
 #[test]

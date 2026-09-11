@@ -33,6 +33,7 @@ use crate::types::zones::Zone;
 
 use super::oracle_nom::bridge::{nom_on_lower, split_once_on_lower};
 use super::oracle_nom::condition::parse_graveyard_keyword_grant_sentence;
+use super::oracle_nom::prevention::has_each_time_event_relative_prevention;
 use super::oracle_nom::primitives::{
     parse_number as nom_parse_number, parse_object_recipient_pronoun, parse_period_sentences,
     scan_at_word_boundaries, scan_contains, scan_preceded,
@@ -6597,6 +6598,23 @@ fn parse_normalized_oracle_ir(
 
         // Priority 8: Replacement patterns
         if is_replacement_pattern(&lower) {
+            // The replacement classifier correctly recognizes this prevention
+            // wording, but the engine cannot yet model its continuous,
+            // repeatable damage-event watcher. Preserve the precise `prevent`
+            // gap rather than degrading it to the generic replacement-structure
+            // fallback below.
+            if has_each_time_event_relative_prevention(&lower) {
+                emitter.ability_at(
+                    item_line,
+                    AbilityDefinition::new(
+                        AbilityKind::Spell,
+                        Effect::unimplemented("prevent", &line),
+                    )
+                    .description(line.clone()),
+                );
+                i += 1;
+                continue;
+            }
             // CR 208.2b + CR 614.1c + CR 614.12a: modal "As ~ enters, it becomes
             // your choice of [P/T profiles]" as-enters replacement (Primal Plasma,
             // Primal Clay, Corrupted Shapeshifter, Aquamorph Entity). This is a

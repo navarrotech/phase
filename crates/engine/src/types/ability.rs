@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fmt;
+use std::num::NonZeroU32;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
@@ -23315,7 +23316,9 @@ pub enum ActivationRestriction {
     /// Read from `GameObject::harnessed`. Sibling of `IsSolved` (CR 719.3c) — a
     /// per-object designation activation gate, not a parameterization of it.
     SourceIsHarnessed,
-    /// CR 716.4: Level N+1 ability can only activate when the source Class is at exactly this level.
+    /// CR 716.2a: "[Cost]: Level N" activates only while the source Class is at
+    /// exactly this level (N-1). CR 716.4 is the disjoint leveler-card rule and
+    /// explicitly does not interact with Class levels.
     ClassLevelIs {
         level: u8,
     },
@@ -28160,14 +28163,14 @@ pub enum DamageModification {
     /// shared `Minus` applier arm: subtraction is applied by the SAME match arm
     /// as `Minus`, and only this provenance additionally emits `DamagePrevented`
     /// bookkeeping plus the CR 615.5 prevented-amount handoff for
-    /// "damage prevented this way" continuations. A `value` of `u32::MAX` is
+    /// "damage prevented this way" continuations. A fixed value of `u32::MAX` is
     /// the continuous prevent-all sentinel (saturating-subtraction yields 0 for
     /// any amount; the replacement is not consumed — continuous, not
     /// shield-style, distinct from `ShieldKind::Prevention { All }`).
     ///
     /// Provenance is a sibling variant rather than a field on `Minus` to
     /// preserve the established `Minus { value }` construction shape.
-    PreventionMinus { value: u32 },
+    PreventionMinus { value: PreventionFormula },
     /// CR 614.1a: Conditional — if amount < source's power, set amount = source's power.
     /// References the replacement source's (not the damage source's) current post-layer power.
     /// Used by Ojer Axonil: "deals damage equal to ~'s power instead."
@@ -28184,6 +28187,33 @@ pub enum DamageModification {
     /// Used by Worship: "damage that would reduce your life total to less
     /// than 1 reduces it to 1 instead."
     LifeFloor { minimum: i32 },
+}
+
+/// CR 615.1a + CR 107.1a: amount removed from each matching damage event.
+///
+/// The numeric `Fixed` form serializes as the legacy bare value inside
+/// `DamageModification::PreventionMinus`, so existing card data continues to
+/// load and round-trip unchanged. `Quantity` is evaluated when the replacement
+/// applies; `Fraction` is evaluated from the in-flight damage event, not from a
+/// game-state quantity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PreventionFormula {
+    Fixed(u32),
+    Quantity {
+        quantity: QuantityExpr,
+    },
+    Fraction {
+        numerator: u32,
+        denominator: NonZeroU32,
+        rounding: RoundingMode,
+    },
+}
+
+impl PreventionFormula {
+    pub const fn fixed(value: u32) -> Self {
+        Self::Fixed(value)
+    }
 }
 
 /// CR 614.1a: Quantity modification for replacement effects (tokens, counters).
@@ -28444,6 +28474,26 @@ pub enum ReplacementMode {
     },
 }
 
+/// Authority for an optional replacement's accept/decline prompt.
+/// CR 109.5 assigns a source's "you may" choice to that source's controller;
+/// CR 616.1 separately assigns the affected player the ordering of multiple
+/// applicable replacement or prevention effects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplacementChoiceAuthority {
+    /// The affected player, used by the default optional-replacement prompt.
+    #[default]
+    AffectedPlayer,
+    /// CR 109.5: "you" in a source's optional replacement text means that
+    /// source's controller (for example, "you may prevent").
+    SourceController,
+}
+
+impl ReplacementChoiceAuthority {
+    pub const fn is_affected_player(&self) -> bool {
+        matches!(self, Self::AffectedPlayer)
+    }
+}
+
 /// CR 614.6 + CR 615.5: Continuation effect that runs after a replacement
 /// effect's modifications complete. Stashed by the replacement pipeline,
 /// drained by callers (`engine_replacement`, `stack`, `deal_damage`,
@@ -28510,6 +28560,15 @@ pub struct ReplacementDefinition {
     pub runtime_execute: Option<Box<ResolvedAbility>>,
     #[serde(default)]
     pub mode: ReplacementMode,
+    /// CR 109.5: an optional "you may prevent" choice belongs to the
+    /// replacement source's controller. Defaults to the affected player for
+    /// compatibility; CR 616.1 still governs ordering multiple applicable
+    /// replacement or prevention effects.
+    #[serde(
+        default,
+        skip_serializing_if = "ReplacementChoiceAuthority::is_affected_player"
+    )]
+    pub choice_authority: ReplacementChoiceAuthority,
     #[serde(default)]
     pub valid_card: Option<TargetFilter>,
     #[serde(default)]
@@ -28851,6 +28910,7 @@ impl ReplacementDefinition {
             execute: None,
             runtime_execute: None,
             mode: ReplacementMode::Mandatory,
+            choice_authority: ReplacementChoiceAuthority::AffectedPlayer,
             valid_card: None,
             description: None,
             condition: None,
@@ -28899,6 +28959,11 @@ impl ReplacementDefinition {
 
     pub fn mode(mut self, mode: ReplacementMode) -> Self {
         self.mode = mode;
+        self
+    }
+
+    pub fn choice_authority(mut self, authority: ReplacementChoiceAuthority) -> Self {
+        self.choice_authority = authority;
         self
     }
 
@@ -34138,6 +34203,19 @@ mod tests {
         let json = serde_json::to_string(&replacement).unwrap();
         let deserialized: ReplacementDefinition = serde_json::from_str(&json).unwrap();
         assert_eq!(replacement, deserialized);
+    }
+
+    #[test]
+    fn prevention_formula_keeps_legacy_fixed_json_shape() {
+        let legacy = r#"{"type":"PreventionMinus","value":2}"#;
+        let formula: DamageModification = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            formula,
+            DamageModification::PreventionMinus {
+                value: PreventionFormula::Fixed(2),
+            }
+        );
+        assert_eq!(serde_json::to_string(&formula).unwrap(), legacy);
     }
 
     #[test]

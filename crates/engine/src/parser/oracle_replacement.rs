@@ -25,6 +25,9 @@ use super::oracle_nom::condition::{
 };
 use super::oracle_nom::duration::parse_duration;
 use super::oracle_nom::filter as nom_filter;
+use super::oracle_nom::prevention::{
+    has_event_relative_prevention_amount, parse_damage_prevention_formula,
+};
 use super::oracle_nom::primitives as nom_primitives;
 use super::oracle_nom::quantity as nom_quantity;
 use super::oracle_nom::target::parse_type_filter_word;
@@ -40,11 +43,11 @@ use crate::types::ability::{
     CounterReplacementSubject, DamageModification, DamageRedirectTarget, DamageTargetFilter,
     DamageTargetPlayerScope, DieRollIgnoreRule, DrawReplacementScope, Duration, Effect,
     EffectScope, FilterProp, LibraryPosition, ManaModification, ManaReplacementScope,
-    ManaSpendPermission, PermissionGrantee, PlayerFilter, PreventionAmount, QuantityExpr,
-    QuantityModification, QuantityRef, RedirectionLifetime, ReplacementCondition,
-    ReplacementDefinition, ReplacementMode, ReplacementPlayerScope, SourceExclusion,
-    StaticCondition, StaticDefinition, TapStateChange, TargetFilter, TriggerDefinition, TypeFilter,
-    TypedFilter,
+    ManaSpendPermission, PermissionGrantee, PlayerFilter, PreventionAmount, PreventionFormula,
+    QuantityExpr, QuantityModification, QuantityRef, RedirectionLifetime,
+    ReplacementChoiceAuthority, ReplacementCondition, ReplacementDefinition, ReplacementMode,
+    ReplacementPlayerScope, SourceExclusion, StaticCondition, StaticDefinition, TapStateChange,
+    TargetFilter, TriggerDefinition, TypeFilter, TypedFilter,
 };
 use crate::types::ability::{CardPlayMode, CastingPermission};
 use crate::types::card_type::Supertype;
@@ -7473,6 +7476,10 @@ pub(crate) fn parse_oneshot_damage_replacement(
     // `PreventDamage` resolver builds a one-shot `ShieldKind::Prevention` shield;
     // route the source-scoped one-shot prevention through it rather than
     // duplicating the shield-creation flow.
+    if has_event_relative_prevention_amount(result_clause) {
+        return Some(Effect::unimplemented("prevent", result_clause));
+    }
+
     if nom_primitives::scan_contains(result_clause, "prevent that damage")
         || nom_primitives::scan_contains(result_clause, "prevent the damage")
     {
@@ -8431,10 +8438,11 @@ fn finish_damage_source_subject(subject: &str) -> Option<TargetFilter> {
         .map_or(subject, |(rest, _)| rest)
         .trim();
 
-    // "a spell" — any spell is the source; no typed filter (Benevolent Unicorn).
-    // Must precede `parse_type_phrase_folding`, which maps bare "spell" to Card.
+    // "a spell" is a source-category restriction, not an untyped source. Must
+    // precede `parse_type_phrase_folding`, which maps bare "spell" to Card.
+    // `StackSpell` excludes permanent and activated/triggered-ability damage.
     if subject == "spell" {
-        return None;
+        return Some(TargetFilter::StackSpell);
     }
 
     // "a source" / "sources" with no qualifier — no filter needed (matches any source).
@@ -8808,8 +8816,9 @@ fn parse_damage_target_phrase(
         // arm so the longer production wins; without it the conjunct's permanent
         // leg is silently dropped and only the controller is protected.
         //
-        // The noun phrase is NOT re-spelled here: `"to you and "` is the only tag
-        // this arm owns, and everything after it delegates to
+        // The connector is semantically a union for a damage event: "and",
+        // "or", and "and/or" all introduce the permanent leg. The noun
+        // phrase is NOT re-spelled here; everything after it delegates to
         // `nom_filter::parse_controlled_permanents_conjunct` — the single
         // authority shared with the `Effect::PreventDamage` surface in
         // `oracle_effect/imperative.rs` (`parse_compound_you_and_permanents` →
@@ -8817,19 +8826,9 @@ fn parse_damage_target_phrase(
         // therefore agree on the six plural nouns AND on the CR 109.1 "other"
         // article, which is carried into `source_scope` rather than discarded.
         //
-        // BOUNDARY — the `"and/or"` spelling is deliberately out of scope. The
-        // prefix `tag("to you and ")` carries a trailing space, so it cannot match
-        // "to you and/or ...". Five corpus cards use that spelling — Divine
-        // Deflection, Refraction Trap, Shadowbane (`Effect::PreventDamage`) and
-        // Harm's Way, Shining Shoal (the one-shot "next N damage" family) — and
-        // all five collapse their victim to the controller today on OTHER parsers.
-        // Widening this to `alt((tag("to you and "), tag("to you and/or ")))`
-        // reclassifies all five across two other effect paths and must not be done
-        // without re-running the card-data corpus diff; see the negative guard
-        // `damage_target_phrase_does_not_claim_and_or_conjunct`.
         nom::combinator::map(
             preceded(
-                tag("to you and "),
+                alt((tag("to you and "), tag("to you or "), tag("to you and/or "))),
                 nom_filter::parse_controlled_permanents_conjunct,
             ),
             |conjunct| DamageTargetFilter::PlayerOrPermanentsControlledBy {
@@ -12210,7 +12209,7 @@ fn parse_damage_prevention_replacement(
     // outside the prevention bookkeeping.
     enum PreventionRepr {
         Shield(PreventionAmount),
-        Reduce(u32),
+        Reduce(PreventionFormula),
     }
     let repr = if let Some((after_all_but, _)) =
         after_prevent.and_then(|s| tag::<_, _, OracleError<'_>>("all but ").parse(s).ok())
@@ -12239,12 +12238,9 @@ fn parse_damage_prevention_replacement(
         // stays with the chunk-level where-X machinery. Any miss (no number, or
         // no adjacent " of that damage" anchor) means this is not a recognized
         // prevention pattern, so `?` bails the whole parse.
-        let n = after_prevent.and_then(|s| {
-            nom_parse_lower(s, |i| {
-                terminated(nom_primitives::parse_number, tag(" of that damage")).parse(i)
-            })
-        })?;
-        PreventionRepr::Reduce(n)
+        let formula =
+            after_prevent.and_then(|s| nom_parse_lower(s, parse_damage_prevention_formula))?;
+        PreventionRepr::Reduce(formula)
     };
 
     // --- 2. Extract combat scope ---
@@ -12265,7 +12261,16 @@ fn parse_damage_prevention_replacement(
     // controller or a spell target slot) — that signal gates the follow-up
     // object/owner-anaphor rewrite in step 5 below.
     let (damage_target_filter, recipient_from_event): (Option<DamageTargetFilter>, bool) =
-        if nom_primitives::scan_contains(working_lower, "dealt to you")
+        if let Some(tf @ DamageTargetFilter::PlayerOrPermanentsControlledBy { .. }) =
+            parse_damage_recipient_scope(working_lower)
+        {
+            // Keep compound player/permanent recipients ahead of the bare
+            // controller scan: "to you or another permanent you control" is
+            // one recipient domain, not a player-only shield. Its rider's
+            // anaphor refers to the actual damage recipient for every player
+            // scope (controller, opponent, or source-chosen player).
+            (Some(tf), true)
+        } else if nom_primitives::scan_contains(working_lower, "dealt to you")
             || nom_primitives::scan_contains(working_lower, "deal to you")
         {
             // CR 615.1a: Recipient is the shield controller; not an event anaphor.
@@ -12380,10 +12385,19 @@ fn parse_damage_prevention_replacement(
         // every qualifying event, and emitting `DamagePrevented` bookkeeping
         // (which plain-arithmetic `Minus`, e.g. Benevolent Unicorn's "minus 1",
         // must not).
-        PreventionRepr::Reduce(n) => {
-            def.damage_modification(DamageModification::PreventionMinus { value: n })
+        PreventionRepr::Reduce(value) => {
+            def.damage_modification(DamageModification::PreventionMinus { value })
         }
     };
+
+    // CR 615.1a: "you may prevent" is an optional prevention replacement;
+    // the modal choice belongs to the ability's controller, while the separate
+    // CR 616.1 ordering choice remains with the affected player.
+    if nom_primitives::scan_contains(working_lower, "you may prevent ") {
+        def = def
+            .mode(ReplacementMode::Optional { decline: None })
+            .choice_authority(ReplacementChoiceAuthority::SourceController);
+    }
 
     if let Some(cs) = combat_scope {
         def = def.combat_scope(cs);
@@ -12423,13 +12437,15 @@ fn parse_damage_prevention_replacement(
     // the prevented event's damage recipient, exactly like a typed `valid_card`
     // does — so the cohort-2 anaphor rewrite must fire for it too.
     let recipient_is_event_filter = valid_card_filter.is_some() || recipient_from_event;
-    // CR 301.5f/303.4b: an OBJECT-recipient shield (typed `valid_card`, e.g.
-    // Panther Habit's equipped creature) rebinds a bare "it" rider to the damage
-    // recipient. Compute by borrow BEFORE the move below; the self-scoped cohort
-    // (`valid_card == SelfRef` — Anti-Venom, Unbreathing Horde) is excluded so it
-    // keeps its source-referring rider.
-    let recipient_is_object =
-        matches!(&valid_card_filter, Some(f) if !matches!(f, TargetFilter::SelfRef));
+    // CR 615.5: an object-recipient shield (typed `valid_card`, e.g. Panther
+    // Habit's equipped creature) or a compound player/permanent scope rebinds a
+    // bare "it" rider to the actual damage recipient. The compound scope's
+    // recipient is event-derived even though it does not use `valid_card`.
+    // Compute by borrow BEFORE the move below; the self-scoped cohort
+    // (`valid_card == SelfRef` — Anti-Venom, Unbreathing Horde) is excluded so
+    // it keeps its source-referring rider.
+    let recipient_is_object = recipient_from_event
+        || matches!(&valid_card_filter, Some(f) if !matches!(f, TargetFilter::SelfRef));
     // CR 608.2k: A self-scoped shield ("dealt to ~") rebinds the rider's dangling
     // anaphor to the SOURCE, not the event recipient — see the follow-up rewrite
     // branch below. Kept as its own predicate (rather than `!recipient_is_object`)
@@ -12520,10 +12536,10 @@ fn parse_damage_prevention_replacement(
             if recipient_is_event_filter {
                 rewrite_parent_target_to_post_replacement_damage_target(&mut followup_def);
             }
-            // CR 615.5 + CR 301.5f/303.4b: in an object-recipient shield a bare
-            // "it" in the prevented-amount rider (Panther Habit "put that many
-            // +1/+1 counters on it") lowers to SelfRef but means the damage
-            // recipient.
+            // CR 615.5: in an object-recipient or compound player/permanent
+            // shield, a bare "it" in the prevented-amount rider (Panther Habit
+            // "put that many +1/+1 counters on it") lowers to SelfRef but means
+            // the event's actual damage recipient.
             if recipient_is_object {
                 rewrite_self_ref_to_post_replacement_damage_target(&mut followup_def);
             }
@@ -15539,7 +15555,9 @@ mod tests {
 
         assert_eq!(
             def.damage_modification,
-            Some(DamageModification::PreventionMinus { value: 1 }),
+            Some(DamageModification::PreventionMinus {
+                value: PreventionFormula::Fixed(1),
+            }),
             "bare 'prevent 1 of that damage' must install a continuous \
              PreventionMinus(1) modification (prevention provenance of the \
              shared Minus subtraction), not fall through unparsed"
@@ -15859,7 +15877,9 @@ mod tests {
 
         assert_eq!(
             def.damage_modification,
-            Some(DamageModification::PreventionMinus { value: 2 })
+            Some(DamageModification::PreventionMinus {
+                value: PreventionFormula::Fixed(2),
+            })
         );
         assert_eq!(def.shield_kind, ShieldKind::None);
         assert!(
@@ -21044,7 +21064,7 @@ mod tests {
             def.damage_modification,
             Some(DamageModification::Minus { value: 1 })
         );
-        assert_eq!(def.damage_source_filter, None); // "a spell" → no source filter
+        assert_eq!(def.damage_source_filter, Some(TargetFilter::StackSpell));
         assert_eq!(def.damage_target_filter, None); // "permanent or player" = any
     }
 
@@ -22803,38 +22823,27 @@ mod tests {
     }
 
     #[test]
-    fn damage_target_phrase_does_not_claim_and_or_conjunct() {
-        // BOUNDARY guard for the shared `parse_damage_target_phrase` edit. The new
-        // conjunct arm leads with `tag("to you and ")` (trailing space), so the
-        // "and/or" spelling falls through to the pre-existing bare `tag("to you")`
-        // arm — it does NOT error. Five corpus cards use that spelling (Divine
-        // Deflection, Refraction Trap, Shadowbane on `Effect::PreventDamage`;
-        // Harm's Way, Shining Shoal on the one-shot path) and must stay on their
-        // current parsers. Widening the tag would silently reclassify all five.
-        for (phrase, unconsumed) in [
-            (
-                "to you and/or permanents you control",
-                " and/or permanents you control",
-            ),
-            (
-                "to you and/or creatures you control",
-                " and/or creatures you control",
-            ),
+    fn damage_target_phrase_composes_player_and_permanent_connectors() {
+        // Each damage event has exactly one recipient, so "you and/or one or
+        // more creatures you control" has the same per-event recipient domain
+        // as the existing player-or-controlled-permanents representation.
+        for phrase in [
+            "to you and/or permanents you control",
+            "to you and/or creatures you control",
         ] {
             let (rest, filter) =
-                parse_damage_target_phrase(phrase).expect("the bare \"to you\" arm still matches");
-            assert_eq!(
+                parse_damage_target_phrase(phrase).expect("the and/or conjunct must parse");
+            assert!(rest.is_empty(), "{phrase} must be fully consumed");
+            assert!(matches!(
                 filter,
-                damage_target_controller(),
-                "the and/or spelling must not reach PlayerOrPermanentsControlledBy"
-            );
-            assert_eq!(
-                rest, unconsumed,
-                "the and/or conjunct must be left entirely unconsumed"
-            );
+                DamageTargetFilter::PlayerOrPermanentsControlledBy {
+                    player: DamageTargetPlayerScope::Controller,
+                    ..
+                }
+            ));
         }
 
-        // Paired positive: the space-separated spelling DOES reach the new arm.
+        // The space-separated spelling reaches the same shared authority.
         let (rest, filter) = parse_damage_target_phrase("to you and other permanents you control")
             .expect("the conjunct arm must match the space-separated spelling");
         assert_eq!(
@@ -27238,6 +27247,7 @@ mod snapshot_tests {
 mod opposition_agent_parser_tests {
     use super::*;
     use crate::types::ability::{CastingPermission, ManaSpendPermission, PermissionGrantee};
+    use crate::types::card_type::CoreType;
     use crate::types::statics::{CastFrequency, ProhibitionScope, StaticMode};
 
     const REPLACEMENT_TEXT: &str = "While an opponent is searching their library, they exile each card they find. You may play those cards for as long as they remain exiled, and you may spend mana as though it were mana of any color to cast them.";
@@ -27390,5 +27400,122 @@ mod opposition_agent_parser_tests {
             .abilities
             .iter()
             .any(|ability| matches!(ability.effect.as_ref(), Effect::Unimplemented { .. })));
+    }
+
+    #[test]
+    fn event_relative_prevention_cards_keep_their_formula_and_scope() {
+        let gisela = parse_replacement_line(
+            "If a source would deal damage to you or a permanent you control, prevent half that damage, rounded up.",
+            "Gisela, Blade of Goldnight",
+        )
+        .expect("Gisela prevention replacement");
+        assert!(matches!(
+            gisela.damage_modification,
+            Some(DamageModification::PreventionMinus {
+                value: PreventionFormula::Fraction {
+                    rounding: crate::types::ability::RoundingMode::Up,
+                    ..
+                }
+            })
+        ));
+        assert!(matches!(
+            gisela.damage_target_filter,
+            Some(DamageTargetFilter::PlayerOrPermanentsControlledBy {
+                player: DamageTargetPlayerScope::Controller,
+                source_scope: SourceExclusion::Include,
+                ..
+            })
+        ));
+
+        let battletide = parse_replacement_line(
+            "If a source would deal damage to a player, you may prevent X of that damage, where X is the number of Clerics you control.",
+            "Battletide Alchemist",
+        )
+        .expect("Battletide prevention replacement");
+        assert!(matches!(
+            battletide.damage_modification,
+            Some(DamageModification::PreventionMinus {
+                value: PreventionFormula::Quantity { .. }
+            })
+        ));
+        assert!(matches!(battletide.mode, ReplacementMode::Optional { .. }));
+        assert_eq!(
+            battletide.choice_authority,
+            ReplacementChoiceAuthority::SourceController
+        );
+    }
+
+    #[test]
+    fn spell_source_and_complete_recipient_domains_do_not_widen() {
+        let rem = parse_replacement_line(
+            "If a spell would deal damage to you or another permanent you control, prevent that damage.",
+            "Rem Karolus, Stalwart Slayer",
+        )
+        .expect("Rem Karolus prevention replacement");
+        assert_eq!(rem.damage_source_filter, Some(TargetFilter::StackSpell));
+        assert!(matches!(
+            rem.damage_target_filter,
+            Some(DamageTargetFilter::PlayerOrPermanentsControlledBy {
+                player: DamageTargetPlayerScope::Controller,
+                source_scope: SourceExclusion::Exclude,
+                ..
+            })
+        ));
+
+        let rem_bonus = parse_replacement_line(
+            "If a spell would deal damage to an opponent or a permanent an opponent controls, it deals that much damage plus 1 instead.",
+            "Rem Karolus, Stalwart Slayer",
+        )
+        .expect("Rem Karolus damage bonus replacement");
+        assert_eq!(
+            rem_bonus.damage_source_filter,
+            Some(TargetFilter::StackSpell)
+        );
+        assert_eq!(
+            rem_bonus.damage_target_filter,
+            Some(damage_target_opponent_or_permanents())
+        );
+
+        let plated = parse_replacement_line(
+            "If a spell would deal damage to a permanent or player, prevent 1 damage that spell would deal to that permanent or player.",
+            "Plated Pegasus",
+        )
+        .expect("Plated Pegasus prevention replacement");
+        assert_eq!(plated.damage_source_filter, Some(TargetFilter::StackSpell));
+        assert_eq!(
+            plated.damage_modification,
+            Some(DamageModification::PreventionMinus {
+                value: PreventionFormula::Fixed(1),
+            })
+        );
+        assert_eq!(plated.damage_target_filter, None);
+    }
+
+    #[test]
+    fn cardinality_recipient_syntax_uses_the_static_replacement_path() {
+        let def = parse_replacement_line(
+            "If a creature would deal combat damage to you and/or one or more creatures you control, prevent X of that damage, where X is the number of age counters on this enchantment.",
+            "Cover of Winter",
+        )
+        .expect("Cover of Winter prevention replacement");
+        assert_eq!(def.combat_scope, Some(CombatDamageScope::CombatOnly));
+        assert_eq!(
+            def.damage_target_filter,
+            Some(DamageTargetFilter::PlayerOrPermanentsControlledBy {
+                player: DamageTargetPlayerScope::Controller,
+                permanent_type: Some(CoreType::Creature),
+                source_scope: SourceExclusion::Include,
+            })
+        );
+        assert_eq!(
+            def.damage_source_filter,
+            Some(TargetFilter::Typed(TypedFilter::creature()))
+        );
+        assert!(matches!(
+            def.damage_modification,
+            Some(DamageModification::PreventionMinus {
+                value: PreventionFormula::Quantity { .. }
+            })
+        ));
     }
 }

@@ -37017,6 +37017,131 @@ pub(crate) fn parse_effect_chain_ir(
         // CR 603.7a: Check for temporal prefix before suffix. When present, parse the
         // inner effect through the full pipeline and wrap in CreateDelayedTrigger.
         let (text_after_prefix, prefix_delayed) = strip_temporal_prefix(&text);
+        // CR 601.2 vs CR 603.7 (issue #8721): the cast-permission back-reference
+        // ("if you cast a spell this way, …" / "when you cast that spell, …") is
+        // recognized HERE rather than inside `strip_temporal_prefix`, because
+        // deciding it needs the CONSEQUENT, and only this site has the `kind` +
+        // `ctx` the consequent parse requires.
+        //
+        // Two categories share the one prefix, and the consequent is the only
+        // honest discriminator (MEASURED over the full corpus: 33 cards carry one
+        // of these two prefixes, between them printing 20 distinct consequent
+        // wordings):
+        //   * a PROPERTY of the granted cast — "you cast it without paying its
+        //     mana cost" (Brilliant Ultimatum, X), "mana of any type can be spent
+        //     to cast it" (Bloodsoaked Insight). Both are COST rules rather than
+        //     ability grants, which is why an earlier revision's CR 601.2a
+        //     ("effects that cause the spell to GAIN ABILITIES") was the wrong
+        //     anchor: CR 118.9 names "you may cast [this object] without paying
+        //     its mana cost" as an alternative cost, announced during casting per
+        //     CR 118.9a, and CR 118.14 is the "mana of any type can be spent"
+        //     rule, which says outright that where the effect also grants
+        //     permission to cast, it applies to the mana spent casting that way.
+        //     CR 601.2 puts cost determination and payment inside casting, so both
+        //     must be live BEFORE the cast; a delayed trigger firing after it
+        //     would be too late. These lower to
+        //     `CastFromZone` (the cast restated) or `GenericEffect` (a static
+        //     modification of the grant), and are left exactly as they parsed
+        //     before this change.
+        //   * a CONSEQUENCE of the cast — "put a +1/+1 counter on ~"
+        //     (Helmut Zemo), "this creature gets +X/+0" (Ogre Battlecaster).
+        //     CR 603.7: a separate ability that triggers on the later cast.
+        //
+        // Asking the parsed consequent what it IS (D1) rather than matching its
+        // wording: a new cast-property wording lowers to the same two variants
+        // and is excluded for free, where a wording list would miss it.
+        let (text_after_prefix, prefix_delayed) = match prefix_delayed {
+            Some(condition) => (text_after_prefix, Some(condition)),
+            // TARGETLESS GRANTS ARE LEFT ALONE (review of PR #8749).
+            //
+            // The condition this recognizer emits scopes itself with
+            // `valid_card: ParentTarget`, which binds at delayed-trigger creation
+            // to the granting ability's chosen target. A chain that never
+            // declared an object target has nothing for it to bind to: the
+            // engine's over-fire guard then refuses to install the trigger at all
+            // (`delayed_trigger::resolve`), and the printed consequent is lost
+            // rather than re-timed.
+            //
+            // MEASURED over the full corpus, exactly one card's PARSE is changed
+            // by this decline — Discord, Lord of Disharmony, whose permission is
+            // "you may cast a COPY of a spell with that name" with no target. Its
+            // consequent is not scoped by a chosen object at all but by the
+            // permission itself ("a spell cast this way"), which is provenance
+            // this seam does not carry yet. Until it does, Discord keeps exactly
+            // the lowering it has on `main` — wrong in its own pre-existing way,
+            // but not newly suppressed by this change.
+            //
+            // Deliberately NOT claimed: that Discord is the only prefix-carrying
+            // card without a declared object referent. It is not — many of the 33
+            // print no "target" at all. For every other one the decline lands
+            // where the consequent discriminator below would have landed anyway,
+            // which is why the corpus diff moves by exactly this one card.
+            //
+            // `chain_declared_object_target` is the existing authority for "what
+            // object target has this chain declared", asked here rather than
+            // re-derived and rather than matched on the absence of the word
+            // "target" in the surrounding text.
+            //
+            // Named imprecision: it answers about the DECLARED target, while the
+            // runtime guard tests `ability.targets.is_empty()`. A declared target
+            // that becomes illegal before resolution would still read as "yes"
+            // here. That is the dangerous direction — proxy says yes, runtime has
+            // no targets, the guard refuses, and the consequent is lost, which is
+            // the Discord failure again — so it is named rather than glossed.
+            //
+            // CORRECTED after review, twice, and both corrections are recorded
+            // because the wrong reasons were plausible. An earlier revision used
+            // the sibling walk `chain_has_prior_typed_referent(.., true)` and
+            // claimed this one "bails on the graveyard rider's condition" and so
+            // could not serve. MEASURED, that is false: it serves, and the two
+            // walks produce BYTE-IDENTICAL `card-data.json` over all 35804 corpus
+            // entries. This one ships because it is the tighter question — it
+            // returns the declared `Typed` filter itself, where the sibling also
+            // accepts compound and non-target referents that never reach
+            // `ability.targets`.
+            //
+            // CR 603.7 (the delayed-trigger reading is stated at the top of this
+            // block): this arm declines it on an engine limit — nothing for
+            // `valid_card: ParentTarget` to bind to — not on a different reading
+            // of the rule. The NEXT `None` arm is the one that lowers the
+            // consequent as that trigger; the gap left here is named in the PR.
+            None if chain_declared_object_target(builder.clauses()).is_none() => {
+                (text_after_prefix, None)
+            }
+            None => match crate::parser::oracle_effect::lower::strip_cast_this_way_gate(&text) {
+                Some((body, condition)) => {
+                    // This parse exists only to ASK what the consequent is; its
+                    // context is discarded either way. `clone_throwaway` is the
+                    // named authority for exactly that (see its doc comment —
+                    // deliberately not a `Clone` impl, and deliberately
+                    // greppable). Passing the live `ctx` would leave this probe's
+                    // diagnostics and `chosen_player_count` behind, and the
+                    // accepted branch parses `body` a second time below.
+                    //
+                    // Named consequence of that second parse: `clone_throwaway`
+                    // resets `chosen_color_qualifier` to `Unbound` (so a
+                    // `ChainBound` qualifier does not reach the probe), and
+                    // everything the probe itself accumulates — diagnostics,
+                    // `chosen_player_count`, any `pending_printed_color_choice`
+                    // it sets — is discarded with the clone. It does NOT start
+                    // without the caller's pending choice; that field rides in on
+                    // `..self.clone()`. Either way the probe and the shipped
+                    // lowering could in principle differ, and the discriminator
+                    // would then have classified a text it is not shipping. Site without a
+                    // demonstrated consequence — the corpus double bake bounds it
+                    // to zero.
+                    let mut probe_ctx = ctx.clone_throwaway();
+                    let probe =
+                        lower_effect_chain_ir(&parse_effect_chain_ir(body, kind, &mut probe_ctx));
+                    if consequent_is_a_property_of_the_granted_cast(&probe) {
+                        (text_after_prefix, None)
+                    } else {
+                        (body, Some(condition))
+                    }
+                }
+                None => (text_after_prefix, None),
+            },
+        };
         // CR 107.3i: If this chunk has no local "where X is" but a sibling clause
         // in the same sentence binds X, propagate the sibling binding so "target
         // player loses X life" and "you gain X life" in the same sentence share
@@ -41536,4 +41661,33 @@ mod chain_declared_object_target_tests {
              `subject_slot: None` resolve the same object",
         );
     }
+}
+
+/// CR 601.2 + CR 603.7 (issue #8721): does a cast-permission back-reference's
+/// consequent describe HOW the granted spell is cast, rather than what happens
+/// as a result of casting it?
+///
+/// `CastFromZone` is the cast itself restated ("you cast it without paying its
+/// mana cost"); `GenericEffect` carries the static/continuous modification of
+/// the grant ("mana of any type can be spent to cast it"). Both are CR 601.2
+/// casting properties and must be live when the spell is cast, so neither may be
+/// deferred into a CR 603.7 delayed triggered ability.
+///
+/// The consequents this actually defers, measured as the full diff of two corpus
+/// parses, are `PutCounter` (Helmut Zemo) and `Pump` (Ogre Battlecaster) — two
+/// cards, no more. Discord, Lord of Disharmony's `CopySpell` was a third until
+/// the call site began declining chains with no declared object referent.
+///
+/// Known imprecision, named rather than hidden, and it cuts both ways.
+/// `GenericEffect` carries any static modification, not only casting ones, so a
+/// genuine CONSEQUENCE lowering to it would be excluded here by mistake. And the
+/// implicit `_ => false` defers anything that is neither variant, so a casting
+/// property lowering to a THIRD variant would be deferred past its own cast
+/// (CR 601.2). Measured over the full corpus, no consequent wording does either
+/// today; a new one is likelier to fail the second way than the first.
+fn consequent_is_a_property_of_the_granted_cast(def: &AbilityDefinition) -> bool {
+    matches!(
+        &*def.effect,
+        Effect::CastFromZone { .. } | Effect::GenericEffect { .. }
+    )
 }

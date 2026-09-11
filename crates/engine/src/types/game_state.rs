@@ -931,10 +931,13 @@ impl<'context, 'state> TriggerSourceRead<'context, 'state> {
         }
     }
 
-    pub fn class_level(self) -> Option<u8> {
+    /// CR 716.2d: the source's level, normalized through the shared
+    /// [`GameObject::level`] authority so a latched snapshot and a live object
+    /// answer identically, and so a source with no stored level reads as 1.
+    pub fn level(self) -> u8 {
         match self {
-            Self::ExactLive(object) => object.class_level,
-            Self::Latched(context) => context.class_level,
+            Self::ExactLive(object) => object.level(),
+            Self::Latched(context) => GameObject::level_from_stored(context.class_level),
         }
     }
 
@@ -21064,6 +21067,11 @@ pub struct PendingReplacement {
     /// `candidates` has exactly one entry (the real replacement); decline is synthetic.
     #[serde(default)]
     pub is_optional: bool,
+    /// Choice authority captured when an optional replacement is offered. This
+    /// is deliberately separate from CR 616 ordering, whose chooser remains
+    /// the affected player.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice_player: Option<PlayerId>,
     /// CR 701.24a: the library placement requested by the original `move_object`
     /// call whose replacement consult parked here (W3 library-placement arm only).
     /// `Some` solely for a parked Library-targeting `ZoneChange`; the resume path
@@ -21165,6 +21173,58 @@ pub struct PhaseTransitionProgress {
     pub entering_cleanup: bool,
     #[serde(default)]
     pub drain_state: PhaseTransitionDrainState,
+}
+
+#[cfg(test)]
+mod trigger_source_read_level_tests {
+    use super::*;
+    use crate::game::game_object::GameObject;
+
+    fn class_object(class_level: Option<u8>) -> GameObject {
+        let mut object = GameObject::new(
+            ObjectId(1),
+            CardId(1),
+            PlayerId(0),
+            "Stormchaser's Talent".to_string(),
+            Zone::Battlefield,
+        );
+        object.class_level = class_level;
+        object
+    }
+
+    fn latched(object: &GameObject) -> TriggerSourceContext {
+        object
+            .snapshot_for_zone_change(object.id, Some(Zone::Battlefield), object.zone)
+            .trigger_source_context
+            .expect("snapshot always carries trigger context")
+    }
+
+    /// CR 716.2d: a source with no stored level reads as level 1, on BOTH
+    /// `TriggerSourceRead` arms. No printed card reaches this through a trigger —
+    /// zero cards say "becomes level 1", and `oracle_class.rs` only wraps a
+    /// trigger in `ClassLevelGE` when `section.level > 1` — so the guarantee is
+    /// asserted directly here rather than through a card scenario the parser
+    /// cannot emit. Without it, a `None` level fails every `== N` / `>= N` gate,
+    /// which is the shape of issue #8773.
+    #[test]
+    fn absent_stored_level_reads_as_one_on_both_arms() {
+        let object = class_object(None);
+        let context = latched(&object);
+
+        assert_eq!(TriggerSourceRead::ExactLive(&object).level(), 1);
+        assert_eq!(TriggerSourceRead::Latched(&context).level(), 1);
+    }
+
+    /// A stored level is reported verbatim, so normalization cannot mask a real
+    /// level, and the two arms agree.
+    #[test]
+    fn stored_level_is_reported_verbatim_on_both_arms() {
+        let object = class_object(Some(3));
+        let context = latched(&object);
+
+        assert_eq!(TriggerSourceRead::ExactLive(&object).level(), 3);
+        assert_eq!(TriggerSourceRead::Latched(&context).level(), 3);
+    }
 }
 
 #[cfg(test)]
