@@ -171,6 +171,7 @@ export function DialogShell({
             <PeekTab
               onClick={peek.togglePeek}
               direction={isNarrow ? "bottom" : "right"}
+              attachment="fullBleedBelowLg"
             />
           ) : null}
         </motion.div>
@@ -225,6 +226,32 @@ export function DialogHeader({
   );
 }
 
+type PeekDirection = "right" | "bottom";
+
+/** The shape of the card a `PeekTab` is attached to, which decides whether the
+ *  tab may straddle that card's edge. See `PEEK_OVERHANG`. */
+type PeekAttachment = "floating" | "fullBleedBelowLg";
+
+/** Placement against the host wrapper's edge, before any overhang. */
+const PEEK_POSITION: Record<PeekDirection, string> = {
+  right: "right-0 top-1/2 h-24 w-9 -translate-y-1/2",
+  bottom: "right-3 top-1 h-9 w-9",
+};
+
+/**
+ * The tab straddles its card's edge, which reads as "attached" only when there
+ * is backdrop beside the card to hang into. A `floating` card — one capped to a
+ * `max-w-*` at every viewport, like ManaPaymentUI's payment panel — always has
+ * some. A shell that goes full-bleed below `lg` has none there, because the card
+ * *is* the viewport: the same overhang would push a third of the tab past the
+ * screen edge (12px at `right`, 8px at `bottom`). Defer it to `lg` for those,
+ * where the card is centered and narrower than the viewport again.
+ */
+const PEEK_OVERHANG: Record<PeekAttachment, Record<PeekDirection, string>> = {
+  floating: { right: "translate-x-1/3", bottom: "-translate-y-1/3" },
+  fullBleedBelowLg: { right: "lg:translate-x-1/3", bottom: "lg:-translate-y-1/3" },
+};
+
 /**
  * Pill tab attached to the edge the dialog slides toward when peeked. The
  * pulsing glow signals "actionable affordance — click me to peek." Mirrors
@@ -235,9 +262,12 @@ export function DialogHeader({
 export function PeekTab({
   onClick,
   direction = "right",
+  attachment = "floating",
 }: {
   onClick: () => void;
-  direction?: "right" | "bottom";
+  direction?: PeekDirection;
+  /** The shape of the card the tab is attached to. See `PEEK_OVERHANG`. */
+  attachment?: PeekAttachment;
 }) {
   const { t } = useTranslation("game");
   const shouldReduceMotion = useReducedMotion();
@@ -253,10 +283,7 @@ export function PeekTab({
       ? "0 18px 36px rgba(0,0,0,0.55), 18px 0 36px rgba(34,211,238,0.65)"
       : "0 8px 20px rgba(0,0,0,0.45), 0 0 24px rgba(34,211,238,0.65)";
 
-  const positionClass =
-    direction === "right"
-      ? "right-0 top-1/2 h-24 w-9 -translate-y-1/2 translate-x-1/3"
-      : "right-3 top-1 h-9 w-9 -translate-y-1/3";
+  const positionClass = `${PEEK_POSITION[direction]} ${PEEK_OVERHANG[attachment][direction]}`;
 
   // The chevron points the way the modal exits: right as-is, down when rotated.
   const iconClass =
