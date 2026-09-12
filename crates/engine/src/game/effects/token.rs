@@ -637,6 +637,7 @@ pub fn resolve(
             // CR 608.2c: drop the consumed set's member-cause provenance too so
             // the side map never outlives its `tracked_object_sets` entry.
             state.tracked_set_member_causes.remove(&id);
+            state.tracked_set_participants.remove(&id);
         }
     }
 
@@ -1371,9 +1372,15 @@ pub(crate) fn materialize_token_copy_body(
     // itself copiable. `install_copiable_values_as_base` already installs
     // `loyalty`/`base_loyalty` from `values.loyalty` (CR 306.5b), so no separate
     // loyalty seed is needed here.
+    let mut values = copy.values.clone();
+    let cda_pruning = super::copy_exception::prune_copy_exception_overridden_cdas(
+        &values.static_definitions,
+        &copy.additional_modifications,
+    );
+    values.static_definitions = Arc::new(cda_pruning.definitions);
     apply_copiable_values_to_liminal_object(
         object,
-        &copy.values,
+        &values,
         copy.display_source,
         copy.printed_ref.clone(),
         copy.token_image_ref.clone(),
@@ -3145,9 +3152,10 @@ fn resolve_attach_host(
         // CR 608.2c: a numbered anaphor resolves against the whole resolving
         // chain's targets, which is why it routes through the same authority
         // `attach::resolve_object_filter` uses rather than reading this clause's
-        // nearest target.
+        // nearest target. CR 608.2b: a slot whose target was illegal at
+        // resolution (or whose pinned referent departed, CR 400.7) names no host.
         AttachHostAuthority::ParentSlot(index) => {
-            crate::game::targeting::resolve_parent_slot_from_root(state, ability, index)
+            crate::game::targeting::resolve_live_parent_slot_from_root(state, ability, index)
                 .map(target_ref_to_attach_target)
         }
         AttachHostAuthority::Source => Some(AttachTarget::Object(ability.source_id)),

@@ -55,8 +55,8 @@ describe("draftProtocol", () => {
   });
 
   describe("DRAFT_PROTOCOL_VERSION", () => {
-    it("is version 27", () => {
-      expect(DRAFT_PROTOCOL_VERSION).toBe(27);
+    it("is version 29", () => {
+      expect(DRAFT_PROTOCOL_VERSION).toBe(29);
     });
   });
 
@@ -279,6 +279,52 @@ describe("draftProtocol", () => {
   });
 
   describe("validateDraftMessage", () => {
+    it.each([
+      { type: "draft_suggest_lands", requestId: "request-1" },
+      { type: "draft_suggest_lands_result", requestId: "request-1", lands: { Island: 17 } },
+      { type: "draft_suggest_lands_rejected", requestId: "request-1", reason: "Deckbuilding is unavailable" },
+    ])("accepts a strict v28 land-suggestion envelope", (message) => {
+      expect(validateDraftMessage(message)).toEqual(message);
+    });
+
+    it.each(["deck", "seat", "seatIndex", "spells"])(
+      "rejects surplus %s fields on every v28 land-suggestion envelope",
+      (surplus) => {
+        for (const message of [
+          { type: "draft_suggest_lands", requestId: "request-1" },
+          { type: "draft_suggest_lands_result", requestId: "request-1", lands: {} },
+          { type: "draft_suggest_lands_rejected", requestId: "request-1", reason: "No workspace" },
+        ]) {
+          expect(() => validateDraftMessage({ ...message, [surplus]: "forbidden" })).toThrow();
+        }
+      },
+    );
+
+    it.each([
+      { requestId: "" },
+      { requestId: "x".repeat(257) },
+      { requestId: 1 },
+      { type: "draft_suggest_lands_result", requestId: "request-1", lands: { Unknown: 1 } },
+      { type: "draft_suggest_lands_result", requestId: "request-1", lands: { Island: -1 } },
+      { type: "draft_suggest_lands_result", requestId: "request-1", lands: { Island: 1.5 } },
+      { type: "draft_suggest_lands_result", requestId: "request-1", lands: { Island: Number.NaN } },
+      { type: "draft_suggest_lands_result", requestId: "request-1", lands: { Island: 1001 } },
+    ])("rejects invalid v28 land-suggestion data", (message) => {
+      expect(() => validateDraftMessage({ type: "draft_suggest_lands", ...message })).toThrow();
+    });
+
+    it("rejects inherited, symbol, and non-enumerable v28 envelope fields", () => {
+      const inherited = Object.create({ requestId: "request-1" });
+      inherited.type = "draft_suggest_lands";
+      const symbolKey = Symbol("surplus");
+      const symbol = { type: "draft_suggest_lands", requestId: "request-1", [symbolKey]: true };
+      const nonEnumerable = { type: "draft_suggest_lands", requestId: "request-1" };
+      Object.defineProperty(nonEnumerable, "spells", { value: [], enumerable: false });
+      expect(() => validateDraftMessage(inherited)).toThrow();
+      expect(() => validateDraftMessage(symbol)).toThrow();
+      expect(() => validateDraftMessage(nonEnumerable)).toThrow();
+    });
+
     it("accepts only versioned, token-bound draft leave messages", () => {
       expect(validateDraftMessage({
         type: "draft_leave",
@@ -670,6 +716,21 @@ describe("draftProtocol", () => {
       }
     });
 
+    it("drops the former cube source field from an incoming participant view", () => {
+      const msg = validateDraftMessage({
+        type: "draft_state_update",
+        view: {
+          ...validDraftView,
+          booster_pack_pool: ["Undealt cube entry"],
+        },
+      });
+
+      expect(msg.type).toBe("draft_state_update");
+      if (msg.type === "draft_state_update") {
+        expect("booster_pack_pool" in msg.view).toBe(false);
+      }
+    });
+
     it.each([undefined, null, "1", 0.5, -1, 2])(
       "rejects invalid active-pack presence %j",
       (activePackCount) => {
@@ -882,6 +943,7 @@ describe("draftProtocol", () => {
         },
         draft_reconnect_rejected: { kind: "NoReconnectWindow", reason: "No grace window" },
         draft_deck_submit_ack: { submissionId: "submission-1", view: validDraftView },
+        draft_match_start: { launch: { type: "Bot", deckPayload: {} } },
         draft_commander_launch: { launch: commanderLaunch() },
       };
       const msg = validateDraftMessage(
@@ -1157,7 +1219,14 @@ describe("draftProtocol", () => {
       }
     });
 
-    it("round-trips a deck-carrying draft match start message", async () => {
+    it.each([
+      { pool: ["Cube A", "Cube A", "Undealt sentinel"] },
+      { pool: [] },
+      // A guest-authority launch names no source: the host sends an explicit null.
+      { pool: null },
+      { pool: undefined },
+    ])(
+      "round-trips a deck-carrying draft match start message: $pool", async ({ pool }) => {
       const deck = {
         main_deck: ["Island"],
         sideboard: [],
@@ -1176,6 +1245,7 @@ describe("draftProtocol", () => {
             player: deck,
             opponent: { main_deck: ["Mountain"], sideboard: [], commander: [] },
             ai_decks: [],
+            booster_pack_pool: pool,
           },
           matchConfig: { match_type: "Bo1" },
           binding: {

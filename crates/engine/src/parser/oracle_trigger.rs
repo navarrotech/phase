@@ -2,7 +2,7 @@ use crate::parser::oracle_nom::error::OracleError;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until};
 use nom::character::complete::{alpha1, one_of, space1};
-use nom::combinator::{all_consuming, eof, map, not, opt, peek, recognize, rest, value};
+use nom::combinator::{all_consuming, consumed, eof, map, not, opt, peek, recognize, rest, value};
 use nom::multi::{many0, many1, separated_list1};
 use nom::sequence::{delimited, pair, preceded, terminated};
 use nom::Parser;
@@ -584,7 +584,7 @@ fn rewrite_cost_x_in_condition(cond: &mut crate::types::ability::AbilityConditio
         | AbilityCondition::SourceAttachedToCreature
         | AbilityCondition::DayNightIsNeither
         | AbilityCondition::DayNightIs { .. }
-        | AbilityCondition::NthResolutionThisTurn { .. }
+        | AbilityCondition::AbilityUseCountThisTurn { .. }
         | AbilityCondition::SourceLacksKeyword { .. }
         | AbilityCondition::ScopedPlayerMatches { .. } => {}
     }
@@ -7530,11 +7530,23 @@ fn map_attachment_kind_filter_prop(input: &str) -> OracleResult<'_, FilterProp> 
     Ok((rest, attachment_kinds_filter_prop(kinds, None)))
 }
 
+/// CR 603.4 + CR 601.2h + CR 106.1a: Extract "if no [colored ]mana was spent to
+/// cast it/that spell/them/~" — the intervening-if that gates on the triggering
+/// spell having been paid for with nothing (Lavinia, Vexing Bauble) or with
+/// nothing *colored* (Void Mirror).
+///
+/// The two metrics take different condition shapes on purpose. The colorless
+/// axis (`Total`) keeps the pre-existing `ManaSpentCondition`, whose runtime arm
+/// carries a source-context fallback for the event-less ETB shapes
+/// ("if it wasn't cast or no mana was spent to cast it"). The color axis
+/// (`DistinctColors`) has no legacy encoding at all, so it goes straight onto
+/// the canonical `QuantityComparison { ManaSpentToCast, EQ, 0 }` path, which
+/// reads the per-color payment tally rather than a substring.
 fn try_extract_no_mana_spent_condition(
     lower: &str,
     text: &str,
 ) -> Option<(String, Option<TriggerCondition>)> {
-    let (before, clause_text, rest) = scan_preceded(lower, |i| {
+    let (before, (clause_text, metric, scope), rest) = scan_preceded(lower, |i| {
         preceded(tag("if "), parse_no_mana_spent_clause).parse(i)
     })?;
     let rest_trimmed = rest.trim_start();
@@ -7544,24 +7556,90 @@ fn try_extract_no_mana_spent_condition(
     }
     let clause_start = before.len();
     let clause_len = lower.len() - before.len() - rest.len();
+    let condition = match metric {
+        CastManaSpentMetric::Total => TriggerCondition::ManaSpentCondition {
+            text: clause_text.to_string(),
+        },
+        // CR 106.1a + CR 106.1b: colorless is a type of mana but not a color,
+        // so "no colored mana was spent" is satisfied when the count of distinct
+        // colors in the payment record is zero — a cost paid entirely with
+        // colorless mana (or with no mana at all). `== 0` is the right
+        // reading for every metric that names a KIND of mana rather than an
+        // amount, so widening `parse_no_spent_mana_metric` ("no red mana",
+        // "no mana from a Treasure") needs no change here; the arms are listed
+        // rather than wildcarded so a metric that is NOT a kind has to choose.
+        metric @ (CastManaSpentMetric::DistinctColors
+        | CastManaSpentMetric::OfColor { .. }
+        | CastManaSpentMetric::FromSource { .. }) => TriggerCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::ManaSpentToCast { scope, metric },
+            },
+            comparator: Comparator::EQ,
+            rhs: QuantityExpr::Fixed { value: 0 },
+        },
+    };
     Some((
         strip_condition_clause(text, clause_start, clause_len),
-        Some(TriggerCondition::ManaSpentCondition {
-            text: clause_text.to_string(),
-        }),
+        Some(condition),
     ))
 }
 
-fn parse_no_mana_spent_clause(i: &str) -> OracleResult<'_, &str> {
-    recognize(pair(
-        tag("no mana was spent to cast "),
+/// Returns the recognized clause alongside the payment metric it measures and
+/// the object whose payment record answers it.
+fn parse_no_mana_spent_clause(
+    i: &str,
+) -> OracleResult<'_, (&str, CastManaSpentMetric, CastManaObjectScope)> {
+    let (rest, (clause, (metric, scope))) = consumed(pair(
+        terminated(parse_no_spent_mana_metric, tag(" was spent to cast ")),
+        parse_cast_payment_subject_scope,
+    ))
+    .parse(i)?;
+    Ok((rest, (clause, metric, scope)))
+}
+
+/// CR 106.1a + CR 601.2h: "no mana" / "no colored mana" — the aggregate over the
+/// payment record that the clause requires to be zero. The bare form must come
+/// last: "mana" is a suffix of "colored mana", so ordering it first would
+/// shadow the qualified reading.
+fn parse_no_spent_mana_metric(i: &str) -> OracleResult<'_, CastManaSpentMetric> {
+    preceded(
+        tag("no "),
         alt((
-            tag("it"),
-            tag("that spell"),
-            tag("this spell"),
-            tag("them"),
-            tag("~"),
+            value(CastManaSpentMetric::DistinctColors, tag("colored mana")),
+            value(CastManaSpentMetric::Total, tag("mana")),
         )),
+    )
+    .parse(i)
+}
+
+/// CR 400.7d + CR 601.2h + CR 603.4: which object's payment record the anaphor
+/// names, IN A TRIGGER'S INTERVENING-IF. "it"/"that spell"/"this spell"/"them"
+/// is the object carried by the trigger event (the spell just cast, or the
+/// permanent that just entered); "~" is the ability's own source.
+///
+/// Deliberately NOT `oracle_nom::quantity::parse_mana_spent_self_subject`,
+/// which maps the same words the other way ("it"/"this spell"/"them" →
+/// `SelfObject`). That combinator is the authority for a RESOLVING spell
+/// referring to its own payment ("where X is the amount of mana spent to cast
+/// it" — Toph, Greatest Earthbender); there "it" IS the source. Here the clause
+/// sits on a trigger whose event carries a different object, so the same words
+/// resolve to the event's subject: Void Mirror's "if no colored mana was spent
+/// to cast it" asks about the spell a player just cast, never about Void Mirror.
+/// Reading `SelfObject` here would answer with the mirror's own {2} payment —
+/// always zero colored — and counter every spell, which is issue #8807 itself.
+///
+/// This matches the mapping the sibling intervening-if extractor in this file
+/// already uses (`try_extract_mana_spent_comparison_condition`: "in a
+/// spell-cast trigger's intervening-if clause, 'it'/'that spell'/'this spell'
+/// all refer to the spell object carried by the trigger event"). The two
+/// contracts are context-scoped, not contradictory.
+fn parse_cast_payment_subject_scope(i: &str) -> OracleResult<'_, CastManaObjectScope> {
+    alt((
+        value(CastManaObjectScope::TriggeringSpell, tag("it")),
+        value(CastManaObjectScope::TriggeringSpell, tag("that spell")),
+        value(CastManaObjectScope::TriggeringSpell, tag("this spell")),
+        value(CastManaObjectScope::TriggeringSpell, tag("them")),
+        value(CastManaObjectScope::SelfObject, tag("~")),
     ))
     .parse(i)
 }
@@ -13126,8 +13204,9 @@ fn try_parse_event(
         BecomesMonstrous,
         BecomesRenowned,
         Mutates,
-        ExploitsCreature,
-        Exploits,
+        Exploits {
+            victim: Option<TargetFilter>,
+        },
         /// CR 701.44b: A permanent "explores" after the explore process completes.
         Explores,
         /// CR 701.50f: A permanent "connives" after the connive process completes.
@@ -13165,6 +13244,34 @@ fn try_parse_event(
             )));
         }
         Ok((rest, SimpleEvent::BecomesUnattached(Some(filter))))
+    }
+    fn parse_exploit_victim(input: &str) -> OracleResult<'_, TargetFilter> {
+        let (filter, remaining) = parse_type_phrase_folding(input);
+        if matches!(filter, TargetFilter::Any) || remaining.len() == input.len() {
+            return Err(nom::Err::Error(OracleError::new(
+                input,
+                nom::error::ErrorKind::Verify,
+            )));
+        }
+        Ok((remaining, filter))
+    }
+    /// CR 702.110b + CR 603.2: an exploit event distinguishes the creature
+    /// performing exploit from the creature sacrificed as the ability resolves.
+    fn parse_exploits_event(input: &str) -> OracleResult<'_, SimpleEvent> {
+        let (remaining, _) = tag("exploits").parse(input)?;
+        if remaining.is_empty() {
+            return Ok((remaining, SimpleEvent::Exploits { victim: None }));
+        }
+
+        let (victim_text, _) =
+            preceded(space1, terminated(alt((tag("a"), tag("an"))), space1)).parse(remaining)?;
+        let (_, victim) = all_consuming(parse_exploit_victim).parse(victim_text)?;
+        Ok((
+            "",
+            SimpleEvent::Exploits {
+                victim: Some(victim),
+            },
+        ))
     }
     /// CR 120.4 + CR 120.4b: the source-scoping tail on the received-damage
     /// grammar — `"…by a single source"` (Pain Magnification). It narrows the
@@ -13349,9 +13456,7 @@ fn try_parse_event(
                 (tag("becomes"), space1, tag("renowned")),
             ),
             value(SimpleEvent::Mutates, tag("mutates")),
-            // CR 702.110b: "exploits a creature" — exploit trigger
-            value(SimpleEvent::ExploitsCreature, tag("exploits a creature")),
-            value(SimpleEvent::Exploits, tag("exploits")),
+            parse_exploits_event,
             // CR 701.44b: "explores" / "explore" — explore trigger
             value(SimpleEvent::Explores, tag("explores")),
             value(SimpleEvent::Explores, tag("explore")),
@@ -13604,9 +13709,10 @@ fn try_parse_event(
                 def.mode = TriggerMode::Mutates;
                 def.valid_card = Some(subject.clone());
             }
-            SimpleEvent::ExploitsCreature | SimpleEvent::Exploits => {
+            SimpleEvent::Exploits { victim } => {
                 def.mode = TriggerMode::Exploited;
-                def.valid_card = Some(subject.clone());
+                def.valid_source = Some(subject.clone());
+                def.valid_card = victim;
             }
             SimpleEvent::Explores => {
                 if !remaining.trim().is_empty() {

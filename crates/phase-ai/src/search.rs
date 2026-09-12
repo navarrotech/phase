@@ -48,6 +48,7 @@ use crate::planner::{
 };
 use crate::policies::context::{PolicyContext, SearchDepth};
 use crate::policies::copy_value::score_legend_rule_keep;
+use crate::policies::effect_classify::{aura_polarity, EffectPolarity};
 use crate::policies::strategy_helpers::{cmp_sacrifice, sacrifice_key};
 
 use crate::policies::tutor::score_search_choice_selection;
@@ -123,7 +124,22 @@ fn target_selection_has_no_modeled_effect(state: &GameState) -> bool {
         return false;
     };
 
-    ability_tree_has_no_modeled_effect(&pending_cast.ability)
+    let source_has_modeled_aura_effect = state
+        .objects
+        .get(&pending_cast.object_id)
+        .filter(|source| {
+            source
+                .card_types
+                .subtypes
+                .iter()
+                .any(|subtype| subtype == "Aura")
+        })
+        .is_some_and(|source| match aura_polarity(source) {
+            EffectPolarity::Beneficial | EffectPolarity::Harmful => true,
+            EffectPolarity::Contextual => false,
+        });
+
+    !source_has_modeled_aura_effect && ability_tree_has_no_modeled_effect(&pending_cast.ability)
 }
 
 fn ability_tree_has_no_modeled_effect(ability: &ResolvedAbility) -> bool {
@@ -4586,10 +4602,12 @@ mod tests {
     use engine::game::scenario_db::GameScenarioDbExt;
     use engine::game::zones::create_object;
     use engine::types::ability::{
-        AbilityCost, AbilityDefinition, AbilityKind, CategoryChooserScope, ContinuousModification,
-        ControllerRef, Duration, Effect, EffectKind, ManaProduction, PlayerFilter, PtValue,
-        QuantityExpr, QuantityRef, ReplacementDefinition, ResolvedAbility, StaticDefinition,
-        TargetFilter, TargetRef, TriggerConstraint, TriggerDefinition, TypedFilter,
+        AbilityCost, AbilityDefinition, AbilityKind, CategoryChooserScope, CommanderOwnership,
+        ContinuousModification, ControllerRef, Duration, Effect, EffectKind, ManaProduction,
+        ModalChoice, ModalSelectionCondition, ModalSelectionConstraint, PlayerFilter, PtValue,
+        QuantityExpr, QuantityRef, ReplacementDefinition, ResolvedAbility, StaticCondition,
+        StaticDefinition, TargetFilter, TargetRef, TriggerConstraint, TriggerDefinition,
+        TypedFilter,
     };
     use engine::types::ability::{ChoiceType, ChosenAttribute};
     use engine::types::card_type::CoreType;
@@ -4608,7 +4626,7 @@ mod tests {
     use rand::rngs::SmallRng;
     use rand::SeedableRng;
 
-    use crate::config::{create_config, AiDifficulty, Platform};
+    use crate::config::{create_config, create_config_for_players, AiDifficulty, Platform};
     use crate::policies::context::PolicyContext;
     use crate::policies::{DecisionKind, PolicyReason, TacticalPolicy};
     use crate::session::SessionCache;
@@ -4623,6 +4641,193 @@ mod tests {
         let file = File::open(path).expect("integration fixture should open");
         let decoder = flate2::read::GzDecoder::new(BufReader::new(file));
         CardDatabase::from_export_reader(decoder).expect("integration fixture should load")
+    }
+
+    fn dark_ritual_window_runner(
+        phase: Phase,
+        active_player: PlayerId,
+    ) -> (GameRunner, ObjectId, ObjectId, ObjectId, ObjectId) {
+        let db = integration_card_db();
+        let mut scenario = GameScenario::new_n_player(4, 0x1544_2034_3617_2648);
+        scenario.at_phase(phase);
+        let ritual = scenario.add_real_card(P0, "Dark Ritual", Zone::Hand, &db);
+        let drone = scenario.add_real_card(P0, "Plague Drone", Zone::Hand, &db);
+        let first_swamp = scenario.add_basic_land(P0, ManaColor::Black);
+        let second_swamp = scenario.add_basic_land(P0, ManaColor::Black);
+        let mut runner = scenario.build();
+        rehydrate_game_from_card_db(runner.state_mut(), &db);
+
+        let state = runner.state_mut();
+        state.active_player = active_player;
+        state.priority_player = P0;
+        state.waiting_for = WaitingFor::Priority { player: P0 };
+
+        (runner, ritual, drone, first_swamp, second_swamp)
+    }
+
+    #[test]
+    fn dark_ritual_respects_its_window_before_and_after_real_resolution() {
+        let exact_cast = |actions: &[CandidateAction], object_id| {
+            actions.iter().any(|candidate| {
+                matches!(
+                    &candidate.action,
+                    GameAction::CastSpell {
+                        object_id: candidate_id,
+                        ..
+                    } if *candidate_id == object_id
+                )
+            })
+        };
+        let easy = create_config_for_players(AiDifficulty::Easy, Platform::Native, 4);
+        let very_hard = create_config_for_players(AiDifficulty::VeryHard, Platform::Native, 4)
+            .into_measurement(17);
+
+        // Discord reports 1544203436172648468 and 1529960750846840891: P0 has
+        // priority during P2's end step. The forced cast below is a replay of
+        // the historical mistake, not an AI-selected action.
+        let (mut end_runner, end_ritual, end_drone, end_first_swamp, end_second_swamp) =
+            dark_ritual_window_runner(Phase::End, PlayerId(2));
+        let end_issued = validated_candidate_actions_for_semantic_owner(end_runner.state(), P0);
+        let end_contract = AiDecisionContract::issue(end_runner.state(), P0);
+        assert!(
+            exact_cast(&end_issued, end_ritual),
+            "reach guard: the engine must issue the exact Dark Ritual before policy scoring"
+        );
+        assert!(
+            end_contract
+                .candidates
+                .iter()
+                .any(|candidate| matches!(&candidate.action, GameAction::PassPriority)),
+            "reach guard: a finite PassPriority candidate must be available beside the vetoed ritual"
+        );
+        let end_scores = score_candidates(end_runner.state(), P0, &easy);
+        assert!(
+            end_scores.iter().any(|(action, score)| {
+                matches!(
+                    action,
+                    GameAction::CastSpell { object_id, .. } if *object_id == end_ritual
+                ) && !score.is_finite()
+            }),
+            "RitualSinkPolicy must reject the engine-issued end-step ritual through public scoring"
+        );
+        assert!(
+            end_scores.iter().any(|(action, score)| {
+                matches!(action, GameAction::PassPriority) && score.is_finite()
+            }),
+            "the non-finite ritual score must not be an all-rejected fallback"
+        );
+        for config in [&easy, &very_hard] {
+            let choice = choose_action(
+                end_runner.state(),
+                P0,
+                config,
+                &mut SmallRng::seed_from_u64(17),
+            )
+            .expect("the finite PassPriority candidate must produce a public choice");
+            assert!(
+                end_contract.contains_action(end_runner.state(), &choice),
+                "{config:?} must return an engine-issued action: {choice:?}"
+            );
+            assert!(
+                !matches!(
+                    &choice,
+                    GameAction::CastSpell { object_id, .. } if *object_id == end_ritual
+                ),
+                "{config:?} must not select the exact end-step Dark Ritual: {choice:?}"
+            );
+        }
+
+        assert!(!end_runner.state().objects[&end_first_swamp].tapped);
+        assert!(!end_runner.state().objects[&end_second_swamp].tapped);
+        end_runner.activate(end_first_swamp, 0).resolve();
+        let end_outcome = end_runner.cast(end_ritual).resolve();
+        end_outcome.assert_zone(&[end_ritual], Zone::Graveyard);
+        assert_eq!(
+            end_outcome.mana_pool_color(P0, ManaType::Black),
+            3,
+            "Dark Ritual must leave exactly its three black mana after paying {{B}}"
+        );
+        assert!(end_outcome.is_tapped(end_first_swamp));
+        assert!(!end_outcome.is_tapped(end_second_swamp));
+        assert!(
+            crate::zone_eval::available_mana(end_outcome.state(), P0)
+                >= end_outcome.state().objects[&end_drone]
+                    .mana_cost
+                    .mana_value(),
+            "the remaining Swamp plus ritual mana must reach the exact Plague Drone cost"
+        );
+        for _ in 0..3 {
+            if matches!(
+                end_runner.state().waiting_for,
+                WaitingFor::Priority { player } if player == P0
+            ) {
+                break;
+            }
+            end_runner
+                .act(GameAction::PassPriority)
+                .expect("priority must pass through the live end-step reducer");
+        }
+        assert!(matches!(
+            end_runner.state().waiting_for,
+            WaitingFor::Priority { player } if player == P0
+        ));
+        assert_eq!(end_runner.state().phase, Phase::End);
+        assert_eq!(
+            end_runner.state().players[P0.0 as usize]
+                .mana_pool
+                .count_color(ManaType::Black),
+            3,
+            "the pool must remain live while priority returns to P0 in the same end step"
+        );
+        assert!(
+            !exact_cast(
+                &validated_candidate_actions_for_semantic_owner(end_runner.state(), P0),
+                end_drone,
+            ),
+            "Plague Drone is unactionable at an opponent's end step despite sufficient mana"
+        );
+
+        // Same real cards and mana reach, but P0's own precombat main phase:
+        // the prospective sorcery-speed Drone is now a valid ritual sink.
+        let (mut main_runner, main_ritual, main_drone, main_first_swamp, main_second_swamp) =
+            dark_ritual_window_runner(Phase::PreCombatMain, P0);
+        let main_issued = validated_candidate_actions_for_semantic_owner(main_runner.state(), P0);
+        assert!(
+            exact_cast(&main_issued, main_ritual),
+            "reach guard: the engine must issue the exact Dark Ritual in P0's main phase"
+        );
+        assert!(
+            score_candidates(main_runner.state(), P0, &easy)
+                .iter()
+                .any(|(action, score)| {
+                    matches!(
+                        action,
+                        GameAction::CastSpell { object_id, .. } if *object_id == main_ritual
+                    ) && score.is_finite()
+                }),
+            "the real Plague Drone must keep Dark Ritual finite in P0's main phase"
+        );
+
+        main_runner.activate(main_first_swamp, 0).resolve();
+        let main_outcome = main_runner.cast(main_ritual).resolve();
+        main_outcome.assert_zone(&[main_ritual], Zone::Graveyard);
+        assert_eq!(main_outcome.mana_pool_color(P0, ManaType::Black), 3);
+        assert!(main_outcome.is_tapped(main_first_swamp));
+        assert!(!main_outcome.is_tapped(main_second_swamp));
+        assert!(
+            crate::zone_eval::available_mana(main_outcome.state(), P0)
+                >= main_outcome.state().objects[&main_drone]
+                    .mana_cost
+                    .mana_value(),
+            "the main-phase replay must retain the same positive mana-reach guard"
+        );
+        assert!(
+            exact_cast(
+                &validated_candidate_actions_for_semantic_owner(main_runner.state(), P0),
+                main_drone,
+            ),
+            "the engine must issue Plague Drone after real Dark Ritual resolution in P0's main phase"
+        );
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -6646,6 +6851,68 @@ mod tests {
         id
     }
 
+    /// Real Drown in Dreams structure: a spell-level `ModalChoice` with two
+    /// independent Spell roots (draw X, mill twice X), not an embedded choice.
+    fn add_drown_in_dreams(state: &mut GameState, owner: PlayerId) -> ObjectId {
+        let id = create_object(
+            state,
+            CardId(1_544_805_279_936_282_634),
+            owner,
+            "Drown in Dreams".to_string(),
+            Zone::Hand,
+        );
+        let object = state.objects.get_mut(&id).unwrap();
+        object.mana_cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::X, ManaCostShard::Blue],
+            generic: 2,
+        };
+        object.card_types.core_types.push(CoreType::Instant);
+        *Arc::make_mut(&mut object.abilities) = vec![
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Draw {
+                    count: QuantityExpr::Ref {
+                        qty: QuantityRef::Variable {
+                            name: "X".to_string(),
+                        },
+                    },
+                    target: TargetFilter::Player,
+                },
+            ),
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Mill {
+                    count: QuantityExpr::Multiply {
+                        factor: 2,
+                        inner: Box::new(QuantityExpr::Ref {
+                            qty: QuantityRef::Variable {
+                                name: "X".to_string(),
+                            },
+                        }),
+                    },
+                    target: TargetFilter::Player,
+                    destination: Zone::Graveyard,
+                },
+            ),
+        ];
+        object.modal = Some(ModalChoice {
+            min_choices: 1,
+            max_choices: 1,
+            mode_count: 2,
+            constraints: vec![ModalSelectionConstraint::ConditionalMaxChoices {
+                condition: ModalSelectionCondition::Static {
+                    condition: StaticCondition::ControlsCommander {
+                        ownership: CommanderOwnership::Any,
+                    },
+                },
+                max_choices: 2,
+                otherwise_max_choices: 1,
+            }],
+            ..ModalChoice::default()
+        });
+        id
+    }
+
     fn activate_score(scored: &[(GameAction, f64)], source: ObjectId) -> Option<f64> {
         scored.iter().find_map(|(action, score)| match action {
             GameAction::ActivateAbility { source_id, .. } if *source_id == source => Some(*score),
@@ -6707,6 +6974,136 @@ mod tests {
         assert!(
             score.is_finite(),
             "with X >= 1 affordable the gate stands down; activation must score finite"
+        );
+    }
+
+    #[test]
+    fn drown_in_dreams_modal_xcast_gate_rejects_zero_and_allows_one() {
+        let mut zero_state = make_state();
+        let drown = add_drown_in_dreams(&mut zero_state, PlayerId(0));
+        // Pay Drown's fixed {2}{U} component while leaving X at zero.
+        add_mana(&mut zero_state, PlayerId(0), ManaType::Colorless, 2);
+        add_mana(&mut zero_state, PlayerId(0), ManaType::Blue, 1);
+        let config = create_config(AiDifficulty::Hard, Platform::Native).into_measurement(1);
+        let session = AiSession::arc_from_game(&zero_state);
+        let zero_scores = score_candidates_core(&zero_state, PlayerId(0), &config, &session, None);
+        let zero_cast_score = zero_scores
+            .iter()
+            .find_map(|(action, score)| {
+                matches!(action, GameAction::CastSpell { object_id, .. } if *object_id == drown)
+                    .then_some(*score)
+            })
+            .expect("real Priority root candidate must include Drown in Dreams");
+        assert!(
+            !zero_cast_score.is_finite(),
+            "Drown at max X=0 must be rejected, got {zero_cast_score}"
+        );
+        assert!(
+            action_score(&zero_scores, &GameAction::PassPriority).is_finite(),
+            "PassPriority remains a finite Priority alternative"
+        );
+        assert_eq!(
+            choose_action(
+                &zero_state,
+                PlayerId(0),
+                &config,
+                &mut SmallRng::seed_from_u64(1),
+            ),
+            Some(GameAction::PassPriority),
+            "the rejected zero-X cast cannot beat PassPriority"
+        );
+
+        let mut one_state = make_state();
+        let one_drown = add_drown_in_dreams(&mut one_state, PlayerId(0));
+        add_mana(&mut one_state, PlayerId(0), ManaType::Colorless, 3);
+        add_mana(&mut one_state, PlayerId(0), ManaType::Blue, 1);
+        let one_session = AiSession::arc_from_game(&one_state);
+        let one_scores =
+            score_candidates_core(&one_state, PlayerId(0), &config, &one_session, None);
+        assert!(
+            one_scores.iter().any(|(action, score)| {
+                matches!(action, GameAction::CastSpell { object_id, .. } if *object_id == one_drown)
+                    && score.is_finite()
+            }),
+            "Drown at max X=1 remains a finite root candidate"
+        );
+
+        let cast = build_decision_context(&one_state)
+            .candidates
+            .into_iter()
+            .find(|candidate| {
+                matches!(candidate.action, GameAction::CastSpell { object_id, .. } if object_id == one_drown)
+            })
+            .expect("the finite Drown root carries a real cast candidate");
+        let mode_state = apply_candidate(&one_state, &cast)
+            .expect("casting the real modal spell reaches mode selection");
+        assert!(
+            matches!(mode_state.waiting_for, WaitingFor::ModeChoice { .. }),
+            "Drown must pause for its real spell-level mode choice"
+        );
+        let selected_mode = choose_action(
+            &mode_state,
+            PlayerId(0),
+            &config,
+            &mut SmallRng::seed_from_u64(2),
+        )
+        .expect("AI selects a real Drown mode");
+        let mode_candidate = build_decision_context(&mode_state)
+            .candidates
+            .into_iter()
+            .find(|candidate| candidate.action == selected_mode)
+            .expect("selected mode is engine-issued");
+        let target_state = apply_candidate(&mode_state, &mode_candidate)
+            .expect("selecting the mode continues the cast");
+        assert!(
+            matches!(target_state.waiting_for, WaitingFor::TargetSelection { .. }),
+            "the chosen Drown mode must declare its player target before X"
+        );
+        let selected_target = choose_action(
+            &target_state,
+            PlayerId(0),
+            &config,
+            &mut SmallRng::seed_from_u64(3),
+        )
+        .expect("AI selects a legal player target for Drown");
+        let target_candidate = build_decision_context(&target_state)
+            .candidates
+            .into_iter()
+            .find(|candidate| candidate.action == selected_target)
+            .expect("selected target is engine-issued");
+        let x_state = apply_candidate(&target_state, &target_candidate)
+            .expect("declaring the target continues to X selection");
+        assert!(
+            matches!(x_state.waiting_for, WaitingFor::ChooseXValue { max: 1, .. }),
+            "the paid fixed component leaves exactly X=1 affordable"
+        );
+        assert_eq!(
+            choose_action(
+                &x_state,
+                PlayerId(0),
+                &AiConfig::default(),
+                &mut SmallRng::seed_from_u64(4),
+            ),
+            Some(GameAction::ChooseX { value: 1 }),
+            "the real X-value policy prefers the funded modal X"
+        );
+        let chosen_x_candidate = build_decision_context(&x_state)
+            .candidates
+            .into_iter()
+            .find(|candidate| candidate.action == GameAction::ChooseX { value: 1 })
+            .expect("ChooseX(1) is engine-issued");
+        let paid_state = apply_candidate(&x_state, &chosen_x_candidate)
+            .expect("choosing X=1 continues to payment");
+        assert_eq!(
+            paid_state
+                .stack
+                .iter()
+                .find(|entry| entry.source_id == one_drown)
+                .and_then(|entry| entry.ability())
+                .expect("the paid modal spell reaches the stack")
+                .chosen_x,
+            Some(1),
+            "the chosen X propagates into the resolved spell ability"
         );
     }
     #[test]
@@ -10114,6 +10511,83 @@ mod tests {
                 .as_ref()
                 .is_some_and(|action| contract.contains_action(&state, action)),
             "the bounded target answer must stay inside the engine-issued decision domain"
+        );
+    }
+
+    fn unmodeled_aura_target_selection_state(
+        static_mode: Option<StaticMode>,
+    ) -> (GameState, ObjectId) {
+        let mut state = spell_target_selection_state(
+            make_state(),
+            vec![TargetRef::Player(PlayerId(1))],
+            vec![TargetRef::Player(PlayerId(1))],
+            false,
+        );
+        let source_id = {
+            let WaitingFor::TargetSelection { pending_cast, .. } = &mut state.waiting_for else {
+                panic!("target-selection fixture must retain its pending cast");
+            };
+            pending_cast.ability.effect =
+                Effect::unimplemented("unsupported_aura", "Unsupported Aura effect.");
+            pending_cast.object_id
+        };
+        let source = state
+            .objects
+            .get_mut(&source_id)
+            .expect("pending Aura source exists");
+        source.card_types.subtypes.push("Aura".to_string());
+        if let Some(static_mode) = static_mode {
+            source
+                .static_definitions
+                .push(StaticDefinition::new(static_mode));
+        }
+        (state, source_id)
+    }
+
+    #[test]
+    fn beneficial_aura_target_selection_keeps_the_normal_scoring_path() {
+        let (state, source_id) =
+            unmodeled_aura_target_selection_state(Some(StaticMode::CantBeBlocked));
+
+        assert_eq!(
+            aura_polarity(&state.objects[&source_id]),
+            EffectPolarity::Beneficial,
+            "reach guard: the Aura classifier recognizes the source benefit"
+        );
+        assert!(
+            !target_selection_has_no_modeled_effect(&state),
+            "a beneficial Aura must retain the normal effect-aware target scorer"
+        );
+    }
+
+    #[test]
+    fn harmful_aura_target_selection_keeps_the_normal_scoring_path() {
+        let (state, source_id) =
+            unmodeled_aura_target_selection_state(Some(StaticMode::CantAttack));
+
+        assert_eq!(
+            aura_polarity(&state.objects[&source_id]),
+            EffectPolarity::Harmful,
+            "reach guard: the Aura classifier recognizes the source harm"
+        );
+        assert!(
+            !target_selection_has_no_modeled_effect(&state),
+            "a harmful Aura must retain the normal effect-aware target scorer"
+        );
+    }
+
+    #[test]
+    fn contextual_aura_target_selection_keeps_the_direct_fallback() {
+        let (state, source_id) = unmodeled_aura_target_selection_state(None);
+
+        assert_eq!(
+            aura_polarity(&state.objects[&source_id]),
+            EffectPolarity::Contextual,
+            "reach guard: the Aura source has no modeled target polarity"
+        );
+        assert!(
+            target_selection_has_no_modeled_effect(&state),
+            "a contextual Aura must keep the direct reducer-validated fallback"
         );
     }
 

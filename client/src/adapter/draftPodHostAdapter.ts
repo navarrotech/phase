@@ -540,6 +540,11 @@ export class DraftPodHostAdapter {
     await this.host.updateHostWorkspace(state);
   }
 
+  async suggestLands(): Promise<Record<string, number>> {
+    if (!this.host) throw new Error("Host not initialized");
+    return this.host.suggestLandsForSeat(0);
+  }
+
   async getHostView(): Promise<DraftPlayerView> {
     if (!this.host) throw new Error("Host not initialized");
     return this.host.getHostView();
@@ -579,6 +584,12 @@ export class DraftPodHostAdapter {
   ): Promise<DraftMatchDeckPayload> {
     if (!this.host) throw new Error("Host not initialized");
     return this.host.podCommanderDeckPayload(view, localSeat);
+  }
+
+  /** Host-only cube source for the <=6-seat Commander game constructor. */
+  async boosterPackPoolForGame(): Promise<string[] | null> {
+    if (!this.host) throw new Error("Host not initialized");
+    return this.host.boosterPackPoolForGame();
   }
 
   /**

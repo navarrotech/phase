@@ -48,6 +48,7 @@ import {
   type DraftWorkspaceState,
 } from "../components/draft/workspace/types";
 import { reconcileWorkspaceState } from "../components/draft/workspace/workspacePlacement";
+import { projectWorkspaceMainDeck } from "../components/draft/workspace/workspaceProjection";
 import { assertNever } from "../utils/assertNever";
 
 function matchConfigForView(view: DraftPlayerView): MatchConfig {
@@ -67,27 +68,79 @@ import { assignAvatarForSeat } from "../services/playerAvatars";
  * Prepare a host snapshot for the publicly retrievable P2P backup endpoint.
  *
  * IndexedDB keeps the full host snapshot and is the only durable location from
- * which a Chaos draft can resume. The HTTP backup is reachable by a derivable
- * host peer id, so it may retain the candidate intent but must never upload the
- * per-seat Chaos assignment matrix. The server repeats this redaction at its
- * trust boundary.
+ * which a host can resume. The HTTP backup is reachable by a derivable host
+ * peer id, so it is a public projection, never an authority. The server
+ * repeats this redaction at its trust boundary.
  */
-function redactChaosAssignmentsFromPublicBackup(
+function sanitizePublicBackup(
   snapshot: PersistedDraftHostSession,
 ): PersistedDraftHostSession {
-  if (snapshot.draftSessionJson === null) return snapshot;
+  // Never mutate the IndexedDB authority while preparing an upload. JSON is
+  // appropriate here because PersistedDraftHostSession is deliberately a JSON
+  // wire shape; unlike a shallow spread it also isolates nested poolInput and
+  // match launch records.
+  const publicSnapshot = JSON.parse(JSON.stringify(snapshot)) as PersistedDraftHostSession;
+  const rawPublicSnapshot = publicSnapshot as unknown as Record<string, unknown>;
+  delete rawPublicSnapshot.booster_pack_pool;
 
-  try {
-    const session: unknown = JSON.parse(snapshot.draftSessionJson);
-    if (!isJsonRecord(session) || !isJsonRecord(session.config)) return snapshot;
-    if (!redactChaosAssignmentsFromSource(session.config.source)) return snapshot;
+  redactPoolInputCubeList(publicSnapshot.poolInput);
+  redactMatchLaunchPools(rawPublicSnapshot.matchLaunches);
+  redactIntergameCommandLaunchPools(rawPublicSnapshot.intergameCommands);
+  redactDraftSessionPoolAndChaos(rawPublicSnapshot);
+  return publicSnapshot;
+}
 
-    return { ...snapshot, draftSessionJson: JSON.stringify(session) };
-  } catch {
-    // The server also redacts at the trust boundary. Keeping an unexpected
-    // opaque payload intact preserves the existing best-effort backup behavior.
-    return snapshot;
+function redactPoolInputCubeList(poolInput: unknown): void {
+  if (!isJsonRecord(poolInput) || !isJsonRecord(poolInput.data)) return;
+  delete poolInput.data.cube_list_text;
+}
+
+function redactMatchLaunchPools(matchLaunches: unknown): void {
+  if (!Array.isArray(matchLaunches)) return;
+  for (const matchLaunch of matchLaunches) {
+    if (!isJsonRecord(matchLaunch) || !isJsonRecord(matchLaunch.launch)) continue;
+    if (!isJsonRecord(matchLaunch.launch.deckPayload)) continue;
+    delete matchLaunch.launch.deckPayload.booster_pack_pool;
   }
+}
+
+/** Held Bo3 commands retain their original launch payload for recovery. That
+ * payload is just as public in an HTTP backup as an ordinary match launch. */
+function redactIntergameCommandLaunchPools(intergameCommands: unknown): void {
+  if (!Array.isArray(intergameCommands)) return;
+  for (const command of intergameCommands) {
+    if (!isJsonRecord(command) || !isJsonRecord(command.launchPayload)) continue;
+    if (!isJsonRecord(command.launchPayload.deckPayload)) continue;
+    delete command.launchPayload.deckPayload.booster_pack_pool;
+  }
+}
+
+function redactDraftSessionPoolAndChaos(snapshot: Record<string, unknown>): void {
+  const draftSessionJson = snapshot.draftSessionJson;
+  if (typeof draftSessionJson === "string") {
+    try {
+      const session: unknown = JSON.parse(draftSessionJson);
+      if (!isJsonRecord(session)) {
+        delete snapshot.draftSessionJson;
+        return;
+      }
+      redactDraftSessionObject(session);
+      snapshot.draftSessionJson = JSON.stringify(session);
+    } catch {
+      // An opaque string cannot be safely redacted, so it cannot appear in the
+      // public backup projection.
+      delete snapshot.draftSessionJson;
+    }
+  } else if (isJsonRecord(draftSessionJson)) {
+    redactDraftSessionObject(draftSessionJson);
+  } else if (draftSessionJson !== null) {
+    delete snapshot.draftSessionJson;
+  }
+}
+
+function redactDraftSessionObject(session: Record<string, unknown>): void {
+  delete session.booster_pack_pool;
+  if (isJsonRecord(session.config)) redactChaosAssignmentsFromSource(session.config.source);
 }
 
 function redactChaosAssignmentsFromSource(source: unknown): boolean {
@@ -127,6 +180,11 @@ interface Bo3MatchState {
   gameNumber: number;
   score: MatchScore;
   decks: Array<{ seat: number; main: DeckCardCount[]; sideboard: DeckCardCount[] }>;
+}
+
+interface GuestLandSuggestionReservation {
+  readonly session: DraftPeerSession;
+  readonly requestId: string;
 }
 
 export type DraftHostEvent =
@@ -435,6 +493,8 @@ export class P2PDraftHost {
   /** Authoritative guest actions cannot race a snapshot/export boundary. */
   private mutationQueue = Promise.resolve();
   private pendingMutations = 0;
+  /** One connected guest may have one queued or in-flight land suggestion. */
+  private guestLandSuggestionReservations = new Map<number, GuestLandSuggestionReservation>();
   /** Admissions mutate token state before their durability fence, so serialize them. */
   private admissionQueue = Promise.resolve();
   private perSeatWorkspaceSnapshots = new Map<number, DraftWorkspaceState>();
@@ -677,7 +737,7 @@ export class P2PDraftHost {
       return;
     }
     session.onMessage((msg) => {
-      this.runDetachedMutation("guest message", () => this.handleGuestMessage(seat, msg, session));
+      this.handleGuestSessionMessage(seat, msg, session);
     });
 
     // Send welcome with empty view (draft hasn't started)
@@ -782,7 +842,7 @@ export class P2PDraftHost {
       this.clearReconnectGrace(reconnectSeat);
       this.guestSessions.set(reconnectSeat, session);
       session.onMessage((msg) => {
-        this.runDetachedMutation("guest message", () => this.handleGuestMessage(reconnectSeat, msg, session));
+        this.handleGuestSessionMessage(reconnectSeat, msg, session);
       });
 
       // The prior fence makes the engine's connected bitmap recoverable while
@@ -857,6 +917,80 @@ export class P2PDraftHost {
 
   // ── Message handling ───────────────────────────────────────────────
 
+  private handleGuestSessionMessage(
+    seat: number,
+    msg: DraftP2PMessage,
+    session: DraftPeerSession,
+  ): void {
+    if (msg.type !== "draft_suggest_lands") {
+      this.runDetachedMutation("guest message", () => this.handleGuestMessage(seat, msg, session));
+      return;
+    }
+
+    // DataChannels can still invoke an old callback after reconnect. It must
+    // not be allowed to alter the replacement session's reservation.
+    if (this.guestSessions.get(seat) !== session) return;
+
+    const existing = this.guestLandSuggestionReservations.get(seat);
+    if (existing?.session === session) {
+      if (existing.requestId === msg.requestId) return;
+      void session.send({
+        type: "draft_suggest_lands_rejected",
+        requestId: msg.requestId,
+        reason: "A land suggestion is already in progress",
+      }).catch(() => undefined);
+      return;
+    }
+
+    const reservation: GuestLandSuggestionReservation = { session, requestId: msg.requestId };
+    this.guestLandSuggestionReservations.set(seat, reservation);
+    this.runDetachedMutation("guest land suggestion", async () => {
+      try {
+        await this.handleGuestLandSuggestion(seat, msg.requestId, reservation);
+      } finally {
+        if (this.guestLandSuggestionReservations.get(seat) === reservation) {
+          this.guestLandSuggestionReservations.delete(seat);
+        }
+      }
+    });
+  }
+
+  private isCurrentGuestLandSuggestion(
+    seat: number,
+    reservation: GuestLandSuggestionReservation,
+  ): boolean {
+    return this.guestSessions.get(seat) === reservation.session
+      && this.guestLandSuggestionReservations.get(seat) === reservation;
+  }
+
+  private async handleGuestLandSuggestion(
+    seat: number,
+    requestId: string,
+    reservation: GuestLandSuggestionReservation,
+  ): Promise<void> {
+    if (!this.isCurrentGuestLandSuggestion(seat, reservation)) return;
+    try {
+      const lands = await this.suggestLandsForSeatInner(
+        seat,
+        () => this.isCurrentGuestLandSuggestion(seat, reservation),
+      );
+      if (!this.isCurrentGuestLandSuggestion(seat, reservation)) return;
+      await reservation.session.send({
+        type: "draft_suggest_lands_result",
+        requestId,
+        lands,
+      });
+    } catch (error) {
+      if (!this.isCurrentGuestLandSuggestion(seat, reservation)) return;
+      const reason = error instanceof Error ? error.message : String(error);
+      await reservation.session.send({
+        type: "draft_suggest_lands_rejected",
+        requestId,
+        reason,
+      });
+    }
+  }
+
   private async handleGuestMessage(
     seat: number,
     msg: DraftP2PMessage,
@@ -905,6 +1039,26 @@ export class P2PDraftHost {
           const reason = err instanceof Error ? err.message : String(err);
           const errorSend = originatingSession?.send({ type: "draft_error", reason });
           if (errorSend) void errorSend.catch(() => undefined);
+        }
+        break;
+      }
+      case "draft_suggest_lands": {
+        try {
+          const lands = await this.suggestLandsForSeatInner(seat);
+          if (this.guestSessions.get(seat) !== originatingSession) return;
+          await originatingSession?.send({
+            type: "draft_suggest_lands_result",
+            requestId: msg.requestId,
+            lands,
+          });
+        } catch (error) {
+          if (this.guestSessions.get(seat) !== originatingSession) return;
+          const reason = error instanceof Error ? error.message : String(error);
+          await originatingSession?.send({
+            type: "draft_suggest_lands_rejected",
+            requestId: msg.requestId,
+            reason,
+          });
         }
         break;
       }
@@ -1061,6 +1215,34 @@ export class P2PDraftHost {
 
   getHostWorkspaceState(): DraftWorkspaceState | null {
     return this.perSeatWorkspaceSnapshots.get(0) ?? null;
+  }
+
+  suggestLandsForSeat(seat: number): Promise<Record<string, number>> {
+    return this.enqueueAuthoritativeMutation(() => this.suggestLandsForSeatInner(seat));
+  }
+
+  private async suggestLandsForSeatInner(
+    seat: number,
+    isLive: () => boolean = () => true,
+  ): Promise<Record<string, number>> {
+    const view = await this.adapter.getViewForSeat(seat);
+    if (!isLive()) throw new Error("Guest session is no longer current");
+    if (view.status !== "Deckbuilding") {
+      throw new Error("Land suggestions are available only during deckbuilding");
+    }
+    const reconciliation = this.reconcileRetainedWorkspace(seat, view.pool);
+    if (!reconciliation.workspaceState) {
+      throw new Error("No retained workspace is available for this seat");
+    }
+    if (reconciliation.changed) {
+      if (!isLive()) throw new Error("Guest session is no longer current");
+      await this.persistSessionStrict();
+    }
+    if (!isLive()) throw new Error("Guest session is no longer current");
+    return this.adapter.suggestLandsForSeat(
+      seat,
+      projectWorkspaceMainDeck(reconciliation.workspaceState, view.pool),
+    );
   }
 
   private async applyWorkspaceUpdate(
@@ -2146,7 +2328,27 @@ export class P2PDraftHost {
       opponent,
       ai_decks: aiDecks,
       draft_set_codes: view.draft_set_codes,
+      booster_pack_pool: await this.adapter.boosterPackPoolForGame(),
     };
+  }
+
+  /** Host-only cube source for a launch assembled outside this coordinator. */
+  async boosterPackPoolForGame(): Promise<string[] | null> {
+    return this.adapter.boosterPackPoolForGame();
+  }
+
+  /**
+   * The booster source for a pairwise launch whose engine runs on
+   * `authoritySeat`. The original Cube multiset is private to this device: the
+   * host is always pod seat 0, and only its own draft session holds the source.
+   * Any other authority is a guest's device, which must never learn the undealt
+   * entries or their duplicate counts, so its launch names no source at all.
+   * That engine then opens ordinary set boosters, exactly as every draft game
+   * did before Cube sources existed; opening from the Cube there would need a
+   * host-side pack request the match authority can call without holding the pool.
+   */
+  private async boosterPackPoolForMatchAuthority(authoritySeat: number): Promise<string[] | null> {
+    return authoritySeat === 0 ? this.adapter.boosterPackPoolForGame() : null;
   }
 
   private async dispatchMatchLaunch(pairing: PairingView, view: DraftPlayerView): Promise<void> {
@@ -2172,6 +2374,7 @@ export class P2PDraftHost {
         player: humanDeck,
         opponent: botDeck,
         ai_decks: [],
+        booster_pack_pool: await this.boosterPackPoolForMatchAuthority(humanSeat),
       };
 
       await this.sendMatchLaunch(humanSeat, {
@@ -2200,6 +2403,7 @@ export class P2PDraftHost {
       player: hostDeck,
       opponent: guestDeck,
       ai_decks: [],
+      booster_pack_pool: await this.boosterPackPoolForMatchAuthority(matchHostSeat),
     };
 
     await this.sendMatchLaunch(matchHostSeat, {
@@ -2952,7 +3156,7 @@ export class P2PDraftHost {
   private async uploadBackupSnapshot(snapshot: PersistedDraftHostSession): Promise<void> {
     if (!this.backupEndpoint || !this.draftCode) return;
     try {
-      const publicSnapshot = redactChaosAssignmentsFromPublicBackup(snapshot);
+      const publicSnapshot = sanitizePublicBackup(snapshot);
       await fetch(`${this.backupEndpoint}/p2p-draft-backup`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },

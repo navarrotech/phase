@@ -2620,7 +2620,7 @@ fn collect_matching_triggers_inner(
             // than the self-ref `ChangesController` case above.
             ability.set_controller_recursive(controller);
             // CR 603.4: Stamp the printed-trigger index so per-turn resolution
-            // tracking (`AbilityCondition::NthResolutionThisTurn`) can identify
+            // tracking (`AbilityCondition::AbilityUseCountThisTurn`) can identify
             // "this ability" at resolution time.
             ability.ability_index = Some(trig_idx);
             // CR 605.4a: A `TapsForMana` triggered mana ability coupled to an
@@ -3024,7 +3024,13 @@ fn source_has_trigger_in_zone(state: &GameState, source_id: ObjectId, zone: Zone
     })
 }
 
-pub(crate) fn trigger_definition_functions_in_zone(def: &TriggerDefinition, zone: Zone) -> bool {
+/// Returns whether a trigger definition functions from `zone`.
+///
+/// CR 113.6 gives abilities their normal battlefield functionality; CR 113.6b
+/// permits an ability to state another zone where it functions. An empty
+/// `trigger_zones` list therefore means battlefield only, while an explicit
+/// list is authoritative.
+pub fn trigger_definition_functions_in_zone(def: &TriggerDefinition, zone: Zone) -> bool {
     if def.trigger_zones.is_empty() {
         zone == Zone::Battlefield
     } else {
@@ -4470,42 +4476,40 @@ fn collect_pending_triggers_with_collection(
                 ..
             } = event
             {
-                if has_prowess && *caster == controller {
-                    // Check if the cast spell is noncreature
-                    let is_noncreature = state
-                        .objects
-                        .get(spell_obj_id)
-                        .map(|obj| !obj.card_types.core_types.contains(&CoreType::Creature))
-                        .unwrap_or(false);
-
-                    if is_noncreature {
-                        let prowess_effect = Effect::Pump {
-                            power: crate::types::ability::PtValue::Fixed(1),
-                            toughness: crate::types::ability::PtValue::Fixed(1),
-                            target: TargetFilter::SelfRef,
-                        };
-                        let prowess_ability =
-                            ResolvedAbility::new(prowess_effect, Vec::new(), obj_id, controller);
-                        let prowess_trig_def = TriggerDefinition::new(TriggerMode::SpellCast)
-                            .description("Prowess".to_string());
-                        pending.push(PendingTriggerContext::single(PendingTrigger {
-                            source_id: obj_id,
-                            controller,
-                            condition: prowess_trig_def.condition,
-                            ability: Box::new(prowess_ability),
-                            timestamp,
-                            target_constraints: Vec::new(),
-                            distribute: None,
-                            trigger_event: Some(event.clone()),
-                            modal: None,
-                            mode_abilities: vec![],
-                            description: prowess_trig_def.description,
-                            may_trigger_origin: None,
-                            subject_match_count: None,
-                            die_result: None,
-                            provenance: None,
-                        }));
-                    }
+                if has_prowess
+                    && synthetic_keyword_spell_cast_trigger_applies(
+                        state,
+                        obj_id,
+                        *caster,
+                        *spell_obj_id,
+                    )
+                {
+                    let prowess_effect = Effect::Pump {
+                        power: crate::types::ability::PtValue::Fixed(1),
+                        toughness: crate::types::ability::PtValue::Fixed(1),
+                        target: TargetFilter::SelfRef,
+                    };
+                    let prowess_ability =
+                        ResolvedAbility::new(prowess_effect, Vec::new(), obj_id, controller);
+                    let prowess_trig_def = TriggerDefinition::new(TriggerMode::SpellCast)
+                        .description("Prowess".to_string());
+                    pending.push(PendingTriggerContext::single(PendingTrigger {
+                        source_id: obj_id,
+                        controller,
+                        condition: prowess_trig_def.condition,
+                        ability: Box::new(prowess_ability),
+                        timestamp,
+                        target_constraints: Vec::new(),
+                        distribute: None,
+                        trigger_event: Some(event.clone()),
+                        modal: None,
+                        mode_abilities: vec![],
+                        description: prowess_trig_def.description,
+                        may_trigger_origin: None,
+                        subject_match_count: None,
+                        die_result: None,
+                        provenance: None,
+                    }));
                 }
             }
 
@@ -6233,6 +6237,30 @@ fn collect_pending_triggers_with_collection(
         )
     });
     pending
+}
+
+/// CR 702.108a: whether this battlefield Prowess instance creates its
+/// synthesized trigger for an announced spell cast.
+///
+/// Prowess has no `TriggerDefinition`; callers that need to account for cast
+/// consequences must use this authority rather than scanning keywords ad hoc.
+pub fn synthetic_keyword_spell_cast_trigger_applies(
+    state: &GameState,
+    source_id: ObjectId,
+    caster: PlayerId,
+    spell_id: ObjectId,
+) -> bool {
+    let Some(source) = state.objects.get(&source_id) else {
+        return false;
+    };
+    let Some(spell) = state.objects.get(&spell_id) else {
+        return false;
+    };
+
+    source.zone == Zone::Battlefield
+        && source.controller == caster
+        && source.has_keyword(&Keyword::Prowess)
+        && !spell.card_types.core_types.contains(&CoreType::Creature)
 }
 
 /// Probe whether a throwaway event batch would create trigger work that uses
@@ -8357,18 +8385,19 @@ pub(crate) fn is_pending_trigger_construction_active(state: &GameState) -> bool 
 /// cursor `pending_trigger_entry` is left dangling.
 ///
 /// This should be UNREACHABLE: mode/target/division are chosen while the ability
-/// is put on the stack (CR 603.3d), before any player has priority, so it cannot
+/// is put on the stack (CR 603.3c + CR 603.3d), before any player has priority, so it cannot
 /// be countered/removed mid-construction; and a controller leaving the game is
 /// already handled upstream (`elimination::do_eliminate` clears all three
 /// pending-trigger fields when the tracked entry is retained off the stack). If
 /// this fires, the entry left the stack via an UNEXPECTED / UNIDENTIFIED
-/// state-coherence defect, not a known rules-legal cause. The CRs below are
-/// cited only as the rules basis for the RECOVERY SEMANTICS, not the cause:
+/// state-coherence defect, not a known rules-legal cause. The CR below is cited
+/// only as the rules basis for the RECOVERY SEMANTICS, not the cause:
 ///
-/// * CR 608.2b: a spell or ability that has left the stack does not resolve.
-/// * CR 800.4a: an object on the stack that ceases to exist is simply gone.
+/// * CR 608.1: resolution selects the spell or ability on top of the stack, so
+///   an entry absent from it is never selected to begin resolving.
 ///
-/// so a stack object that no longer exists can be neither mutated nor resolved.
+/// A cursor into an entry that is gone has nothing left to complete and
+/// nothing to hand the resolver.
 /// Recovery: record a distinguishable diagnostic (item recorded once per
 /// abandon, count preserved — see `GameState::pending_trigger_abandons`), drop
 /// the vanished entry's side-table rows, and clear every in-flight construction
@@ -8512,7 +8541,7 @@ fn assign_pending_trigger_entry_ability(
             _ => None,
         });
     let mut assigned_ability = source_ability.clone();
-    // CR 603.3d: Target/mode construction replaces the provisional stack
+    // CR 603.3c + CR 603.3d: Target/mode construction replaces the provisional stack
     // ability before any player receives priority. Rebind event-referential
     // force-blocks here so that replacement cannot discard the stack-time
     // identity for "that Wolf".
@@ -11248,7 +11277,7 @@ fn gate_binding_diverges_at_fire_time(condition: &AbilityCondition) -> bool {
         | AbilityCondition::WhenYouDo
         | AbilityCondition::RevealedHasCardType { .. }
         | AbilityCondition::PreviousEffectAmount { .. }
-        | AbilityCondition::NthResolutionThisTurn { .. }
+        | AbilityCondition::AbilityUseCountThisTurn { .. }
         | AbilityCondition::DiscardedCardMatchesFilter { .. }
         // CR 608.2c: the "this way" ledgers — `state.last_zone_changed_ids` and
         // the tracked sets — declined for exactly the reason their
@@ -11930,6 +11959,11 @@ fn filter_prop_binding_diverges(prop: &FilterProp) -> bool {
         FilterProp::Owned { controller } | FilterProp::ProtectorMatches { controller } => {
             controller_ref_binding_diverges(controller)
         }
+        // CR 303.4 + CR 301.5: the player referent is a `ControllerRef` like
+        // `Owned`/`ProtectorMatches` above — recurse into the same authority
+        // rather than bucketing with `AttachedToRecipient` (whose divergence is
+        // about the per-recipient `FilterContext` binding, a different axis).
+        FilterProp::AttachedToPlayer { player } => controller_ref_binding_diverges(player),
         FilterProp::MostPrevalentCreatureTypeIn { scope, .. } => {
             controller_ref_binding_diverges(scope)
         }
@@ -13433,9 +13467,10 @@ fn check_trigger_constraint_with_ref(
             nth_in_turn == *n
         }
         // CR 716.2a: "When this Class becomes level N" — fire only at the specified level.
-        TriggerConstraint::AtClassLevel { level } => source_context
-            .and_then(|source| source.source_read(state).class_level())
-            .is_some_and(|current| current == *level),
+        // CR 716.2d: an absent stored level reads as 1 (`GameObject::level`).
+        TriggerConstraint::AtClassLevel { level } => {
+            source_context.is_some_and(|source| source.source_read(state).level() == *level)
+        }
         // CR 603.4: "This ability triggers only the first N times each turn."
         TriggerConstraint::MaxTimesPerTurn { max } => definition_ref.is_none_or(|key| {
             state
@@ -13995,9 +14030,10 @@ fn evaluate_trigger_condition_with_source(
                 })
         }),
         // CR 716.2a: True when the source Class is at or above the specified level.
-        TriggerCondition::ClassLevelGE { level } => source_context
-            .and_then(|source| source.source_read(state).class_level())
-            .is_some_and(|current| current >= *level),
+        // CR 716.2d: an absent stored level reads as 1 (`GameObject::level`).
+        TriggerCondition::ClassLevelGE { level } => {
+            source_context.is_some_and(|source| source.source_read(state).level() >= *level)
+        }
         // CR 701.64b + CR 702.186b: True when the source permanent is harnessed.
         // Gates an ∞ (Infinity) triggered ability so it only fires while
         // harnessed (the ∞ ability word maps to this condition).
@@ -44044,6 +44080,7 @@ pub mod tests {
                 enter_with_counters: vec![],
                 face_down_profile: None,
                 library_position: None,
+                library_shuffle: Default::default(),
                 random_order: false,
             },
             Vec::new(),
@@ -44387,6 +44424,7 @@ pub mod tests {
                 enter_with_counters: vec![],
                 face_down_profile: None,
                 library_position: None,
+                library_shuffle: Default::default(),
                 random_order: false,
             },
             Vec::new(),
@@ -44448,6 +44486,7 @@ pub mod tests {
                 enter_with_counters: vec![],
                 face_down_profile: None,
                 library_position: None,
+                library_shuffle: Default::default(),
                 random_order: false,
             },
             LogicalZoneProductionCarrier::BatchDelivery => Effect::BounceAll {

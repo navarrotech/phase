@@ -52,6 +52,8 @@ use super::proposed_event::{
 use super::replacements::ReplacementEvent;
 #[cfg(debug_assertions)]
 use super::resolution::debug_assert_runtime_resolution_invariants;
+#[cfg(test)]
+use super::resolution::RESOLUTION_STATE_WIRE_VERSION;
 use super::resolution::{
     AbilityContinuationFrame, ChangeZoneFrame, ChildStackDepth, FrameGate, MultiDrawFrame,
     OptionalEffectFrame, PendingCoinFlip, PendingDieRoll, PendingDieRollInstruction,
@@ -929,10 +931,13 @@ impl<'context, 'state> TriggerSourceRead<'context, 'state> {
         }
     }
 
-    pub fn class_level(self) -> Option<u8> {
+    /// CR 716.2d: the source's level, normalized through the shared
+    /// [`GameObject::level`] authority so a latched snapshot and a live object
+    /// answer identically, and so a source with no stored level reads as 1.
+    pub fn level(self) -> u8 {
         match self {
-            Self::ExactLive(object) => object.class_level,
-            Self::Latched(context) => context.class_level,
+            Self::ExactLive(object) => object.level(),
+            Self::Latched(context) => GameObject::level_from_stored(context.class_level),
         }
     }
 
@@ -4219,6 +4224,109 @@ pub struct PendingEachPlayerCopyChosen {
     pub trigger_event: Option<crate::types::events::GameEvent>,
 }
 
+/// CR 607.2a + CR 608.2c: one row of the exiled-"this way" population that
+/// `RepeatContinuation::UntilStopConditions`'s stop predicates read.
+///
+/// One field per input the predicates actually consult, so the set is exactly
+/// what `should_stop_repeat_until` reads and nothing more:
+///  - `zone` — `stop_on_put_to_hand` asks where an exiled card is NOW
+///    (`obj.zone == Zone::Hand`);
+///  - `controller` — the same predicate's second conjunct is
+///    `obj.controller == ability.controller`. Note what this field is NOT for:
+///    `Zone` is player-agnostic (`types/zones.rs` declares a bare `Hand`), so a
+///    card reaching ANY player's hand already changes `zone` and needs no help
+///    here. What `zone` cannot see is a CONTROL CHANGE with the zone held
+///    constant — that flips exactly this conjunct while `zone` and `name` stay
+///    byte-identical, and only a witness carrying `controller` observes it;
+///  - `name` — `stop_on_duplicate_exiled_names` compares names.
+///
+/// Two witnesses therefore compare equal exactly when every input both
+/// predicates read is unchanged.
+///
+/// NOTE (safe asymmetry, do NOT "fix"): `duplicate_name_among_exiled_by_source`
+/// compares names with `eq_ignore_ascii_case`, while this type's derived `Eq`
+/// is case-sensitive — so the witness is strictly FINER than the predicate. A
+/// finer witness can only ever fail to stop (one extra iteration), never stop
+/// early; that is the safe direction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExiledStopInput {
+    pub object_id: ObjectId,
+    pub zone: Zone,
+    pub controller: PlayerId,
+    pub name: String,
+}
+
+/// CR 104.4b + CR 608.2c: a snapshot of every input the `UntilStopConditions`
+/// stop predicates consult, taken immediately before one iteration of the
+/// repeat.
+///
+/// TERMINATION CONTRACT: both stop predicates are pure functions of this
+/// witness. An iteration that leaves it unchanged changed nothing either
+/// predicate can observe, so no further iteration of the same body can reach a
+/// stop condition. `effects::repeat_until_verdict` turns that into the CR 104.4b
+/// outcome: a draw when the stalled iteration contained only mandatory actions
+/// and moved no object, otherwise the end of the process. Without this, an
+/// `UntilStopConditions` repeat whose producer is starved (empty library, a
+/// `Moved` redirect away from Exile) never terminates.
+///
+/// COUPLING, recorded: the `Some(RepeatContinuation::UntilStopConditions {
+/// stop_on_put_to_hand, stop_on_duplicate_exiled_names })` patterns in
+/// `game/effects/mod.rs` bind every field WITHOUT `..`. Keep it that way: a
+/// future third stop predicate must fail to compile there so it is classified
+/// here too. A `..` would silently make this witness unsound for it.
+///
+/// LATENT TRUNCATION HAZARD (not live in today's card pool — measured n = 1,
+/// Tainted Pact, which is unaffected): these ledgers are only populated when
+/// `exile_links::should_track_exiled_by_source` is true, i.e. the ability
+/// carries a linked-exile consumer. The grammar makes the same-name stop
+/// clause OPTIONAL, so a future body reading only "…repeat this process until
+/// you put a card into your hand" would track nothing, hold this witness
+/// byte-identical every iteration WHILE ACTUALLY EXILING CARDS, and be judged
+/// stalled after one iteration rather than hung. That iteration moved a card,
+/// so `repeat_until_verdict` ends the process there (TRUNCATED) instead of
+/// declaring a draw. A `Moved` redirect that
+/// sends the card anywhere but Exile has the same shape. If such a card
+/// appears, the repair is to make the witness key on something that body
+/// actually mutates (the producer's own output — moved-card count, library
+/// size, the iteration's published zone-change ids), NOT to loosen this
+/// type's equality. Note the no-`..` tripwire above does NOT fire for a body
+/// that merely omits a clause — this comment is the only warning for that
+/// case.
+///
+/// Every field added here WEAKENS the guard: this is a no-change detector, not
+/// a no-progress-toward-stop detector, so each field is one more way for a
+/// stalled loop to look like it advanced. `zone`, `controller` and `name` earn
+/// their place because `should_stop_repeat_until` reads all three. Add a fourth
+/// only when a stop predicate reads it.
+///
+/// THE ONE EXCEPTION, which STRENGTHENS the guard: keeping the two ledgers in
+/// SEPARATE rows (below) rather than deduping their union. The two stop
+/// predicates read the ledgers separately — the put-to-hand half reads
+/// `cards_exiled_with_source_this_turn`, `duplicate_name_among_exiled_by_source`
+/// reads `exile_links` — so a row added to one ledger for an object the OTHER
+/// ledger already holds genuinely moves a predicate's input. A union deduped by
+/// `ObjectId` would hold byte-identical across exactly that change and stop (or
+/// draw) a repeat that had in fact advanced — the unsafe direction — so
+/// the rows are keyed by `(ledger, object_id)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepeatUntilStopWitness {
+    /// Rows drawn from `GameState::cards_exiled_with_source_this_turn`, the
+    /// ledger `should_stop_repeat_until`'s put-to-hand half reads.
+    ///
+    /// Sorted and deduped by `object_id` so equality is order-independent —
+    /// the ledger this is built from is insertion-ordered, not stable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exiled_this_turn: Vec<ExiledStopInput>,
+    /// Rows drawn from `GameState::exile_links` for this source, the ledger
+    /// `duplicate_name_among_exiled_by_source` reads. Kept separate from
+    /// `exiled_this_turn` rather than unioned with it, for the reason recorded
+    /// in this type's doc comment.
+    ///
+    /// Sorted and deduped by `object_id`, same as above.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub linked: Vec<ExiledStopInput>,
+}
+
 /// CR 608.2c + CR 107.1c: Resume state for a "repeat this process" loop
 /// (`RepeatContinuation`) paused when an iteration's process entered an
 /// interactive `WaitingFor` state.
@@ -4230,9 +4338,21 @@ pub struct PendingEachPlayerCopyChosen {
 ///
 /// - `ability` — the loop ability, retaining `repeat_until` so the drain knows
 ///   which continuation mode to apply.
+/// - `stop_progress` — CR 104.4b: the `UntilStopConditions` stop-predicate
+///   inputs as they stood BEFORE the paused iteration began, so the drain can
+///   tell a stalled repeat from a progressing one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingRepeatUntil {
     pub ability: Box<crate::types::ability::ResolvedAbility>,
+    /// CR 104.4b: the stop-predicate inputs as they stood BEFORE the paused
+    /// iteration began. `None` means no baseline was recorded (a legacy
+    /// payload, or a continuation mode that carries no progress guard:
+    /// `ControllerChoice` re-prompts the player every iteration, and
+    /// `WhileCondition` is bounded by its own `max_iterations`). `None` can
+    /// never cause a stop — it costs at most one extra iteration, which is the
+    /// safe direction to fail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_progress: Option<RepeatUntilStopWitness>,
 }
 
 /// CR 701.55d: Remaining players queued to face the same resolution-time
@@ -6564,13 +6684,13 @@ pub enum PendingCounterPostAction {
     ///
     /// Serialized surface: this enum reaches persisted state through
     /// `PendingEffectResolved::post_actions`, carried on the
-    /// `RESOLUTION_STATE_WIRE_VERSION` = 2 frame wire. A new externally-tagged
+    /// `RESOLUTION_STATE_WIRE_VERSION` = 3 frame wire. A new externally-tagged
     /// variant is backward compatible — no save written before it can contain
     /// one, so existing saves still decode — but NOT forward compatible: a build
     /// predating this variant cannot decode a save taken mid-paused-proliferate.
     /// That is the same one-way contract `MarkMonstrous`, `MarkRenowned` and
     /// `EmitCommittedCopyTokenEntry` shipped under, so the wire version is
-    /// deliberately not bumped.
+    /// did not itself require a bump.
     ContinueProliferateActions {
         pending: PendingProliferateActions,
     },
@@ -6836,6 +6956,10 @@ pub struct PendingCast {
     pub declared_mana_additions: Vec<ManaCost>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation_cost: Option<AbilityCost>,
+    /// CR 601.2h: Random cost elements are paid after every nonrandom element.
+    /// Presence also reserves this many hand cards through the mana window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_random_discard_cost: Option<DeferredRandomDiscardCost>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation_ability_index: Option<usize>,
     /// CR 606.3: Loyalty activation history is recorded only after the loyalty
@@ -7438,13 +7562,40 @@ pub struct RandomDiscardUnlessPaymentResume {
 /// choice. The object at `paused_at_index` completes during
 /// `handle_replacement_choice`; resumption starts with the following object.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingDiscardForCostResume {
-    pub player: PlayerId,
-    pub pending: PendingCast,
-    pub chosen: Vec<ObjectId>,
-    /// Index into `chosen` whose move was paused; that move completes during
-    /// `handle_replacement_choice` before this resume runs.
-    pub paused_at_index: usize,
+pub enum PendingDiscardForCostResume {
+    Chosen {
+        player: PlayerId,
+        pending: PendingCast,
+        chosen: Vec<ObjectId>,
+        /// Index into `chosen` whose move was paused; that move completes during
+        /// `handle_replacement_choice` before this resume runs.
+        paused_at_index: usize,
+    },
+    /// CR 601.2h + CR 701.9b + CR 616.1: A random cost discard paused after
+    /// its selected card entered the replacement pipeline. The narrowed cursor
+    /// prevents the settled pick from being selected or paid twice.
+    Random {
+        player: PlayerId,
+        pending: PendingCast,
+        remaining_eligible: Vec<ObjectId>,
+        remaining_count: usize,
+        paused_pick: Box<RandomDiscardCostPick>,
+    },
+}
+
+/// CR 400.7j + CR 608.2k: Identity and public characteristics captured before
+/// a randomly selected cost card leaves its owner's hand.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RandomDiscardCostPick {
+    pub occurrence: ObjectIncarnationRef,
+    pub snapshot: CostPaidObjectSnapshot,
+}
+
+/// The single supported random hand-discard leaf, reserved while every
+/// nonrandom component of the same cost is paid.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeferredRandomDiscardCost {
+    pub count: usize,
 }
 
 impl PendingCast {
@@ -7463,6 +7614,7 @@ impl PendingCast {
             base_cost: None,
             declared_mana_additions: Vec::new(),
             activation_cost: None,
+            deferred_random_discard_cost: None,
             activation_ability_index: None,
             pending_loyalty_activation_player: None,
             target_constraints: Vec::new(),
@@ -8520,20 +8672,31 @@ pub enum OutsideGameChoiceSource {
     /// CR 400.11 + CR 400.11b: A card in a booster pack `Effect::OpenBoosterPack`
     /// just opened. The pack's cards are outside the game and in no zone, so —
     /// like `Sideboard` — the entry carries the full `CardFace` the taken card
-    /// is built from, plus the set the pack came from for display. `pack_slot`
+    /// is built from, plus where the pack came from for display. `pack_slot`
     /// is the card's position in the opened pack and its only stable identity.
     BoosterPack {
         pack_slot: usize,
-        set_code: String,
+        origin: PackOrigin,
         /// Boxed, unlike `Sideboard`'s inline face: `WaitingFor` is stored
         /// inline in `GameState`, which `phase-server` moves BY VALUE through
         /// the action + AI path, so this enum's largest variant is multiplied by
         /// every live `GameState` on a frame chain (see `types/game_state_size.rs`
         /// and the `game_state_stack_budget` regression). `Sideboard` already
-        /// sets that ceiling; adding a set code beside a second inline face
+        /// sets that ceiling; adding a pack origin beside a second inline face
         /// would raise it.
         card: Box<crate::types::card::CardFace>,
     },
+}
+
+/// Where an opened booster pack came from, for display. Every card in one pack
+/// shares its origin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum PackOrigin {
+    /// A sealed product of one set, named by its MTGJSON set code.
+    Set(String),
+    /// The game's original Cube source (`GameState::booster_pack_pool`).
+    Cube,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -8558,17 +8721,34 @@ fn default_one_u32() -> u32 {
 /// and each `Effect::OpenBoosterPack` resolution opens a freshly collated pack
 /// from one of them — so the number of packs a game can open is unbounded while
 /// the resident cost stays proportional to the shelf, not to the corpus.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct BoosterShelf {
-    /// Products in deterministic order. Empty when no card in the game opens
-    /// booster packs, or when the loaded card database carries no set that can
-    /// fill a pack.
-    pub products: Vec<BoosterProduct>,
+///
+/// A game opens packs from exactly one kind of source, so the shelf is one or
+/// the other and never both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BoosterShelf {
+    /// Sealed products in deterministic order. Empty when no card in the game
+    /// opens booster packs, or when the loaded card database carries no set
+    /// that can fill a pack.
+    Products(Vec<BoosterProduct>),
+    /// The hydrated original Cube source (`GameState::booster_pack_pool`),
+    /// copies included. Empty when that source is unavailable: a legacy
+    /// snapshot that lost it, or an entry the card database cannot resolve.
+    Cube(Vec<CardFace>),
+}
+
+impl Default for BoosterShelf {
+    /// An unstocked shelf: no products until rehydrate stocks it.
+    fn default() -> Self {
+        Self::Products(Vec::new())
+    }
 }
 
 impl BoosterShelf {
     pub fn is_empty(&self) -> bool {
-        self.products.is_empty()
+        match self {
+            Self::Products(products) => products.is_empty(),
+            Self::Cube(cards) => cards.is_empty(),
+        }
     }
 }
 
@@ -9829,8 +10009,9 @@ fn visit_persisted_journal_zone_change_trigger_records(
 /// omit either field and deserialize them as zero.
 ///
 /// This runs against serialized `ResolutionStateWire` input before either v1
-/// legacy fields or v2 frames materialize into runtime state. The caller passes
-/// any v1-only live roots; v2 frames are part of the canonical root set below.
+/// legacy fields or v2/v3 typed frames materialize into runtime state. The
+/// caller passes any v1-only live roots; typed frames are part of the canonical
+/// root set below.
 /// Raw and Trusted persistence are both fallible at that boundary, and rebinding
 /// after deserialization would be too late: callers could already observe an
 /// ambiguous trigger event.
@@ -13610,8 +13791,9 @@ pub enum WaitingFor {
     ///
     /// The window is what makes CR 732.2c's "once the LAST player has either accepted or
     /// shortened" a real condition rather than an assumption: no advance occurs until this queue
-    /// drains. See `ShortcutResponse` for how a `Shorten` is realized, which is deliberately
-    /// conservative and disclosed there.
+    /// drains — on either answer. A `Shorten` rewrites `proposal.count` to the place it names
+    /// and records the namer in `proposal.shortened_by`, so the seats queued behind it answer
+    /// the shortened proposal and the last of them takes it to that place.
     RespondToShortcut {
         player: PlayerId,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -17348,6 +17530,13 @@ pub struct LoopDetectSample {
     pub live: GameState,
 }
 
+/// CR 104.1: the result of a game that has ended. `winner: None` is a draw (CR 104.4).
+/// Written only by `elimination::end_game`; see [`GameState::game_end`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GameEnd {
+    pub winner: Option<PlayerId>,
+}
+
 /// Declares the runtime state and its private serde-only raw mirror from one
 /// field list. Keeping the field declaration single-sourced makes persistence
 /// ingress exhaustive whenever `GameState` evolves.
@@ -17508,6 +17697,24 @@ declare_game_state! {
 
     // Game flow
     pub waiting_for: WaitingFor,
+    /// CR 104.1: the recorded result once the game has ended, written only by
+    /// `elimination::end_game`. `waiting_for` is not a durable home for it: a game can end
+    /// mid-resolution (the CR 104.4b mandatory-loop draw), and a later step of the SAME
+    /// action can still overwrite `waiting_for` before the action boundary. The CR 104.1
+    /// guard in `run_post_action_pipeline` stops triggers from reaching a finished game's
+    /// stack at the source. This record covers the writers that remain, such as a CR 616.1
+    /// replacement-order prompt raised in `resolve_top` on the resolving spell's own zone
+    /// move. `elimination::ensure_game_over_if_terminal`
+    /// re-establishes `WaitingFor::GameOver` from this record, without a second
+    /// `GameEvent::GameOver`.
+    ///
+    /// `#[serde(skip)]`: consumed within the apply that set it. Every action boundary runs
+    /// `reconcile_terminal_result`, after which `waiting_for` carries the result on the
+    /// wire, and nothing serializes a `GameState` between the write and that boundary (the
+    /// only runtime serializers are the persistence and client-wire boundaries). A clone
+    /// keeps it. A new game is a fresh `GameState::new`, so it cannot leak into game 2.
+    #[serde(skip)]
+    pub game_end: Option<GameEnd>,
     /// Persisted allocation source for Resolve All consent epochs. Starts at
     /// one for legacy saves and is minted only by `BeginResolveAll`.
     #[serde(default = "initial_resolve_all_consent_epoch")]
@@ -18054,6 +18261,15 @@ declare_game_state! {
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_map_of_hash_map")]
     pub tracked_set_member_causes: HashMap<TrackedSetId, HashMap<ObjectId, ThisWayCause>>,
 
+    /// CR 701.24c-e + CR 608.2c: players explicitly designated by a tracked-set
+    /// producer even when their subject population is empty. The object ledger
+    /// alone cannot represent "shuffle your empty graveyard into your library";
+    /// this sidecar preserves that participant so the cause-filtered owner
+    /// consumer still performs the shuffle.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
+    pub tracked_set_participants: HashMap<TrackedSetId, Vec<(PlayerId, ThisWayCause)>>,
+
     // Commander support
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
@@ -18595,7 +18811,7 @@ declare_game_state! {
     /// ability on a specific source object. Incremented at the top of
     /// `resolve_ability_chain` (depth 0) when the resolving ability has a
     /// `Some(ability_index)` stamp; read by
-    /// `AbilityCondition::NthResolutionThisTurn` to gate Omnath-style
+    /// `AbilityCondition::AbilityUseCountThisTurn` to gate Omnath-style
     /// "if this is the [Nth] time this ability has resolved this turn" patterns.
     /// Cleared in `start_next_turn` alongside other per-turn counters.
     #[serde(
@@ -19167,6 +19383,11 @@ declare_game_state! {
     #[serde(skip)]
     pub booster_shelf: Arc<BoosterShelf>,
 
+    /// Original source entries for in-game packs. Shared across search clones,
+    /// persisted as names, and hydrated independently of the game RNG.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub booster_pack_pool: Option<Arc<Vec<String>>>,
+
     /// Display names for log resolution. Set by server; WASM leaves empty (defaults to "Player N").
     /// Skipped in serialization — runtime context only.
     #[serde(skip)]
@@ -19183,9 +19404,10 @@ declare_game_state! {
     pub last_revealed_ids: Vec<ObjectId>,
 
     /// CR 401.5 + CR 608.2c + CR 609.3 + issue #4950: Set when the most
-    /// recently resolved `Dig`/`ChooseFromZone`/`RevealHand` reveal-choice
-    /// came up with nothing (empty library, no eligible card, or an empty
-    /// reveal-choice set respectively) — distinct from "none of those has run
+    /// recently resolved `Dig`/`ChooseFromZone`/`RevealHand` reveal-choice/
+    /// `ExileTop` came up with nothing (empty library, no eligible card, an
+    /// empty reveal-choice set, or no card exiled respectively; `ExileTop`
+    /// since issue #8798) — distinct from "none of those has run
     /// in this chain link," which is `None`. This is a brief, transient
     /// relay: `effects::apply_parent_chain_context` reads and immediately
     /// clears it at the very next parent->child hand-off (whatever that
@@ -19225,6 +19447,21 @@ declare_game_state! {
     /// Cleared at depth 0 in resolve_ability_chain.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub last_zone_changed_ids: Vec<ObjectId>,
+
+    /// CR 701.6a + CR 614.1a (issue #8762): the spells the most recent
+    /// `Effect::Counter` exiled through its "exile it instead of putting it
+    /// into its owner's graveyard" rider — recorded by `counter::resolve` at
+    /// the moment it chooses that destination, from the rider AS APPLIED to
+    /// the concrete countered spell (Thranduil's Decree names "a permanent
+    /// spell" only). Read by the `Exiled` provenance stamp of the same
+    /// resolution, which must not re-derive the answer: an Adventure or Omen
+    /// spell has its creature face restored between the destination choice
+    /// and the stamp (CR 715.4 / CR 720.4), so the same filter would answer
+    /// differently there.
+    /// Mirrors `last_zone_changed_ids` lifecycle: cleared at chain depth 0 in
+    /// `resolve_ability_chain`, and at the start of every `counter::resolve`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exile_rider_countered_ids: Vec<ObjectId>,
 
     /// CR 608.2c + CR 701.38: Per-vote ballots from the most recent
     /// `Effect::Vote` resolution within the current top-level ability
@@ -19789,6 +20026,7 @@ pub(crate) enum GameStateDecodeMode {
     TrustedEnvelope,
     ResolutionWireV1,
     ResolutionWireV2,
+    ResolutionWireV3,
     DirectCurrentRaw,
 }
 
@@ -19797,31 +20035,185 @@ pub(crate) enum GameStateDecodeMode {
 /// restore caller from silently becoming a second compatibility boundary.
 pub(crate) struct GameStateDecode;
 
+const LEGACY_EXPLOIT_EVENT_EVIDENCE_ERROR: &str =
+    "CreatureExploited snapshot lacks authoritative victim record; restore a save that contains the exploit departure record";
+
+const SERIALIZED_TRIGGER_DEFINITION_CORE_FIELDS: &[&str] = &[
+    "execute",
+    "valid_card",
+    "origin",
+    "destination",
+    "trigger_zones",
+    "phase",
+    "optional",
+    "damage_kind",
+    "secondary",
+    "valid_target",
+    "valid_source",
+    "description",
+    "constraint",
+    "condition",
+];
+
+fn is_serialized_exploited_trigger_definition(
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    object.get("mode").and_then(serde_json::Value::as_str) == Some("Exploited")
+        && SERIALIZED_TRIGGER_DEFINITION_CORE_FIELDS
+            .iter()
+            .all(|field| object.contains_key(*field))
+}
+
+pub(crate) fn contains_ambiguous_serialized_exploited_trigger_definition(
+    value: &serde_json::Value,
+) -> bool {
+    match value {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(contains_ambiguous_serialized_exploited_trigger_definition),
+        serde_json::Value::Object(object) => {
+            (is_serialized_exploited_trigger_definition(object)
+                && object
+                    .get("valid_card")
+                    .is_some_and(|valid_card| !valid_card.is_null()))
+                || object
+                    .values()
+                    .any(contains_ambiguous_serialized_exploited_trigger_definition)
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => false,
+    }
+}
+
+fn migrate_legacy_exploited_trigger_roles(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                migrate_legacy_exploited_trigger_roles(value);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            if is_serialized_exploited_trigger_definition(object) {
+                if object
+                    .get("valid_source")
+                    .is_none_or(serde_json::Value::is_null)
+                {
+                    let legacy_actor = object
+                        .get("valid_card")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    object.insert("valid_source".to_string(), legacy_actor);
+                }
+                object.insert("valid_card".to_string(), serde_json::Value::Null);
+            }
+            for value in object.values_mut() {
+                migrate_legacy_exploited_trigger_roles(value);
+            }
+        }
+        serde_json::Value::Null
+        | serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::String(_) => {}
+    }
+}
+
+fn reject_legacy_exploit_event_evidence(value: &serde_json::Value) -> Result<(), String> {
+    fn reject(path: &str, reason: &str) -> Result<(), String> {
+        Err(format!(
+            "{LEGACY_EXPLOIT_EVENT_EVIDENCE_ERROR} at {path}: {reason}"
+        ))
+    }
+
+    fn validate_event_data(data: &serde_json::Value, path: &str) -> Result<(), String> {
+        let Some(data) = data.as_object() else {
+            return reject(path, "event data is not an object");
+        };
+        let Some(record) = data.get("record") else {
+            return reject(path, "record is missing");
+        };
+        let Some(record) = record.as_object() else {
+            return reject(path, "record must be an object");
+        };
+        match record.get("is_token") {
+            None => return reject(path, "record.is_token is missing"),
+            Some(value) if !value.is_boolean() => {
+                return reject(path, "record.is_token must be a boolean");
+            }
+            Some(_) => {}
+        }
+        if let (Some(sacrificed), Some(object_id)) = (
+            data.get("sacrificed").and_then(serde_json::Value::as_u64),
+            record.get("object_id").and_then(serde_json::Value::as_u64),
+        ) {
+            if sacrificed != object_id {
+                return reject(path, "record.object_id disagrees with event.sacrificed");
+            }
+        }
+        Ok(())
+    }
+
+    fn visit(value: &serde_json::Value, path: &str) -> Result<(), String> {
+        match value {
+            serde_json::Value::Array(values) => {
+                for (index, value) in values.iter().enumerate() {
+                    visit(value, &format!("{path}[{index}]"))?;
+                }
+            }
+            serde_json::Value::Object(object) => {
+                if object.get("type").and_then(serde_json::Value::as_str)
+                    == Some("CreatureExploited")
+                {
+                    let Some(data) = object.get("data") else {
+                        return reject(path, "event data is missing");
+                    };
+                    validate_event_data(data, &format!("{path}.data"))?;
+                }
+                if let Some(data) = object.get("CreatureExploited") {
+                    validate_event_data(data, &format!("{path}.CreatureExploited"))?;
+                }
+                for (key, value) in object {
+                    visit(value, &format!("{path}.{key}"))?;
+                }
+            }
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_) => {}
+        }
+        Ok(())
+    }
+
+    visit(value, "$")
+}
+
 impl GameStateDecode {
     pub(crate) fn decode_persisted_resolution_state(
         mut value: serde_json::Value,
         mode: GameStateDecodeMode,
     ) -> Result<GameState, String> {
-        let object = value
-            .as_object_mut()
-            .ok_or_else(|| "persisted game state must be a JSON object".to_string())?;
+        if !value.is_object() {
+            return Err("persisted game state must be a JSON object".to_string());
+        }
         match mode {
             // An UNVERSIONED raw payload carries no resolution-wire
             // discriminator. Raw persistence in general does: the engine's own
             // raw writer, `PersistedGameState::Raw`'s `Serialize`, routes
             // through `ResolutionStateWire::to_value`, which always declares
-            // version 2. This is the only ingress allowed to infer a MISSING
+            // the current version. This is the only ingress allowed to infer a MISSING
             // discriminator, and `declare_raw_resolution_wire` is the single
             // authority that does. A payload that declares its own version
             // keeps it and is handled exactly as any declared payload is.
             GameStateDecodeMode::PersistedRaw => {
-                crate::types::resolution::declare_raw_resolution_wire(object)?;
+                crate::types::resolution::declare_raw_resolution_wire(&mut value)?;
             }
             // Trusted snapshots are written as versioned resolution-wire
             // envelopes and must retain their declared compatibility mode.
             GameStateDecodeMode::TrustedEnvelope => {}
             GameStateDecodeMode::ResolutionWireV1
             | GameStateDecodeMode::ResolutionWireV2
+            | GameStateDecodeMode::ResolutionWireV3
             | GameStateDecodeMode::DirectCurrentRaw => {
                 return Err("invalid persisted resolution-state decode mode".to_string());
             }
@@ -19846,6 +20238,7 @@ impl GameStateDecode {
         mut value: serde_json::Value,
         mode: GameStateDecodeMode,
     ) -> Result<GameState, String> {
+        reject_legacy_exploit_event_evidence(&value)?;
         reject_legacy_raw_prompt_authority(&value)?;
         if !matches!(mode, GameStateDecodeMode::DirectCurrentRaw) {
             migrate_legacy_delayed_trigger_provenance(&mut value)?;
@@ -19889,9 +20282,18 @@ impl GameStateDecode {
     ) -> Result<(), String> {
         debug_assert!(matches!(
             mode,
-            GameStateDecodeMode::ResolutionWireV1 | GameStateDecodeMode::ResolutionWireV2
+            GameStateDecodeMode::ResolutionWireV1
+                | GameStateDecodeMode::ResolutionWireV2
+                | GameStateDecodeMode::ResolutionWireV3
         ));
+        reject_legacy_exploit_event_evidence(value)?;
         reject_legacy_raw_prompt_authority(value)?;
+        if matches!(
+            mode,
+            GameStateDecodeMode::ResolutionWireV1 | GameStateDecodeMode::ResolutionWireV2
+        ) {
+            migrate_legacy_exploited_trigger_roles(value);
+        }
         migrate_legacy_delayed_trigger_provenance(value)?;
         migrate_legacy_trigger_firing_carriers(
             value,
@@ -20855,6 +21257,11 @@ pub struct PendingReplacement {
     /// `candidates` has exactly one entry (the real replacement); decline is synthetic.
     #[serde(default)]
     pub is_optional: bool,
+    /// Choice authority captured when an optional replacement is offered. This
+    /// is deliberately separate from CR 616 ordering, whose chooser remains
+    /// the affected player.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice_player: Option<PlayerId>,
     /// CR 701.24a: the library placement requested by the original `move_object`
     /// call whose replacement consult parked here (W3 library-placement arm only).
     /// `Some` solely for a parked Library-targeting `ZoneChange`; the resume path
@@ -20948,14 +21355,129 @@ pub enum PhaseTransitionDrainState {
     AwaitingPostReplacementContinuation,
 }
 
+/// Why an empty-pool event is costing a player life. Two independent causes
+/// can apply to the SAME event, and they are not interchangeable: one is the
+/// format's rules being older, the other is a card doing something.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EmptyPoolLifeLossCause {
+    /// The pre-M10 mana-burn rule, per `LegacyRuleSet.mana_burn`. Emits
+    /// `GameEvent::ManaBurn` once the loss actually completes.
+    ManaBurn,
+    /// A Yurlok-class static ability that makes unspent mana cost life.
+    UnspentManaStatic,
+}
+
+/// A life loss an empty-pool event still owes, carried across a replacement
+/// deferral.
+///
+/// CR 616.1 life-loss replacement can pause mid-event, and the player was
+/// already popped from the APNAP queue by then — so without this the rest of
+/// that player's operation would be silently skipped when the transition
+/// resumes, and the next player would be processed instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingEmptyPoolLifeLoss {
+    pub player_id: PlayerId,
+    pub amount: u32,
+    pub cause: EmptyPoolLifeLossCause,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhaseTransitionProgress {
     pub remaining_players: VecDeque<PlayerId>,
     pub next_phase: Phase,
-    pub in_combat: bool,
+    /// Life losses this transition still owes, in the order they must apply.
+    /// Non-empty only between a deferral and its resume; the drain discharges
+    /// it before advancing to the next player.
+    #[serde(default)]
+    pub owed_life_loss: VecDeque<PendingEmptyPoolLifeLoss>,
+    /// The empty-pool life loss currently IN FLIGHT through a CR 616.1 ordering
+    /// choice, kept only to name its cause when it lands.
+    ///
+    /// Distinct from `owed_life_loss`, which holds losses not yet ATTEMPTED:
+    /// this one has entered the pipeline and will complete elsewhere
+    /// (`apply_life_loss_after_replacement`), so re-queuing it would double it.
+    /// Without this the loss still resolves correctly, but nothing records WHY
+    /// — a deferred mana burn would silently lose its `ManaBurn` event and the
+    /// player would see life vanish with no stated reason.
+    ///
+    /// Set ONLY for `ReplacementDeferred::ReplacementChoice`, where the amount
+    /// is still unknown. A `SubstitutionContinuation` deferral has already
+    /// applied the root loss and carries the figure back to the drain, which
+    /// narrates it on the spot — parking that case would strand the record,
+    /// since the resume that finishes a substitute is not the one that applied
+    /// the root.
+    ///
+    /// Every terminal outcome of that choice must consume this, `Prevented`
+    /// included; see `turns::note_empty_pool_life_loss_resolved`.
+    #[serde(default)]
+    pub in_flight_life_loss: Option<PendingEmptyPoolLifeLoss>,
+    /// The phase the turn is leaving, paired with `next_phase` to identify the
+    /// boundary being crossed. Replaces a derived `in_combat: bool`, which
+    /// carried strictly less information than the phase it was computed from
+    /// and could contradict `next_phase` if either were ever set separately —
+    /// CR 500.1's phase-group crossing cannot be recovered from the
+    /// destination alone.
+    ///
+    /// `#[serde(default)]` `None` for a `GameState` saved before this field
+    /// existed; see `ManaPool::clear_expired_retention_markers` for why that
+    /// resolves conservatively rather than guessing a crossing.
+    #[serde(default)]
+    pub previous_phase: Option<Phase>,
     pub entering_cleanup: bool,
     #[serde(default)]
     pub drain_state: PhaseTransitionDrainState,
+}
+
+#[cfg(test)]
+mod trigger_source_read_level_tests {
+    use super::*;
+    use crate::game::game_object::GameObject;
+
+    fn class_object(class_level: Option<u8>) -> GameObject {
+        let mut object = GameObject::new(
+            ObjectId(1),
+            CardId(1),
+            PlayerId(0),
+            "Stormchaser's Talent".to_string(),
+            Zone::Battlefield,
+        );
+        object.class_level = class_level;
+        object
+    }
+
+    fn latched(object: &GameObject) -> TriggerSourceContext {
+        object
+            .snapshot_for_zone_change(object.id, Some(Zone::Battlefield), object.zone)
+            .trigger_source_context
+            .expect("snapshot always carries trigger context")
+    }
+
+    /// CR 716.2d: a source with no stored level reads as level 1, on BOTH
+    /// `TriggerSourceRead` arms. No printed card reaches this through a trigger —
+    /// zero cards say "becomes level 1", and `oracle_class.rs` only wraps a
+    /// trigger in `ClassLevelGE` when `section.level > 1` — so the guarantee is
+    /// asserted directly here rather than through a card scenario the parser
+    /// cannot emit. Without it, a `None` level fails every `== N` / `>= N` gate,
+    /// which is the shape of issue #8773.
+    #[test]
+    fn absent_stored_level_reads_as_one_on_both_arms() {
+        let object = class_object(None);
+        let context = latched(&object);
+
+        assert_eq!(TriggerSourceRead::ExactLive(&object).level(), 1);
+        assert_eq!(TriggerSourceRead::Latched(&context).level(), 1);
+    }
+
+    /// A stored level is reported verbatim, so normalization cannot mask a real
+    /// level, and the two arms agree.
+    #[test]
+    fn stored_level_is_reported_verbatim_on_both_arms() {
+        let object = class_object(Some(3));
+        let context = latched(&object);
+
+        assert_eq!(TriggerSourceRead::ExactLive(&object).level(), 3);
+        assert_eq!(TriggerSourceRead::Latched(&context).level(), 3);
+    }
 }
 
 #[cfg(test)]
@@ -20967,7 +21489,9 @@ mod phase_transition_progress_serde_tests {
         let progress = PhaseTransitionProgress {
             remaining_players: VecDeque::from([PlayerId(1)]),
             next_phase: Phase::Upkeep,
-            in_combat: false,
+            previous_phase: Some(Phase::Untap),
+            owed_life_loss: VecDeque::new(),
+            in_flight_life_loss: None,
             entering_cleanup: false,
             drain_state: PhaseTransitionDrainState::AwaitingPostReplacementContinuation,
         };
@@ -23874,6 +24398,7 @@ impl GameState {
             waiting_for: WaitingFor::Priority {
                 player: starting_player,
             },
+            game_end: None,
             next_resolve_all_consent_epoch: initial_resolve_all_consent_epoch(),
             viewer_projection: None,
             resolve_all_consent_run: None,
@@ -23934,6 +24459,7 @@ impl GameState {
             chain_tracked_set_id: None,
             resolving_modal_instruction: None,
             tracked_set_member_causes: HashMap::new(),
+            tracked_set_participants: HashMap::new(),
             commander_cast_count: HashMap::new(),
             commander_cast_owners: HashMap::new(),
             extra_turns: Vec::new(),
@@ -24067,6 +24593,7 @@ impl GameState {
             meld_pair_registry: Arc::new(HashMap::new()),
             card_db: None,
             booster_shelf: Arc::new(BoosterShelf::default()),
+            booster_pack_pool: None,
             log_player_names: Vec::new(),
             last_created_token_ids: Vec::new(),
             last_revealed_ids: Vec::new(),
@@ -24074,6 +24601,7 @@ impl GameState {
             private_look_ids: Vec::new(),
             private_look_player: None,
             last_zone_changed_ids: Vec::new(),
+            exile_rider_countered_ids: Vec::new(),
             last_vote_ballots: im::Vector::new(),
             player_actions_this_way: HashSet::new(),
             last_effect_amount: None,
@@ -25260,10 +25788,32 @@ impl GameState {
         if self.loop_detect_ring.len() == LOOP_DETECT_RING_CAP {
             self.loop_detect_ring.pop_front();
         }
-        let snapshot = std::sync::Arc::new(LoopDetectSample {
-            normalized: self.normalize_for_loop(),
-            live: self.loop_detect_live_sample(),
-        });
+        // The two clones are metered at THIS call site rather than at either clone
+        // function's entry: `normalize_for_loop` carries production callers outside this
+        // detector (the CR 104.4b mandatory-draw fingerprint among them), which are not part
+        // of the detector's budget.
+        let normalized = {
+            let _timed = crate::analysis::resource::CostTimer::start(|cost| {
+                (
+                    &mut cost.sample_normalize_ns,
+                    &mut cost.sample_normalize_calls,
+                )
+            });
+            crate::analysis::resource::bump_loop_detect_cost(|cost| {
+                cost.sampler_normalized_clones += 1;
+            });
+            self.normalize_for_loop()
+        };
+        let live = {
+            let _timed = crate::analysis::resource::CostTimer::start(|cost| {
+                (&mut cost.sample_live_ns, &mut cost.sample_live_calls)
+            });
+            crate::analysis::resource::bump_loop_detect_cost(|cost| {
+                cost.sampler_live_clones += 1;
+            });
+            self.loop_detect_live_sample()
+        };
+        let snapshot = std::sync::Arc::new(LoopDetectSample { normalized, live });
         self.loop_detect_ring.push_back(snapshot);
     }
 
@@ -25567,8 +26117,11 @@ impl GameState {
     ///    every free choice BEFORE the offer, and `DecisionTemplate`'s schedules are pure functions
     ///    of (iteration index, live legal set) — never of a prior iteration's outcome, which makes
     ///    a react-to-what-happened choice unrepresentable rather than merely unused. With the
-    ///    coin/die/random rejection at the offer gate and `elimination_bounds` stopping short of
-    ///    every CR 704 threshold, predictability holds BY CONSTRUCTION.
+    ///    coin/die/random rejection at the offer gate and `elimination_bounds` admitting no
+    ///    CR 704 threshold crossing except as the sequence's FINAL iteration — where no declared
+    ///    choice remains to be made unmakeable — predictability holds BY CONSTRUCTION. The
+    ///    primary statement of that property is `elimination_bounds`' own doc; this is a
+    ///    restatement of it.
     /// 3. THE COUNT — CR 732.2a lets a proposal be "a loop that repeats a specified number of
     ///    times", and the proposer is who specifies it. The collapse prompt (`game::turns`) is that
     ///    specification, bounded above by what the table accepted; `SubmitPayAmount` rejects any
@@ -25586,8 +26139,8 @@ impl GameState {
     /// **ELISION ≡ PERFORMANCE. The engine can never advance to a state that performing the
     /// proposal's choices would not produce.** CR 732.2c defines the advance as reaching the ending
     /// point "with all game choices contained in the shortcut proposal having been taken", so the
-    /// end state must be the state those choices produce. There are exactly three materialization
-    /// routes and each preserves that identity:
+    /// end state must be the state those choices produce. Every materialization route the
+    /// confirmed-shortcut dispatch can take preserves that identity:
     ///
     /// (a) UNOBSERVED → batch. `batch(N) ≡ perform-each(N)` by the growth-observed firewall's own
     ///     precondition: the batch route is entered only when no observer can make the lump apply
@@ -25596,6 +26149,18 @@ impl GameState {
     ///     observers fire exactly as they would in manual play.
     /// (c) BECAME OBSERVED IN-WINDOW → `engine_resolution_choices::boundary_declines` → manual
     ///     play, where the player performs the actions.
+    /// (d) DRAIN PATH → the bounded-cycle certificate producer
+    ///     (`game::engine::try_offer_bounded_cycle_shortcut`) and the interactive loop bridge
+    ///     (`game::engine::interactive_loop_bridge`) both materialize through
+    ///     `materialize_fixed_shortcut` / `apply_until_lethal_shortcut`, which LITERALLY PERFORM
+    ///     the iterations beat by beat through `pass_priority_once_with_pipeline`. Identity holds
+    ///     the way it holds on route (b), and for the same reason: nothing is elided that
+    ///     performance would not produce.
+    /// (e) SHORTENED, OR A COUNT OF ZERO → the captured period is PERFORMED the named number of
+    ///     times, through the same driver route (b) names. Route (a)'s licence is that the table
+    ///     accepted an unbounded advance; a responder who named a place (CR 732.2b) accepted no
+    ///     such thing, and a sequence performed zero times reaches its ending point having done
+    ///     nothing, so neither may take the elision. Identity again holds by performance.
     ///
     /// Route (c) is the one the review indicted, and it is the route that ENFORCES CR 732.2c rather
     /// than departing from it. Once an observer appears, the other two options both break the
@@ -25988,6 +26553,16 @@ fn _gamestate_partition_is_total(s: &GameState) {
         rng: _,
         combat: _,
         waiting_for: _,
+        // `game_end` (CR 104.1 terminal record): EXCLUDED from `impl PartialEq for
+        // GameState`, and that is the SAFE direction. It is written once, when the game
+        // ends, and never cleared or grown, so it cannot be a per-cycle accumulator; and the
+        // write is followed, at the same action boundary, by a `reconcile_terminal_result`
+        // that leaves the game on `GameOver` (or past it, in the match flow), so
+        // no CR 732 loop verdict is reached from a state that carries it. After the action
+        // boundary it is redundant with the COMPARED `waiting_for` (`GameOver { winner }`)
+        // and `match_phase`. Comparing it would make a finished game unequal to its own
+        // serde round trip, since it is `#[serde(skip)]`.
+        game_end: _,
         next_resolve_all_consent_epoch: _,
         // `viewer_projection`: COMPARED (fail-safe). It is `None` on every authoritative
         // state, so every loop-detection sample compares `None == None` and COMPARING it
@@ -26063,6 +26638,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         // resolution — the same reason that field is projected out here.
         resolving_modal_instruction: _,
         tracked_set_member_causes: _,
+        tracked_set_participants: _,
         commander_cast_count: _,
         commander_cast_owners: _,
         commander_declined_zone_return: _,
@@ -26198,6 +26774,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         meld_pair_registry: _,
         card_db: _,
         booster_shelf: _,
+        booster_pack_pool: _,
         log_player_names: _,
         last_created_token_ids: _,
         last_revealed_ids: _,
@@ -26205,6 +26782,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         private_look_ids: _,
         private_look_player: _,
         last_zone_changed_ids: _,
+        exile_rider_countered_ids: _,
         last_vote_ballots: _,
         player_actions_this_way: _,
         last_effect_amount: _,
@@ -26407,6 +26985,7 @@ impl PartialEq for GameState {
             && self.chain_tracked_set_id == other.chain_tracked_set_id
             && self.resolving_modal_instruction == other.resolving_modal_instruction
             && self.tracked_set_member_causes == other.tracked_set_member_causes
+            && self.tracked_set_participants == other.tracked_set_participants
             && self.commander_cast_count == other.commander_cast_count
             && self.commander_cast_owners == other.commander_cast_owners
             && self.commander_declined_zone_return == other.commander_declined_zone_return
@@ -26441,6 +27020,7 @@ impl PartialEq for GameState {
             && self.current_starting_player == other.current_starting_player
             && self.next_game_chooser == other.next_game_chooser
             && self.deck_pools == other.deck_pools
+            && self.booster_pack_pool == other.booster_pack_pool
             && self.outside_game_cards_brought_in == other.outside_game_cards_brought_in
             && self.sideboard_submitted == other.sideboard_submitted
             && self.triggers_fired_this_turn == other.triggers_fired_this_turn
@@ -26550,6 +27130,7 @@ impl PartialEq for GameState {
             && self.private_look_ids == other.private_look_ids
             && self.private_look_player == other.private_look_player
             && self.last_zone_changed_ids == other.last_zone_changed_ids
+            && self.exile_rider_countered_ids == other.exile_rider_countered_ids
             && self.last_vote_ballots == other.last_vote_ballots
             && self.player_actions_this_way == other.player_actions_this_way
             && self.last_effect_count == other.last_effect_count
@@ -27145,6 +27726,7 @@ mod forced_cascade_window_tests {
                         win_kind: crate::analysis::loop_check::WinKind::LethalDamage,
                         template: None,
                         per_cycle: None,
+                        shortened_by: None,
                     },
                 },
             ),
@@ -27730,6 +28312,486 @@ mod tests {
     };
     use crate::types::resolved_commands::ResolvedDelayedTriggerCommand;
     use crate::types::triggers::TriggerMode;
+
+    fn state_with_recorded_exploit() -> (GameState, GameEvent) {
+        let mut state = GameState::new_two_player(42);
+        let exploiter = create_object(
+            &mut state,
+            CardId(70),
+            PlayerId(0),
+            "Exploit source".to_string(),
+            Zone::Battlefield,
+        );
+        let victim = create_object(
+            &mut state,
+            CardId(71),
+            PlayerId(1),
+            "Exploit victim".to_string(),
+            Zone::Battlefield,
+        );
+        let victim_object = state.objects.get_mut(&victim).expect("victim exists");
+        victim_object.controller = PlayerId(0);
+        victim_object.card_types.core_types.push(CoreType::Creature);
+        victim_object.base_card_types = victim_object.card_types.clone();
+        victim_object.is_token = true;
+
+        let mut departure_events = Vec::new();
+        crate::game::zones::move_to_zone(
+            &mut state,
+            victim,
+            Zone::Graveyard,
+            &mut departure_events,
+        );
+        let record = departure_events
+            .iter()
+            .find_map(|event| match event {
+                GameEvent::ZoneChanged {
+                    object_id, record, ..
+                } if *object_id == victim => Some(record.clone()),
+                _ => None,
+            })
+            .expect("the fixture emits an authoritative departure record");
+        let exploit = GameEvent::CreatureExploited {
+            exploiter,
+            sacrificed: victim,
+            record,
+        };
+        state.deferred_entry_events = vec![exploit.clone()];
+        (state, exploit)
+    }
+
+    #[test]
+    fn recorded_exploit_round_trips_through_current_and_persisted_ingresses() {
+        let (state, expected) = state_with_recorded_exploit();
+
+        let direct: GameState =
+            serde_json::from_value(serde_json::to_value(&state).expect("current state serializes"))
+                .expect("current state with complete exploit evidence decodes");
+        assert_eq!(direct.deferred_entry_events, vec![expected.clone()]);
+
+        for persisted in [
+            PersistedGameState::Raw(Box::new(state.clone())),
+            PersistedGameState::capture(state),
+        ] {
+            let restored = serde_json::from_value::<PersistedGameState>(
+                serde_json::to_value(persisted).expect("persisted state serializes"),
+            )
+            .expect("persisted state with complete exploit evidence decodes")
+            .into_game_state_unchecked();
+            assert_eq!(restored.deferred_entry_events, vec![expected.clone()]);
+        }
+    }
+
+    #[test]
+    fn exploit_evidence_guard_rejects_obsolete_and_untrustworthy_snapshots() {
+        let (state, _) = state_with_recorded_exploit();
+        let current_wire =
+            serde_json::to_value(ResolutionStateWire::from_game_state(state.clone()))
+                .expect("versioned fixture serializes");
+        let base = serde_json::to_value(state).expect("fixture serializes");
+        let event_path = "$.deferred_entry_events[0].data";
+
+        let mut cases = Vec::new();
+        let mut missing_record = base.clone();
+        missing_record["deferred_entry_events"][0]["data"]
+            .as_object_mut()
+            .expect("event data is an object")
+            .remove("record");
+        cases.push((missing_record, "record is missing"));
+
+        let mut null_record = base.clone();
+        null_record["deferred_entry_events"][0]["data"]["record"] = serde_json::Value::Null;
+        cases.push((null_record, "record must be an object"));
+
+        let mut scalar_record = base.clone();
+        scalar_record["deferred_entry_events"][0]["data"]["record"] =
+            serde_json::Value::from("not a record");
+        cases.push((scalar_record, "record must be an object"));
+
+        let mut missing_token = base.clone();
+        missing_token["deferred_entry_events"][0]["data"]["record"]
+            .as_object_mut()
+            .expect("record is an object")
+            .remove("is_token");
+        cases.push((missing_token, "record.is_token is missing"));
+
+        let mut invalid_token = base.clone();
+        invalid_token["deferred_entry_events"][0]["data"]["record"]["is_token"] =
+            serde_json::Value::from("true");
+        cases.push((invalid_token, "record.is_token must be a boolean"));
+
+        let mut mismatched_id = base.clone();
+        mismatched_id["deferred_entry_events"][0]["data"]["record"]["object_id"] =
+            serde_json::Value::from(99_999_u64);
+        cases.push((
+            mismatched_id,
+            "record.object_id disagrees with event.sacrificed",
+        ));
+
+        for (value, reason) in cases {
+            let error = serde_json::from_value::<GameState>(value)
+                .expect_err("invalid exploit evidence must refuse the containing state")
+                .to_string();
+            assert!(
+                error.contains(LEGACY_EXPLOIT_EVENT_EVIDENCE_ERROR),
+                "{error}"
+            );
+            assert!(error.contains(event_path), "{error}");
+            assert!(error.contains(reason), "{error}");
+        }
+
+        let mut partial_record = base.clone();
+        partial_record["deferred_entry_events"][0]["data"]["record"]
+            .as_object_mut()
+            .expect("record is an object")
+            .remove("name");
+        let error = serde_json::from_value::<GameState>(partial_record)
+            .expect_err("ordinary incomplete record shape remains a serde schema error")
+            .to_string();
+        assert!(error.contains("missing field `name`"), "{error}");
+        assert!(
+            !error.contains(LEGACY_EXPLOIT_EVENT_EVIDENCE_ERROR),
+            "ordinary record schema errors must not be mislabeled as legacy exploit evidence: {error}"
+        );
+
+        let historical = serde_json::json!({
+            "journal": [{
+                "CreatureExploited": {
+                    "exploiter": 1,
+                    "sacrificed": 2
+                }
+            }]
+        });
+        let error = reject_legacy_exploit_event_evidence(&historical)
+            .expect_err("historical externally tagged evidence is diagnostic-only");
+        assert!(error.contains(LEGACY_EXPLOIT_EVENT_EVIDENCE_ERROR));
+        assert!(error.contains("$.journal[0].CreatureExploited"));
+
+        let benign = serde_json::json!({ "description": "CreatureExploited" });
+        reject_legacy_exploit_event_evidence(&benign)
+            .expect("a string mentioning the event is not an event envelope");
+
+        for version in [1_u64, 2_u64] {
+            let mut historical_wire = current_wire.clone();
+            historical_wire["resolution_state_version"] = serde_json::Value::from(version);
+            if version == 1 {
+                historical_wire
+                    .as_object_mut()
+                    .expect("wire is an object")
+                    .remove("resolution_frames");
+            }
+            historical_wire["deferred_entry_events"][0]["data"]
+                .as_object_mut()
+                .expect("event data is an object")
+                .remove("record");
+            let error = serde_json::from_value::<ResolutionStateWire>(historical_wire)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains(LEGACY_EXPLOIT_EVENT_EVIDENCE_ERROR),
+                "declared v{version}: {error}"
+            );
+        }
+    }
+
+    fn legacy_exploited_definition(marker: &str, actor_id: u64) -> serde_json::Value {
+        let mut definition = TriggerDefinition::new(TriggerMode::Exploited);
+        definition.description = Some(marker.to_string());
+        let mut value = serde_json::to_value(definition)
+            .expect("typed exploited trigger definition serializes");
+        value["valid_card"] = serde_json::to_value(TargetFilter::SpecificObject {
+            id: ObjectId(actor_id),
+        })
+        .expect("actor filter serializes");
+        value["valid_source"] = serde_json::Value::Null;
+        value
+    }
+
+    fn assert_migrated_exploited_definition(
+        tree: &serde_json::Value,
+        pointer: &str,
+        marker: &str,
+        actor_id: u64,
+    ) {
+        let definition = tree
+            .pointer(pointer)
+            .unwrap_or_else(|| panic!("fixture contains {pointer}"));
+        assert_eq!(definition["description"], marker);
+        assert_eq!(definition["valid_source"]["type"], "SpecificObject");
+        assert_eq!(definition["valid_source"]["id"], actor_id);
+        assert!(definition["valid_card"].is_null());
+    }
+
+    #[test]
+    fn legacy_exploited_role_migration_visits_every_persisted_definition_carrier() {
+        let mut decoy = legacy_exploited_definition("decoy", 99);
+        decoy
+            .as_object_mut()
+            .expect("definition is an object")
+            .remove("execute");
+        let expected_decoy = decoy.clone();
+
+        let mut tree = serde_json::json!({
+            "objects": {
+                "1": {
+                    "trigger_definitions": [{ "definition": legacy_exploited_definition("live", 1) }],
+                    "base_trigger_definitions": [legacy_exploited_definition("base", 2)]
+                }
+            },
+            "zone_change_record": {
+                "trigger_definitions": [{ "definition": legacy_exploited_definition("record", 3) }],
+                "trigger_source_context": {
+                    "trigger_entries": [{ "definition": legacy_exploited_definition("context", 4) }]
+                }
+            },
+            "logical_zone_change_group": {
+                "immediately_before_batched_triggers": [{ "definition": legacy_exploited_definition("latch-before", 5) }],
+                "immediately_after_batched_triggers": [{ "definition": legacy_exploited_definition("latch-after", 6) }]
+            },
+            "delayed_triggers": [
+                {
+                    "condition": {
+                        "type": "WheneverEvent",
+                        "trigger": legacy_exploited_definition("whenever", 7)
+                    }
+                },
+                {
+                    "condition": {
+                        "type": "WhenNextEvent",
+                        "trigger": legacy_exploited_definition("when-next", 8),
+                        "or_trigger": legacy_exploited_definition("when-next-or", 9)
+                    }
+                }
+            ],
+            "nested_effects": [
+                {
+                    "type": "CreateDelayedTrigger",
+                    "condition": {
+                        "type": "WheneverEvent",
+                        "trigger": legacy_exploited_definition("created-delayed", 10)
+                    }
+                },
+                {
+                    "type": "CreateEmblem",
+                    "triggers": [legacy_exploited_definition("emblem", 11)]
+                }
+            ],
+            "preexisting_source": {
+                "definition": legacy_exploited_definition("preexisting-source", 13)
+            },
+            "decoy": decoy
+        });
+        tree["preexisting_source"]["definition"]["valid_source"] =
+            serde_json::to_value(TargetFilter::SpecificObject { id: ObjectId(12) })
+                .expect("preexisting actor filter serializes");
+
+        migrate_legacy_exploited_trigger_roles(&mut tree);
+
+        for (pointer, marker, actor_id) in [
+            ("/objects/1/trigger_definitions/0/definition", "live", 1),
+            ("/objects/1/base_trigger_definitions/0", "base", 2),
+            (
+                "/zone_change_record/trigger_definitions/0/definition",
+                "record",
+                3,
+            ),
+            (
+                "/zone_change_record/trigger_source_context/trigger_entries/0/definition",
+                "context",
+                4,
+            ),
+            (
+                "/logical_zone_change_group/immediately_before_batched_triggers/0/definition",
+                "latch-before",
+                5,
+            ),
+            (
+                "/logical_zone_change_group/immediately_after_batched_triggers/0/definition",
+                "latch-after",
+                6,
+            ),
+            ("/delayed_triggers/0/condition/trigger", "whenever", 7),
+            ("/delayed_triggers/1/condition/trigger", "when-next", 8),
+            (
+                "/delayed_triggers/1/condition/or_trigger",
+                "when-next-or",
+                9,
+            ),
+            ("/nested_effects/0/condition/trigger", "created-delayed", 10),
+            ("/nested_effects/1/triggers/0", "emblem", 11),
+        ] {
+            assert_migrated_exploited_definition(&tree, pointer, marker, actor_id);
+        }
+        assert_migrated_exploited_definition(
+            &tree,
+            "/preexisting_source/definition",
+            "preexisting-source",
+            12,
+        );
+        assert_eq!(tree["decoy"], expected_decoy);
+    }
+
+    fn state_with_exploited_trigger_roles(
+        mut state: GameState,
+        actor: TargetFilter,
+        victim: Option<TargetFilter>,
+    ) -> (GameState, ObjectId) {
+        let object_id = ObjectId(9_170);
+        let mut definition = TriggerDefinition::new(TriggerMode::Exploited);
+        definition.valid_source = Some(actor);
+        definition.valid_card = victim;
+        let mut object = GameObject::new(
+            object_id,
+            CardId(9_170),
+            PlayerId(0),
+            "Exploit observer".to_string(),
+            Zone::Battlefield,
+        );
+        object.push_printed_trigger(definition);
+        state.objects.insert(object_id, object);
+        (state, object_id)
+    }
+
+    fn downgrade_exploited_roles(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    downgrade_exploited_roles(value);
+                }
+            }
+            serde_json::Value::Object(object) => {
+                if is_serialized_exploited_trigger_definition(object) {
+                    let actor = object
+                        .get("valid_source")
+                        .cloned()
+                        .expect("complete trigger definition has valid_source");
+                    object.insert("valid_card".to_string(), actor);
+                    object.insert("valid_source".to_string(), serde_json::Value::Null);
+                }
+                for value in object.values_mut() {
+                    downgrade_exploited_roles(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn assert_restored_exploit_roles(
+        restored: &GameState,
+        object_id: ObjectId,
+        actor: &TargetFilter,
+        victim: Option<&TargetFilter>,
+    ) {
+        let definition = &restored.objects[&object_id].trigger_definitions[0].definition;
+        assert_eq!(definition.valid_source.as_ref(), Some(actor));
+        assert_eq!(definition.valid_card.as_ref(), victim);
+    }
+
+    #[test]
+    fn declared_resolution_wires_migrate_only_legacy_exploited_roles() {
+        let actor = TargetFilter::SpecificObject {
+            id: ObjectId(9_171),
+        };
+        let victim = TargetFilter::SpecificObject {
+            id: ObjectId(9_172),
+        };
+        let (state, object_id) = state_with_exploited_trigger_roles(
+            GameState::new_two_player(42),
+            actor.clone(),
+            Some(victim.clone()),
+        );
+        let current = serde_json::to_value(ResolutionStateWire::from_game_state(state))
+            .expect("current resolution wire serializes");
+
+        assert_eq!(
+            current["resolution_state_version"],
+            serde_json::Value::from(RESOLUTION_STATE_WIRE_VERSION)
+        );
+        let restored_current = serde_json::from_value::<ResolutionStateWire>(current.clone())
+            .expect("declared v3 payload restores")
+            .into_game_state();
+        assert_restored_exploit_roles(&restored_current, object_id, &actor, Some(&victim));
+
+        for version in [1_u64, 2_u64] {
+            let mut legacy = current.clone();
+            legacy["resolution_state_version"] = serde_json::Value::from(version);
+            if version == 1 {
+                legacy
+                    .as_object_mut()
+                    .expect("wire is an object")
+                    .remove("resolution_frames");
+            }
+            downgrade_exploited_roles(&mut legacy);
+            let restored = serde_json::from_value::<ResolutionStateWire>(legacy)
+                .unwrap_or_else(|error| panic!("declared v{version} payload restores: {error}"))
+                .into_game_state();
+            assert_restored_exploit_roles(&restored, object_id, &actor, None);
+        }
+    }
+
+    #[test]
+    fn unversioned_ambiguous_exploited_roles_fail_closed_before_carrier_inference() {
+        let actor = TargetFilter::SpecificObject {
+            id: ObjectId(9_173),
+        };
+        let victim = TargetFilter::SpecificObject {
+            id: ObjectId(9_174),
+        };
+        let (state, _) =
+            state_with_exploited_trigger_roles(GameState::new_two_player(42), actor, Some(victim));
+        let bare_current = serde_json::to_value(state).expect("bare state serializes");
+        assert!(bare_current.get("resolution_state_version").is_none());
+        assert!(bare_current.get("resolution_stack").is_none());
+        assert!(contains_ambiguous_serialized_exploited_trigger_definition(
+            &bare_current
+        ));
+
+        let error = serde_json::from_value::<PersistedGameState>(bare_current.clone())
+            .expect_err("unversioned v3 role layout is ambiguous")
+            .to_string();
+        assert!(error.contains(
+            "unversioned raw resolution state contains an Exploited trigger with ambiguous role layout"
+        ));
+
+        let mut old_layout = bare_current;
+        downgrade_exploited_roles(&mut old_layout);
+        assert!(contains_ambiguous_serialized_exploited_trigger_definition(
+            &old_layout
+        ));
+        let error = serde_json::from_value::<PersistedGameState>(old_layout)
+            .expect_err("unversioned legacy role layout is equally ambiguous")
+            .to_string();
+        assert!(error.contains(
+            "unversioned raw resolution state contains an Exploited trigger with ambiguous role layout"
+        ));
+    }
+
+    #[test]
+    fn unversioned_safe_exploited_roles_restore_with_or_without_a_live_stack() {
+        let actor = TargetFilter::SpecificObject {
+            id: ObjectId(9_175),
+        };
+        for (label, state) in [
+            ("empty stack", GameState::new_two_player(42)),
+            ("live stack", parked_spell_resolution_fixture()),
+        ] {
+            let (state, object_id) = state_with_exploited_trigger_roles(state, actor.clone(), None);
+            let bare = serde_json::to_value(state).expect("bare state serializes");
+            assert!(bare.get("resolution_state_version").is_none(), "{label}");
+            assert_eq!(
+                bare.get("resolution_stack").is_some(),
+                label == "live stack"
+            );
+            assert!(
+                !contains_ambiguous_serialized_exploited_trigger_definition(&bare),
+                "{label}"
+            );
+            let restored = serde_json::from_value::<PersistedGameState>(bare)
+                .unwrap_or_else(|error| panic!("{label} safe role layout restores: {error}"))
+                .into_game_state_unchecked();
+            assert_restored_exploit_roles(&restored, object_id, &actor, None);
+        }
+    }
 
     #[test]
     fn persisted_legacy_tap_effects_migrate_only_effect_payloads() {
@@ -29889,7 +30951,7 @@ mod tests {
         // `GameState`'s derived `Serialize` — the unversioned raw writer whose
         // shape `declare_raw_resolution_wire` infers from. NOT
         // `to_value(PersistedGameState::Raw(..))`, which routes through
-        // `ResolutionStateWire::to_value` and emits a DECLARED v2 wire that would
+        // `ResolutionStateWire::to_value` and emits a DECLARED current wire that would
         // take the inference's early return and make this test vacuous.
         let wire = serde_json::to_value(&state).expect("the bare GameState serializes");
         assert!(
@@ -29903,7 +30965,7 @@ mod tests {
         );
         assert!(
             wire.get("resolution_frames").is_none(),
-            "the raw writer must not emit the v2 frame carrier"
+            "the raw writer must not emit the typed-frame carrier"
         );
 
         let restored = serde_json::from_value::<PersistedGameState>(wire)
@@ -29950,9 +31012,10 @@ mod tests {
     }
 
     /// V6 + V7. The unlabeled-carrier allowance is **not** widened to the raw
-    /// ingress by the inference. A raw payload that now classifies as v2 and
-    /// carries a triggered `resolving_stack_entry` with no firing carrier is
-    /// refused, at BOTH a Priority rest and a non-Priority prompt rest.
+    /// ingress by the inference. A raw payload that now classifies as the
+    /// current wire and carries a triggered `resolving_stack_entry` with no
+    /// firing carrier is refused, at BOTH a Priority rest and a non-Priority
+    /// prompt rest.
     ///
     /// What this prevents: `migrate_legacy_trigger_firing_carriers` fabricates
     /// `TriggerFiring::LegacyDelayed` for an unlabeled triggered carrier when
@@ -29964,7 +31027,7 @@ mod tests {
     /// for an ordinary trigger is a rules error, so the inference must leave the
     /// allowance exactly where it was.
     #[test]
-    fn raw_inferred_v2_refuses_an_unlabeled_triggered_carrier() {
+    fn raw_inferred_current_wire_refuses_an_unlabeled_triggered_carrier() {
         let priority_rest = parked_frame_on_triggered_carrier_fixture();
 
         // The non-Priority sibling. `SpellResolution` is an `AfterChild` frame,
@@ -29986,7 +31049,7 @@ mod tests {
             let labeled = serde_json::to_value(&state).expect("the bare GameState serializes");
             assert!(
                 labeled.get("resolution_stack").is_some(),
-                "{label}: the fixture must reach the inferred-v2 classification"
+                "{label}: the fixture must reach the inferred-current-wire classification"
             );
 
             // Paired positive reach-guard, asserted FIRST: the identical payload
@@ -30045,7 +31108,14 @@ mod tests {
                 1_u64,
                 "v1 resolution state must not contain resolution_stack",
             ),
-            (2_u64, "v2 resolution state is missing resolution_frames"),
+            (
+                2_u64,
+                "typed-frame resolution state is missing resolution_frames",
+            ),
+            (
+                RESOLUTION_STATE_WIRE_VERSION,
+                "typed-frame resolution state is missing resolution_frames",
+            ),
         ] {
             let declared = declare(version);
             let raw_error = serde_json::from_value::<PersistedGameState>(declared.clone())
@@ -30240,7 +31310,7 @@ mod tests {
     /// that fixture sets a triggered `resolving_stack_entry` AND a live firing,
     /// so extending it yields the coherent shape, which the client wire already
     /// refuses without any of this — see
-    /// `raw_inferred_v2_refuses_an_unlabeled_triggered_carrier`.
+    /// `raw_inferred_current_wire_refuses_an_unlabeled_triggered_carrier`.
     fn parked_continuation_fixture(stashed: Option<TriggerFiring>) -> GameState {
         let mut state = GameState::new_two_player(42);
         let source = create_object(
@@ -30861,7 +31931,7 @@ mod tests {
     }
 
     #[test]
-    fn v2_continuation_zone_change_event_reconciles_in_serialized_frame() {
+    fn current_continuation_zone_change_event_reconciles_in_serialized_frame() {
         let mut state = trigger_continuation_fixture();
         state.turn_number = 19;
         let record = persisted_zone_change_record(ObjectId(9_172), state.turn_number, 0);
@@ -30882,14 +31952,14 @@ mod tests {
         state.park_ability_continuation(continuation);
 
         let mut persisted = serde_json::to_value(PersistedGameState::Raw(Box::new(state)))
-            .expect("v2 frame fixture serializes");
+            .expect("current frame fixture serializes");
         erase_persisted_event_occurrence_fields(persisted_state_payload_mut(&mut persisted));
         let restored = serde_json::from_value::<PersistedGameState>(persisted)
-            .expect("v2 frame event reconciles before materialization")
+            .expect("current frame event reconciles before materialization")
             .into_game_state_unchecked();
         let GameEvent::ZoneChanged { record, .. } = &restored
             .active_ability_continuation()
-            .expect("v2 frame restores as an active continuation")
+            .expect("current frame restores as an active continuation")
             .trigger_context
             .as_ref()
             .expect("continuation retains its trigger context")
@@ -30902,7 +31972,7 @@ mod tests {
         assert_eq!(
             (record.recorded_turn_number, record.turn_zone_change_index),
             (19, 0),
-            "serialized v2 frame event is reconciled to its current ledger occurrence"
+            "serialized current frame event is reconciled to its ledger occurrence"
         );
     }
 
@@ -30910,7 +31980,7 @@ mod tests {
     fn direct_resolution_wire_rejects_unlabeled_active_trigger_carriers() {
         let state = normal_trigger_firing_fixture();
         let wire = serde_json::to_value(ResolutionStateWire::from_game_state(state))
-            .expect("coherent trigger fixture serializes as v2 wire");
+            .expect("coherent trigger fixture serializes through the current wire");
 
         let mut missing_pending = wire.clone();
         missing_pending
@@ -30956,7 +32026,7 @@ mod tests {
         continuation_state.park_ability_continuation(continuation);
         let continuation_wire =
             serde_json::to_value(ResolutionStateWire::from_game_state(continuation_state))
-                .expect("continuation fixture serializes as v2 wire");
+                .expect("continuation fixture serializes through the current wire");
         let continuation_error = serde_json::from_value::<ResolutionStateWire>(continuation_wire)
             .expect_err("direct wire must reject an unlabeled active continuation");
         assert!(
@@ -31243,7 +32313,8 @@ mod tests {
     fn direct_v2_resolution_wire_rejects_orphaned_trigger_continuation() {
         let state = trigger_continuation_fixture();
         let mut wire = serde_json::to_value(ResolutionStateWire::from_game_state(state))
-            .expect("v2 fixture serializes");
+            .expect("current fixture serializes before v2 downgrade");
+        wire["resolution_state_version"] = serde_json::Value::from(2_u64);
         remove_resolving_trigger_carrier(&mut wire);
 
         let error = serde_json::from_value::<ResolutionStateWire>(wire)
@@ -31278,7 +32349,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_v2_resolution_wire_preserves_normal_continuations() {
+    fn direct_current_resolution_wire_preserves_normal_continuations() {
         let mut state = normal_trigger_firing_fixture();
         let continuation = PendingContinuation::new(
             state
@@ -34313,6 +35384,7 @@ mod tests {
                 base_cost: None,
                 declared_mana_additions: Vec::new(),
                 activation_cost: None,
+                deferred_random_discard_cost: None,
                 activation_ability_index: None,
                 pending_loyalty_activation_player: None,
                 target_constraints: vec![],
@@ -34743,6 +35815,7 @@ mod tests {
             base_cost: None,
             declared_mana_additions: Vec::new(),
             activation_cost: None,
+            deferred_random_discard_cost: None,
             activation_ability_index: None,
             pending_loyalty_activation_player: None,
             target_constraints: vec![],
@@ -36100,7 +37173,7 @@ mod tests {
     }
 
     #[test]
-    fn persisted_state_decodes_v1_at_the_boundary_and_rewrites_v2_only() {
+    fn persisted_state_decodes_v1_at_the_boundary_and_rewrites_current_only() {
         let mut v1 =
             serde_json::to_value(GameState::new_two_player(43)).expect("serialize v1 baseline");
         v1["pending_multi_draw"] = serde_json::to_value(PendingMultiDraw {
@@ -36123,20 +37196,20 @@ mod tests {
             Some(2)
         );
 
-        let raw_v2 = serde_json::to_value(restored).expect("restored raw state serializes");
+        let raw_current = serde_json::to_value(restored).expect("restored raw state serializes");
         assert_eq!(
-            raw_v2["resolution_state_version"],
-            serde_json::Value::from(2)
+            raw_current["resolution_state_version"],
+            serde_json::Value::from(RESOLUTION_STATE_WIRE_VERSION)
         );
-        assert!(raw_v2.get("resolution_frames").is_some());
-        assert!(raw_v2.get("pending_multi_draw").is_none());
+        assert!(raw_current.get("resolution_frames").is_some());
+        assert!(raw_current.get("pending_multi_draw").is_none());
 
-        let trusted_v2 = serde_json::to_value(PersistedGameState::capture(resumed))
+        let trusted_current = serde_json::to_value(PersistedGameState::capture(resumed))
             .expect("trusted state serializes");
-        let trusted_state = &trusted_v2["state"];
+        let trusted_state = &trusted_current["state"];
         assert_eq!(
             trusted_state["resolution_state_version"],
-            serde_json::Value::from(2)
+            serde_json::Value::from(RESOLUTION_STATE_WIRE_VERSION)
         );
         assert!(trusted_state.get("resolution_frames").is_some());
         assert!(trusted_state.get("pending_multi_draw").is_none());

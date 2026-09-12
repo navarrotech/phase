@@ -4754,8 +4754,26 @@ fn discard_cost_choice(
     // discard paid by doing nothing (skip the leg). `Err` (fewer eligible cards than the nonzero
     // count) is unreachable here because `cost_payability` already gated activation on hand size,
     // so `unwrap_or_default()`'s `None` fallback is the correct "no selection to surface" result.
-    super::casting::resolve_non_self_discard_requirement(state, player, source_id, cost)
-        .unwrap_or_default()
+    let (count, mut eligible) =
+        super::casting::resolve_non_self_discard_requirement(state, player, source_id, cost)
+            .unwrap_or_default()?;
+    if let Some((pending_spell, reserved)) = state
+        .pending_cast
+        .as_ref()
+        .filter(|pending| pending.ability.controller == player)
+        .and_then(|pending| {
+            pending
+                .deferred_random_discard_cost
+                .as_ref()
+                .map(|cost| (pending.object_id, cost.count))
+        })
+    {
+        eligible.retain(|&id| id != pending_spell);
+        if eligible.len() < count + reserved {
+            return None;
+        }
+    }
+    Some((count, eligible))
 }
 
 /// CR 117.1 + CR 118.3: Match non-self `AbilityCost::Exile` shapes. Returns
@@ -5204,7 +5222,7 @@ mod tests {
     use crate::types::mana::{
         ManaColor, ManaCost, ManaCostShard, ManaRestriction, ManaType, ManaUnit,
     };
-    use crate::types::proposed_event::{ProposedEvent, ReplacementId};
+    use crate::types::proposed_event::{DrawEventStage, ProposedEvent, ReplacementId};
     use crate::types::statics::{CostPaymentProhibition, ProhibitionScope, StaticMode};
     use crate::types::triggers::TriggerMode;
     use crate::types::zones::Zone;
@@ -5230,6 +5248,7 @@ mod tests {
             proposed: ProposedEvent::Draw {
                 player_id: PlayerId(0),
                 count: 1,
+                stage: DrawEventStage::Individual,
                 applied: HashSet::new(),
             },
             sacrifice_provenance: None,
@@ -5240,6 +5259,7 @@ mod tests {
             search_found_candidates: Vec::new(),
             depth: 0,
             is_optional: false,
+            choice_player: None,
             library_placement: None,
             exile_controller: None,
             exile_duration: None,

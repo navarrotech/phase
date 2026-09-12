@@ -729,6 +729,7 @@ impl EventObjectSnapshot {
             | FilterProp::SameNameAsExiledBySource
             | FilterProp::AttachedToSource
             | FilterProp::AttachedToRecipient
+            | FilterProp::AttachedToPlayer { .. }
             | FilterProp::Unpaired
             | FilterProp::OtherThanTriggerObject
             | FilterProp::MostPrevalentCreatureTypeIn { .. }
@@ -924,6 +925,23 @@ pub enum GameEvent {
         player_id: PlayerId,
         source_id: ObjectId,
         color: ManaType,
+    },
+    /// Mana burn: a player lost life for mana unspent when one of CR 500.1's
+    /// five phases ended. Pre-M10 only — the current rules have no such rule
+    /// (glossary "Mana Burn (Obsolete)": "Older versions of the rules stated
+    /// that unspent mana caused a player to lose life"), so this is emitted
+    /// only for a custom format declaring `LegacyRuleSet.mana_burn`.
+    ///
+    /// Distinct from the Yurlok-class life loss a card's static ability
+    /// causes at the same seam: that is a card doing something, this is the
+    /// format's rules being older. A log that conflated them would tell a
+    /// player the wrong reason they are at 14 life.
+    ManaBurn {
+        player_id: PlayerId,
+        /// The number of mana units that emptied — a count, so `u32` like
+        /// `apply_empty_mana_pool_decisions` returns. Under mana burn the
+        /// emptied count IS the life lost, which is why no second tally exists.
+        amount: u32,
     },
     /// CR 614.1a + CR 703.4q: A `Transform(_)` step-end mana handler (Horizon
     /// Stone, Kruphix, Omnath, Ozai) recolored a unit in place during the
@@ -1677,10 +1695,14 @@ pub enum GameEvent {
         is_mana_ability: bool,
     },
 
-    /// CR 702.110: A creature exploited another creature (sacrificed via exploit ETB).
+    /// CR 702.110b + CR 603.10a + CR 400.7: A creature exploited another
+    /// creature. `exploiter` identifies the actor, while `record` preserves the
+    /// sacrificed victim's exact pre-departure characteristics for later
+    /// trigger matching after the victim has become a new object.
     CreatureExploited {
         exploiter: ObjectId,
         sacrificed: ObjectId,
+        record: Box<ZoneChangeRecord>,
     },
     /// CR 122.1: A player's energy counter total changed.
     EnergyChanged {

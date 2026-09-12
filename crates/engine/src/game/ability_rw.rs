@@ -1996,7 +1996,7 @@ fn legacy_ability_condition(x: &AbilityCondition) -> bool {
         | AbilityCondition::EventOutcomeWon
         | AbilityCondition::CoinFlipOutcome { .. }
         | AbilityCondition::SpellCastWithVariantThisTurn { .. }
-        | AbilityCondition::NthResolutionThisTurn { .. }
+        | AbilityCondition::AbilityUseCountThisTurn { .. }
         | AbilityCondition::RevealedHasCardType { .. }
         | AbilityCondition::SourceEnteredThisTurn
         | AbilityCondition::AdditionalCostPaid { .. }
@@ -2452,6 +2452,11 @@ fn legacy_filter_prop(p: &FilterProp) -> bool {
         }
         FilterProp::ProtectorMatches { controller }
         | FilterProp::Owned { controller }
+        // CR 303.4 + CR 301.5: the attachment referent is a `ControllerRef`, so
+        // whether this prop nests a frozen-12 event-context tag is exactly
+        // whether that referent is one — delegate rather than assert, mirroring
+        // the sibling `ControllerRef`-bearing props.
+        | FilterProp::AttachedToPlayer { player: controller }
         | FilterProp::MostPrevalentCreatureTypeIn {
             scope: controller, ..
         } => legacy_controller_ref(controller),
@@ -2731,6 +2736,12 @@ fn member_bound_filter_prop(p: &FilterProp) -> bool {
         }
         FilterProp::ProtectorMatches { controller }
         | FilterProp::Owned { controller }
+        // CR 303.4 + CR 301.5: the attachment referent is a `ControllerRef`
+        // resolved against the reading ability's OWN source (an
+        // `EnchantedPlayer` referent is that source's enchanted player), so its
+        // member-boundness is exactly the referent's — delegate rather than
+        // assert, mirroring the sibling `ControllerRef`-bearing props.
+        | FilterProp::AttachedToPlayer { player: controller }
         | FilterProp::MostPrevalentCreatureTypeIn {
             scope: controller, ..
         } => member_bound_controller_ref(controller),
@@ -4085,6 +4096,7 @@ fn walk_ability(
         force_block_attacker: _, // exact force-block referent, no read/write effect
         target_incarnations: _, // CR 400.7 pins on the referents, no read/write effect
         selected_target_incarnations: _, // CR 400.7 selected-target pins, no read/write effect
+        illegal_target_slots: _, // CR 608.2b resolution legality stamp, no read/write effect
         controller: _,
         original_controller: _,
         scoped_player: _,
@@ -4982,6 +4994,7 @@ fn rw_effect(
             enters_attacking: _,
             face_down_profile: _,
             library_position: _,
+            library_shuffle: _,
             random_order: _,
         } => {
             let (mut p, sc) = mem(target, *origin, *destination);
@@ -6570,10 +6583,19 @@ fn rw_ability_condition(x: &AbilityCondition) -> RwProfile {
         // CR 705.2: reads resolution-local `state.resolution_coin_flip` — a live
         // in-resolution signal, same read-bucket as `EventOutcomeWon`.
         AbilityCondition::CoinFlipOutcome { result: _ } => reads_event_live(),
+        // Both `AbilityUseCountThisTurn` tallies read a per-turn journal keyed
+        // by this ability's own `(source_id, ability_index)` — the same read
+        // bucket for `Resolved` (`ability_resolutions_this_turn`) and
+        // `Activated` (`activated_abilities_this_turn`). Neither field selects a
+        // different KIND or SCOPE of state, so the profile is unchanged by the
+        // tally axis; both are destructured without `..` so a future field
+        // forces re-classification.
         AbilityCondition::SpellCastWithVariantThisTurn { variant: _ }
-        | AbilityCondition::NthResolutionThisTurn { n: _ } => {
-            reads_player_of(StateKind::JournalCast)
-        }
+        | AbilityCondition::AbilityUseCountThisTurn {
+            tally: _,
+            comparator: _,
+            n: _,
+        } => reads_player_of(StateKind::JournalCast),
         // CR 701.20 + CR 603.3b: "if a card revealed THIS WAY has card type T" —
         // a read of the card the member's OWN parent reveal surfaced (a per-
         // resolution local, like an `ObjectScope::Recipient` read-modify-write:
@@ -7729,6 +7751,17 @@ mod tests {
                 properties: vec![FilterProp::SameNameAsExiledBySource],
                 ..TypedFilter::creature()
             }),
+            // CR 303.4 + CR 301.5: an attachment-relative player referent is
+            // read against the ability's OWN source (the enchanted player of
+            // THIS Aura), so distinct sources are not one shared function —
+            // `AttachedToPlayer` must delegate its `ControllerRef` rather than
+            // answer FALSE outright.
+            TargetFilter::Typed(TypedFilter {
+                properties: vec![FilterProp::AttachedToPlayer {
+                    player: ControllerRef::EnchantedPlayer,
+                }],
+                ..TypedFilter::creature()
+            }),
         ] {
             assert!(
                 member_bound_target_filter(&f),
@@ -7746,6 +7779,15 @@ mod tests {
             TargetFilter::LastRevealed,
             TargetFilter::DefendingPlayer,
             typed_ctrl(ControllerRef::You),
+            // The delegation is the referent's own verdict, not a blanket TRUE
+            // for the prop: a controller-relative attachment referent stays
+            // member-invariant under uniformity.
+            TargetFilter::Typed(TypedFilter {
+                properties: vec![FilterProp::AttachedToPlayer {
+                    player: ControllerRef::You,
+                }],
+                ..TypedFilter::creature()
+            }),
             TargetFilter::None,
         ] {
             assert!(

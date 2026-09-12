@@ -23,10 +23,13 @@ import type {
 } from "../adapter/draft-adapter";
 import type { DeckCardCount, MatchConfig, MatchScore } from "../adapter/types";
 import {
+  MAX_MATERIALIZED_VIRTUAL_BASICS,
   MAX_DRAFT_WORKSPACE_NETWORK_PLACEMENTS,
+  isPlainRecord,
   validateWorkspaceState,
   type DraftWorkspaceState,
 } from "../components/draft/workspace/types";
+import { BASIC_LAND_NAMES } from "../constants/game";
 import type {
   DraftIntergameCommand,
   DraftIntergameCommandAck,
@@ -153,8 +156,15 @@ import type {
  *       launch. A v26 peer has no arm for it and would silently drop the
  *       message, stranding that seat on the completed pod with no way to
  *       join the game every other seat is playing.
+ *  28 — authoritative per-seat Auto Lands requests and correlated results,
+ *       including explicit rejection so an older peer cannot leave a waiter
+ *       pending after an otherwise exact handshake.
+ *  29 — a Cube match launch run on the host's own seat names the original
+ *       entries as its in-game booster source; a guest authority and public
+ *       draft views never receive them.
+ *       Older hosts would silently discard the in-game booster source.
  */
-export const DRAFT_PROTOCOL_VERSION = 27 as const;
+export const DRAFT_PROTOCOL_VERSION = 29 as const;
 
 /** Canonical multiset fingerprint: deck order is UI-only, card counts are not. */
 export function deckSubmissionFingerprint(mainDeck: readonly string[]): string {
@@ -201,6 +211,13 @@ export interface DraftMatchDeckPayload {
   player: DraftDeckPayload;
   opponent: DraftDeckPayload;
   ai_decks: DraftDeckPayload[];
+  /**
+   * In-game booster source. Original Cube entries, including duplicates, only
+   * when the launch's engine runs on the host's own seat; null for a guest
+   * authority, which must never learn the private multiset and so opens
+   * ordinary set boosters.
+   */
+  booster_pack_pool?: string[] | null;
   /**
    * Every set whose draft boosters these decks' draft CONTAINED, supplied
    * verbatim from `DraftPlayerView.draft_set_codes`, populated by
@@ -339,9 +356,9 @@ export interface DraftCommanderLaunch {
  *
  * Flow:
  *   Guest → Host: `draft_join`, `draft_reconnect`, `draft_pick`, `draft_pick_with_draft_effect`, `draft_submit_deck`,
- *                 `draft_request_advance`, `draft_workspace_update`, `draft_leave`
+ *                 `draft_request_advance`, `draft_workspace_update`, `draft_suggest_lands`, `draft_leave`
  *   Host → Guest: `draft_welcome`, `draft_reconnect_ack`, `draft_reconnect_rejected`,
- *                 `draft_state_update`, `draft_pick_ack`, `draft_error`,
+ *                 `draft_state_update`, `draft_pick_ack`, `draft_suggest_lands_result`, `draft_suggest_lands_rejected`, `draft_error`,
  *                 `draft_kicked`, `draft_pairing`, `draft_match_result`,
  *                 `draft_paused`, `draft_resumed`, `draft_lobby_update`,
  *                 `draft_host_left`, `draft_timer_sync`, `draft_match_start`,
@@ -385,6 +402,11 @@ export type DraftP2PMessage =
   | {
       type: "draft_workspace_update";
       workspaceState: DraftWorkspaceState;
+    }
+  | {
+      /** The host derives spells and seat from its retained authoritative state. */
+      type: "draft_suggest_lands";
+      requestId: string;
     }
   | {
       /** Explicit participant exit, bound to the currently authenticated seat. */
@@ -438,6 +460,16 @@ export type DraftP2PMessage =
   | {
       type: "draft_pick_ack";
       view: DraftPlayerView;
+    }
+  | {
+      type: "draft_suggest_lands_result";
+      requestId: string;
+      lands: Record<string, number>;
+    }
+  | {
+      type: "draft_suggest_lands_rejected";
+      requestId: string;
+      reason: string;
     }
   | {
       type: "draft_error";
@@ -606,6 +638,7 @@ const VALID_DRAFT_TYPES = new Set([
   "draft_pick_with_draft_effect",
   "draft_submit_deck",
   "draft_workspace_update",
+  "draft_suggest_lands",
   "draft_leave",
   "draft_welcome",
   "draft_reconnect_ack",
@@ -614,6 +647,8 @@ const VALID_DRAFT_TYPES = new Set([
   "draft_state_update",
   "draft_deck_submit_ack",
   "draft_pick_ack",
+  "draft_suggest_lands_result",
+  "draft_suggest_lands_rejected",
   "draft_error",
   "draft_kicked",
   "draft_pairing",
@@ -642,6 +677,7 @@ const VALID_DRAFT_TYPES = new Set([
 ]);
 
 const MAX_DRAFT_CARD_INSTANCE_ID_LENGTH = 256;
+const MAX_DRAFT_SUGGESTION_REASON_LENGTH = 1024;
 
 /**
  * The largest `DraftProcedure.cards_per_pick` over every kind — the
@@ -676,6 +712,90 @@ function requireDraftCardInstanceId(value: unknown, field: string, context: stri
     throw new Error(`Invalid ${context}: ${field} must be a bounded string`);
   }
   return value;
+}
+
+function requireExactOwnKeyRecord(
+  raw: unknown,
+  expectedKeys: readonly string[],
+  context: string,
+): Record<string, unknown> {
+  if (!isPlainRecord(raw)) {
+    throw new Error(`Invalid ${context}: must be a plain record`);
+  }
+  const keys = Reflect.ownKeys(raw);
+  if (
+    keys.length !== expectedKeys.length
+    || !expectedKeys.every((expected) => Object.prototype.hasOwnProperty.call(raw, expected))
+    || !keys.every((key) =>
+      typeof key === "string"
+      && expectedKeys.includes(key)
+      && Object.prototype.propertyIsEnumerable.call(raw, key))
+  ) {
+    throw new Error(`Invalid ${context}: invalid fields`);
+  }
+  return raw;
+}
+
+function validateSuggestedLands(raw: unknown): Record<string, number> {
+  if (!isPlainRecord(raw)) {
+    throw new Error("Invalid land suggestion result: lands must be a plain record");
+  }
+  const keys = Reflect.ownKeys(raw);
+  if (keys.length > BASIC_LAND_NAMES.size) {
+    throw new Error("Invalid land suggestion result: too many land entries");
+  }
+  const lands: Record<string, number> = {};
+  for (const key of keys) {
+    if (
+      typeof key !== "string"
+      || !Object.prototype.propertyIsEnumerable.call(raw, key)
+      || !BASIC_LAND_NAMES.has(key)
+    ) {
+      throw new Error("Invalid land suggestion result: land names must be canonical basics");
+    }
+    const count = raw[key];
+    if (
+      typeof count !== "number"
+      || !Number.isSafeInteger(count)
+      || count < 0
+      || count > MAX_MATERIALIZED_VIRTUAL_BASICS
+    ) {
+      throw new Error("Invalid land suggestion result: land counts must be bounded nonnegative integers");
+    }
+    lands[key] = count;
+  }
+  return lands;
+}
+
+function validateSuggestLandsMessage(raw: unknown, type: string): DraftP2PMessage {
+  if (type === "draft_suggest_lands") {
+    const request = requireExactOwnKeyRecord(raw, ["type", "requestId"], "land suggestion request");
+    return {
+      type: "draft_suggest_lands",
+      requestId: requireDraftCardInstanceId(request.requestId, "requestId", "land suggestion request"),
+    };
+  }
+  if (type === "draft_suggest_lands_result") {
+    const result = requireExactOwnKeyRecord(raw, ["type", "requestId", "lands"], "land suggestion result");
+    return {
+      type: "draft_suggest_lands_result",
+      requestId: requireDraftCardInstanceId(result.requestId, "requestId", "land suggestion result"),
+      lands: validateSuggestedLands(result.lands),
+    };
+  }
+  const rejection = requireExactOwnKeyRecord(raw, ["type", "requestId", "reason"], "land suggestion rejection");
+  if (
+    typeof rejection.reason !== "string"
+    || rejection.reason.length === 0
+    || rejection.reason.length > MAX_DRAFT_SUGGESTION_REASON_LENGTH
+  ) {
+    throw new Error("Invalid land suggestion rejection: reason must be a bounded string");
+  }
+  return {
+    type: "draft_suggest_lands_rejected",
+    requestId: requireDraftCardInstanceId(rejection.requestId, "requestId", "land suggestion rejection"),
+    reason: rejection.reason,
+  };
 }
 
 function validatePick(raw: Record<string, unknown>): DraftP2PMessage {
@@ -984,8 +1104,12 @@ function normalizeDraftPlayerView(raw: unknown): DraftPlayerView {
   }
   const pool_groups = normalizePoolGroups(view.pool_groups);
   const source = normalizeDraftSourceView(view.source);
+  // A v28 peer may still send this former public-view field. Do not preserve
+  // it through a permissive object spread: the host-only source belongs only
+  // to the local WASM session and launch payloads, never a participant frame.
+  const { booster_pack_pool: _boosterPackPool, ...publicView } = view;
   return {
-    ...view,
+    ...publicView,
     ...(pool_groups !== undefined ? { pool_groups } : {}),
     ...(source !== undefined ? { source } : {}),
     draft_effects: normalizeArrayField(view, "draft_effects"),
@@ -1105,6 +1229,13 @@ export function validateDraftMessage(raw: unknown): DraftP2PMessage {
   }
   if (msg.type === "draft_commander_launch") {
     return validateCommanderLaunch(raw as Record<string, unknown>);
+  }
+  if (
+    msg.type === "draft_suggest_lands"
+    || msg.type === "draft_suggest_lands_result"
+    || msg.type === "draft_suggest_lands_rejected"
+  ) {
+    return validateSuggestLandsMessage(raw, msg.type);
   }
   if (msg.type === "draft_deck_submit_ack") {
     const acknowledgement = raw as Record<string, unknown>;

@@ -897,6 +897,38 @@ pub fn suggest_lands(spells_json: &str) -> Result<JsValue, JsValue> {
     })
 }
 
+/// Suggest land counts for spells in a specific multiplayer seat's pool.
+///
+/// The spells payload is parsed before the active session is accessed, so a
+/// malformed request cannot observe or depend on the current draft state.
+#[wasm_bindgen]
+pub fn suggest_lands_for_seat(seat: u8, spells_json: &str) -> Result<JsValue, JsValue> {
+    let lands = suggest_lands_for_seat_inner(seat, spells_json)
+        .map_err(|error| JsValue::from_str(&error))?;
+    Ok(to_js(&lands))
+}
+
+/// Native-testable core for the multiplayer Auto Lands boundary.
+fn suggest_lands_for_seat_inner(
+    seat: u8,
+    spells_json: &str,
+) -> Result<std::collections::HashMap<String, u8>, String> {
+    let spell_names: Vec<String> = serde_json::from_str(spells_json)
+        .map_err(|error| format!("Failed to parse spells: {error}"))?;
+
+    with_draft_inner(|session| {
+        let pool = session
+            .pools
+            .get(seat as usize)
+            .ok_or_else(|| format!("Seat {seat} has no pool"))?;
+        Ok(suggest::suggest_lands(
+            &spell_names,
+            pool,
+            session.config.min_deck_size,
+        ))
+    })
+}
+
 // ── Multi-seat draft API (P2P Tournament Host) ─────────────────────────
 //
 // These exports support the P2P draft host running an authoritative
@@ -1434,6 +1466,19 @@ pub fn create_multiplayer_draft(
     )
     .map_err(|e| JsValue::from_str(&e))?;
     Ok(to_js(&view))
+}
+
+/// Return the host-only original cube multiset for the game launched after a
+/// draft. This deliberately bypasses `DraftPlayerView`: players and spectators
+/// must never receive undealt cube entries or their duplicate counts.
+#[wasm_bindgen]
+pub fn booster_pack_pool_for_game() -> Result<JsValue, JsValue> {
+    let pool = booster_pack_pool_for_game_inner().map_err(|error| JsValue::from_str(&error))?;
+    Ok(to_js(&pool))
+}
+
+fn booster_pack_pool_for_game_inner() -> Result<Option<Vec<String>>, String> {
+    with_draft_inner(|session| Ok(session.booster_pack_pool_for_game().map(<[String]>::to_vec)))
 }
 
 /// Pure-Rust core for `create_multiplayer_draft`. Returns a typed
@@ -2102,6 +2147,71 @@ mod create_multiplayer_draft_tests {
         DraftSession::new(config, seats, "persisted-draft".to_string())
     }
 
+    fn colored_spell(name: &str, color: &str) -> DraftCardInstance {
+        DraftCardInstance {
+            instance_id: format!("{name}-id"),
+            name: name.to_string(),
+            set_code: "TST".to_string(),
+            collector_number: "1".to_string(),
+            rarity: "common".to_string(),
+            colors: vec![color.to_string()],
+            cmc: 1,
+            type_line: "Creature".to_string(),
+            draft_effect: None,
+        }
+    }
+
+    #[test]
+    fn suggest_lands_for_seat_uses_the_requested_seat_pool() {
+        clear_state();
+        let mut session = persisted_premier_session(SetLayout::UniformByRound {
+            codes: vec!["TST".to_string()],
+        });
+        session.pools[0] = vec![colored_spell("Host Blue", "U")];
+        session.pools[1] = vec![colored_spell("Guest Red", "R")];
+        DRAFT_SESSION.with(|cell| cell.set(Some(session)));
+
+        let lands = suggest_lands_for_seat_inner(1, r#"["Guest Red"]"#)
+            .expect("seat-one suggestion should succeed");
+        assert_eq!(lands.get("Mountain"), Some(&18));
+        assert!(!lands.contains_key("Island"));
+
+        clear_state();
+    }
+
+    #[test]
+    fn suggest_lands_for_seat_parses_before_accessing_the_session() {
+        clear_state();
+        let error = suggest_lands_for_seat_inner(1, "not JSON")
+            .expect_err("malformed spells must be rejected");
+        assert!(
+            error.contains("Failed to parse spells"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !error.contains("Draft not initialized"),
+            "parse must precede session access"
+        );
+    }
+
+    #[test]
+    fn suggest_lands_for_seat_rejects_a_missing_pool() {
+        clear_state();
+        let session = persisted_premier_session(SetLayout::UniformByRound {
+            codes: vec!["TST".to_string()],
+        });
+        DRAFT_SESSION.with(|cell| cell.set(Some(session)));
+
+        let error =
+            suggest_lands_for_seat_inner(8, "[]").expect_err("out-of-range seat must be rejected");
+        assert!(
+            error.contains("Seat 8 has no pool"),
+            "unexpected error: {error}"
+        );
+
+        clear_state();
+    }
+
     #[test]
     fn import_accepts_persisted_chaos_only_through_a_redacted_player_view() {
         clear_state();
@@ -2202,11 +2312,11 @@ mod create_multiplayer_draft_tests {
         clear_state();
         install_fixture_db();
 
-        // 2 seats × 2 cards/pack × 1 pack = 4 cards exactly.
+        // Four dealt cards, plus duplicate and undealt source occurrences.
         let pool_input_json = r#"{
             "type": "Cube",
             "data": {
-                "cube_list_text": "1 Alpha\n1 Beta\n1 Gamma\n1 Delta\n",
+                "cube_list_text": "2 Alpha\n1 Beta\n1 Gamma\n2 Delta\n",
                 "cube_name": "Test Cube",
                 "cube_draft_settings": {
                     "pod_size": 2,
@@ -2232,6 +2342,19 @@ mod create_multiplayer_draft_tests {
             "Competitive",
         )
         .expect("cube draft should start");
+
+        let expected = vec!["Alpha", "Alpha", "Beta", "Gamma", "Delta", "Delta"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert!(serde_json::to_value(&view)
+            .unwrap()
+            .get("booster_pack_pool")
+            .is_none());
+        assert_eq!(
+            booster_pack_pool_for_game_inner(),
+            Ok(Some(expected.clone()))
+        );
 
         assert!(
             matches!(view.status, DraftStatus::Drafting),
@@ -2261,10 +2384,18 @@ mod create_multiplayer_draft_tests {
         // (it has been passed; pack will not be visible again until the rotation lands).
         let post_view = DRAFT_SESSION.with(|cell| {
             let session = cell.take().expect("session populated");
-            let v = filter_for_player(&session, 0);
+            let json = serde_json::to_string(&session).unwrap();
+            let restored = restorable_draft_session_from_json(&json).unwrap();
+            let v = filter_for_player(&restored, 0);
             cell.set(Some(session));
             v
         });
+        assert_eq!(post_view.pool.len(), 1);
+        assert!(serde_json::to_value(&post_view)
+            .unwrap()
+            .get("booster_pack_pool")
+            .is_none());
+        assert_eq!(booster_pack_pool_for_game_inner(), Ok(Some(expected)));
         if let Some(pack_after) = &post_view.current_pack {
             assert!(
                 !pack_after.iter().any(|c| c.instance_id == picked),
@@ -3487,6 +3618,31 @@ mod create_multiplayer_draft_tests {
 
         assert_eq!(config(0).min_deck_size, 1);
         assert_eq!(config(4).min_deck_size, 4);
+        install_fixture_db();
+        let cards = CARD_DB.with(|cell| {
+            let db = cell.borrow();
+            cube_cards_from_entries(
+                &parse_cube_list("400 Alpha\n1 Delta").unwrap(),
+                db.as_ref().unwrap(),
+            )
+            .unwrap()
+        });
+        let source = CubePackSource::new(cards);
+        let seats = (0..8)
+            .map(|i| DraftSeat::Bot {
+                name: format!("Bot {i}"),
+            })
+            .collect();
+        let mut session = DraftSession::new(config(4), seats, "quick-cube".into());
+        session::apply(&mut session, DraftAction::StartDraft, Some(&source)).unwrap();
+        assert_eq!(session.current_pack[0].as_ref().unwrap().0.len(), 15);
+        let restored =
+            restorable_draft_session_from_json(&serde_json::to_string(&session).unwrap()).unwrap();
+        DRAFT_SESSION.with(|cell| cell.set(Some(restored)));
+        let pool = booster_pack_pool_for_game_inner().unwrap().unwrap();
+        assert_eq!(pool.len(), 401);
+        assert_eq!(pool.last().unwrap(), "Delta");
+        clear_state();
     }
 
     #[test]
@@ -3524,6 +3680,14 @@ mod create_multiplayer_draft_tests {
         .expect("Commander cube should start");
 
         assert_eq!(view.min_deck_size, 60);
+        assert!(serde_json::to_value(&view)
+            .unwrap()
+            .get("booster_pack_pool")
+            .is_none());
+        assert_eq!(
+            booster_pack_pool_for_game_inner(),
+            Ok(Some(vec!["Alpha".to_string(); 200]))
+        );
         DRAFT_SESSION.with(|cell| {
             let session = cell.take().expect("Commander cube session is stored");
             assert_eq!(session.config.min_deck_size, 60);
