@@ -66,6 +66,13 @@ const config: StorybookConfig = {
     return {
       ...viteConfig,
       plugins: plugins.filter((plugin) => !isAppOnlyPlugin(plugin)),
+      // `staticDirs` above is the single authority for publishing `client/public`.
+      // The app's config leaves `publicDir` at its default, which resolves to that
+      // same directory, so a static build otherwise hands two concurrent `fs.cp`
+      // walks the same destination tree. Node's `cp` checks for a directory and
+      // then creates it in separate steps, so the two races and the loser fails
+      // the build with `EEXIST` on whichever nested directory it reached second.
+      publicDir: false,
       resolve: {
         ...viteConfig.resolve,
         // Storybook's entries come first, because Vite takes the first
