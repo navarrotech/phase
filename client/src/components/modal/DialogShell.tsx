@@ -19,6 +19,10 @@ interface DialogShellProps {
   title: ReactNode;
   subtitle?: ReactNode;
   size?: "sm" | "md" | "lg";
+  /** Caps the card's height on `lg` and up, so tall content scrolls inside the
+   * dialog rather than running past the bottom of the viewport. Below `lg` the
+   * card is full-bleed and its content region scrolls unconditionally, so this
+   * has no effect there. */
   scrollable?: boolean;
   children: ReactNode;
   footer?: ReactNode;
@@ -298,11 +302,12 @@ export function PeekTab({
 export const PeekButton = PeekTab;
 
 /**
- * X close affordance in the dialog's top-right corner. Sits inside the card
- * (so it scrolls with content if the dialog is scrollable) at z-20 to ride
- * above the gradient overlay but below the peek tab. Renders only when the
- * caller provides `onClose` — non-dismissable dialogs (ChoiceOverlay) don't
- * get one.
+ * X close affordance in the dialog's top-right corner. Positioned against the
+ * card, which is no longer the scroll container — the content region between
+ * header and footer is — so the button stays pinned while the body scrolls.
+ * Sits at z-20 to ride above the gradient overlay but below the peek tab.
+ * Renders only when the caller provides `onClose` — non-dismissable dialogs
+ * (ChoiceOverlay) don't get one.
  */
 function CloseButton({ onClose }: { onClose: () => void }) {
   const { t } = useTranslation("game");
