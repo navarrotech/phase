@@ -196,11 +196,22 @@ export type WishOutsideGameScope = "PostM10SideboardOnly" | "PreM10ReachesExile"
  *  all-controllers form. Schema only — unenforced. */
 export type LegendRuleScope = "Modern" | "PreM14AnyController";
 
+/** CR 407: whether the format is played for ante. `Excluded` is the modern
+ *  default and the only value the engine implements; unlike its sibling axes
+ *  it is enforced, at deck construction (CR 407.3). */
+export type AntePolicy = "Excluded" | "Enabled";
+
 export interface LegacyRuleSet {
   mana_burn: ManaBurnPolicy;
   damage_timing: CombatDamageTiming;
   wish_scope: WishOutsideGameScope;
   legend_rule_scope: LegendRuleScope;
+  /** Optional because this axis postdates the Axis-A save path: a definition
+   *  persisted before it existed carries no `ante` key. Mirrors the engine's
+   *  `#[serde(default)]` on the same field, where absent likewise means
+   *  `"Excluded"` — which is what such a save meant. The engine always emits
+   *  it, so only a locally-persisted definition can be missing it. */
+  ante?: AntePolicy;
 }
 
 /** CR 903.3 and the Tiny Leaders / Oathbreaker / Brawl deck-construction
@@ -244,6 +255,10 @@ export interface StructuralRules {
 /** `legal_sets: null` means unrestricted; a list restricts to exactly it. */
 export interface LegalityRules {
   legal_sets: SetCode[] | null;
+  /** Cards legal regardless of `legal_sets`, unioned with it — a ruleset can
+   *  name a card its set list cannot express. Optional because it postdates
+   *  the Axis-A save path; absent means an empty list. */
+  legal_cards?: string[];
   banned: string[];
   restricted: string[];
   legacy: LegacyRuleSet;
@@ -550,8 +565,14 @@ export type OutsideGameChoiceSource =
   | { type: "FaceUpExile"; data: { object_id: ObjectId } }
   | {
       type: "BoosterPack";
-      data: { pack_slot: number; set_code: string; card: CardFacePartial };
+      data: { pack_slot: number; origin: PackOrigin; card: CardFacePartial };
     };
+
+/**
+ * Where an opened booster pack came from, for display. Mirrors Rust
+ * `PackOrigin` (engine `types/game_state.rs`).
+ */
+export type PackOrigin = { type: "Set"; data: string } | { type: "Cube" };
 
 export interface OutsideGameChoiceEntry {
   source: OutsideGameChoiceSource;
@@ -3389,13 +3410,19 @@ export type DecisionSource =
  */
 export type DecisionTemplate = Record<string, unknown>;
 
-/** Mirrors `engine::analysis::loop_check::ShortcutProposal`. */
+/**
+ * Mirrors `engine::analysis::loop_check::ShortcutProposal`. `shortened_by` is the responder
+ * whose named place is the proposal's current ending point (CR 732.2b); it is `skip_serializing_if
+ * none` on the wire, so an unshortened proposal serializes exactly as before and no protocol
+ * version moves — the same posture the two optional fields this interface does not mirror ship.
+ */
 export interface ShortcutProposal {
   proposer: PlayerId;
   predicted_winner: PlayerId | null;
   count: IterationCount;
   unbounded: ResourceAxis[];
   win_kind: WinKind;
+  shortened_by?: PlayerId;
 }
 
 /**
@@ -4706,6 +4733,36 @@ export type TournamentStatus =
 export type BracketShape = "Swiss" | "SingleElimination";
 
 /**
+ * Why the broker would refuse a report for one pairing, or `"Open"` if it would
+ * not. Mirrors `lobby_broker::tournament::ReportGate` (added in lobby protocol
+ * v6), the single authority for the viewer-INDEPENDENT half of the broker's
+ * report gate — every conjunct of `TournamentManager::report_result` that does
+ * not depend on WHO is asking, carried as the REASON rather than a bare bool so
+ * a client can gate on `=== "Open"` and a new refusal arm is a compile error.
+ *
+ * `TournamentNotRunning` is the arm the outcome-only client fallback cannot
+ * see: a `Reported` pairing on a `Completed`/`Abandoned` event is not
+ * reportable, but its outcome alone still looks re-reportable. The broker
+ * checks `TournamentStatus::is_terminal` first, so consuming this field is what
+ * removes the "Report on a finished event" affordance.
+ *
+ * `Bye` and `Forfeit` are server-assigned outcomes with nothing to report;
+ * `Open` includes an already-`Reported` pairing, because re-reporting is how a
+ * mistyped tally is corrected.
+ */
+export type ReportGate = "Open" | "TournamentNotRunning" | "Bye" | "Forfeit";
+
+/**
+ * One tournament-scoped gated action, as an axis rather than sibling
+ * `can_start` / `can_end` / `can_drop` booleans. Mirrors
+ * `lobby_broker::tournament::TournamentAction` (lobby protocol v6). These are
+ * the members carried by {@link TournamentSummary.open_actions}; the set is
+ * viewer-INDEPENDENT (it rides a frame fanned to every subscriber), so a client
+ * composes it with its own credential rather than reading authority from it.
+ */
+export type TournamentAction = "StartRound" | "EndTournament" | "Drop";
+
+/**
  * The reported content of a *played* pairing. Mirrors the externally-tagged
  * `crates/lobby-broker/src/tournament.rs:336-348`. `game_wins` is keyed by
  * `player_key`, and is empty for a pod (arity > 2) because pods are single-game
@@ -4795,17 +4852,24 @@ export interface PlayerSummary {
  * `outcome` is emitted with **no** `skip_serializing_if`, so a pending pairing
  * arrives as an explicit `"outcome": null`.
  *
- * NOTE (protocol v6, client-render deferred): the wire struct now also carries
- * a required `report_gate` (broker-owned per-pairing report legality). It is
- * intentionally not mirrored here yet — the client-rendering follow-up adds the
- * field and consumes it. Received unknown fields are ignored by `JSON.parse`,
- * so omitting it is inert. The Rust line citations below predate the v6 shift.
+ * `report_gate` is REQUIRED on the v6 wire but typed OPTIONAL here on purpose:
+ * {@link MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL} stays at 2, so this client still
+ * talks to a pre-v6 broker that emits a pairing with no `report_gate` at all. A
+ * consumer treats its absence as "fall back to the outcome-only reportability
+ * heuristic" and its presence as the authority — see
+ * `isPairingReportable` in `pages/tournamentPageState.ts`.
  */
 export interface TournamentPairingView {
   id: PairingId;
   round: number;
   players: PlayerSummary[];
   outcome: PairingOutcome | null;
+  /**
+   * Broker-owned per-pairing report legality (lobby protocol v6). Absent from a
+   * pre-v6 broker's frame; a consumer degrades to the outcome-only fallback
+   * when it is `undefined`.
+   */
+  report_gate?: ReportGate;
 }
 
 /**
@@ -4825,11 +4889,13 @@ export type TournamentCredentialRole = "Organizer" | "Player";
  * One row of the tournament list. Mirrors
  * `crates/lobby-broker/src/protocol.rs:507-528` (citation predates the v6 shift).
  *
- * NOTE (protocol v6, client-render deferred): the wire struct now also carries
- * a required `scoring` (resolved `ScoringPolicy`) and `open_actions`
- * (broker-owned set of legal tournament actions). Both are intentionally not
- * mirrored here yet — the client-rendering follow-up adds and consumes them.
- * Unknown received fields are ignored by `JSON.parse`, so omitting them is inert.
+ * `scoring` and `open_actions` are REQUIRED on the v6 wire but typed OPTIONAL
+ * here for the same reason `report_gate` is on {@link TournamentPairingView}:
+ * {@link MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL} stays at 2, so a pre-v6 broker
+ * emits a summary carrying neither. A consumer reads the resolved `scoring` when
+ * present (and never recomputes it — that duplicate is exactly what the field
+ * exists to delete), and treats an absent `open_actions` as "fall back to the
+ * credential-only gate" rather than as "no action is open".
  */
 export interface TournamentSummary {
   code: string;
@@ -4853,6 +4919,23 @@ export interface TournamentSummary {
    */
   total_rounds: number;
   created_at: number;
+  /**
+   * The RESOLVED scoring policy the event is actually scored under — the
+   * organizer's explicit choice, or the broker's `ScoringPolicy::default_for_arity`
+   * applied when `CreateTournament.scoring` was omitted (lobby protocol v6).
+   * Absent from a pre-v6 broker's frame. Render it; never recompute it.
+   */
+  scoring?: ScoringPolicy;
+  /**
+   * Which tournament-scoped gated actions the broker would currently admit from
+   * a correctly credentialed actor (lobby protocol v6). A viewer-INDEPENDENT
+   * set — the authorization conjuncts cannot ride a broadcast frame — so a
+   * client composes it with its own credential. Absent from a pre-v6 broker's
+   * frame, where a consumer degrades to the credential-only gate. Reporting is
+   * deliberately not here: its gate is pairing-scoped and lives on
+   * {@link TournamentPairingView.report_gate}.
+   */
+  open_actions?: TournamentAction[];
   /**
    * The event's game-format label (Standard, Commander, …), a display label
    * only — the tournament enforces no deck legality. Typed `| null` because the

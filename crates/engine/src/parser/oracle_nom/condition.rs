@@ -7,7 +7,7 @@ use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::bytes::complete::take_until;
 use nom::character::complete::multispace1;
-use nom::combinator::{cut, eof, map, opt, peek, value, verify};
+use nom::combinator::{cut, eof, map, not, opt, peek, value, verify};
 use nom::multi::many0;
 use nom::sequence::{delimited, preceded, terminated};
 use nom::Parser;
@@ -2262,15 +2262,16 @@ fn parse_source_enchanted_by_aura_count(input: &str) -> OracleResult<'_, StaticC
 pub(crate) fn parse_source_has_counters(input: &str) -> OracleResult<'_, StaticCondition> {
     // The shared condition path (intervening-"if" triggers and static gates that
     // delegate to `parse_inner_condition`) reads the subject as
-    // source-referential: "whenever ~ attacks, if it has three +1/+1 counters on
-    // it" (Ayara's Oathsworn) means the triggering source itself. The
-    // recipient-bound "for as long as it has a counter" reading is the duration
-    // grammar's job — see `parse_recipient_has_counters`.
+    // source-referential: "whenever ~ deals combat damage to a player, if it has
+    // fewer than four +1/+1 counters on it" (Ayara's Oathsworn) means the
+    // triggering source itself. The recipient-bound "for as long as it has a
+    // counter" reading is the duration grammar's job — see
+    // `parse_recipient_has_counters`.
     let (rest, (subject, counters, minimum, maximum)) = parse_has_counters_axes(input)?;
     match subject {
         // "~"/"this creature" and the bound pronoun "it" are both
         // source-referential in this path (the intervening-"if" trigger /
-        // static-gate reading — #3084 Ayara's Oathsworn).
+        // static-gate reading — Ayara's Oathsworn "fewer than four").
         CounterConditionSubject::Source | CounterConditionSubject::RecipientPronoun => Ok((
             rest,
             StaticCondition::HasCounters {
@@ -2460,6 +2461,8 @@ fn parse_counter_condition_subject(input: &str) -> OracleResult<'_, CounterCondi
 /// - `"N or more"` → `(N, None)`
 /// - `"exactly N"` → `(N, Some(N))`
 /// - `"N or fewer"` → `(0, Some(N))`
+/// - `"fewer than N"` → `(0, Some(N-1))`
+/// - `"more than N"` → `(N+1, None)`
 fn parse_has_counters_quantity(input: &str) -> OracleResult<'_, (u32, Option<u32>)> {
     alt((
         value((1u32, None), tag("a ")),
@@ -2468,6 +2471,7 @@ fn parse_has_counters_quantity(input: &str) -> OracleResult<'_, (u32, Option<u32
         parse_exactly_n_counters,
         parse_n_or_more_counters,
         parse_n_or_fewer_counters,
+        parse_strict_n_counters,
         // CR 122.1: a bare "counter(s)" with no quantifier word means "at least
         // one" — "if ~ has counters on it" (The Ozolith, Denry Klin). `peek` so
         // the counter-type axis still consumes the noun, and gate on the bare
@@ -2498,6 +2502,38 @@ fn parse_exactly_n_counters(input: &str) -> OracleResult<'_, (u32, Option<u32>)>
     let (rest, n) = parse_number(rest)?;
     let (rest, _) = tag(" ").parse(rest)?;
     Ok((rest, (n, Some(n))))
+}
+
+/// CR 107.1 + CR 122.1: "fewer than N" / "more than N" are strict integer
+/// inequalities on the source's matching counters. Encoded as inclusive
+/// HasCounters bounds: LT N → (0, Some(N-1)); GT N → (N+1, None).
+/// CR 603.4: the resulting HasCounters is the intervening-if predicate.
+fn parse_strict_n_counters(input: &str) -> OracleResult<'_, (u32, Option<u32>)> {
+    let (rest, comparator) = parse_strict_comparator_prefix(input)?;
+    let (rest, n) = parse_number(rest)?;
+    let (rest, _) = tag(" ").parse(rest)?;
+    // Refuse mixed "fewer than N or more" (same refuse as parse_there_are_conditions).
+    let (rest, _) = peek(not(alt((
+        tag("or more "),
+        tag("or fewer "),
+        tag("at least "),
+    ))))
+    .parse(rest)?;
+    match comparator {
+        Comparator::LT => {
+            let Some(max) = n.checked_sub(1) else {
+                return Err(oracle_err(input));
+            };
+            Ok((rest, (0, Some(max))))
+        }
+        Comparator::GT => {
+            let Some(min) = n.checked_add(1) else {
+                return Err(oracle_err(input));
+            };
+            Ok((rest, (min, None)))
+        }
+        Comparator::GE | Comparator::LE | Comparator::EQ | Comparator::NE => Err(oracle_err(input)),
+    }
 }
 
 /// Consume `"<type> counter"` / `"<type> counters"` and return
@@ -4057,9 +4093,10 @@ fn parse_ge_threshold(input: &str) -> OracleResult<'_, u32> {
 /// are the strict-inequality prefix idioms (LT / GT), in contrast to the
 /// "N or more" (GE) / "N or fewer" (LE) suffix idioms. Single authority for
 /// the comparator-prefix family — shared by `parse_put_onto_battlefield_this_way`
-/// ("you put fewer than two lands onto the battlefield this way") and
+/// ("you put fewer than two lands onto the battlefield this way"),
 /// `parse_there_are_conditions` ("there are fewer than six creature cards in
-/// your graveyard").
+/// your graveyard"), and `parse_strict_n_counters` ("has fewer than three
+/// +1/+1 counters on it" / "has more than two +1/+1 counters on it").
 fn parse_strict_comparator_prefix(input: &str) -> OracleResult<'_, Comparator> {
     alt((
         value(Comparator::LT, tag("fewer than ")),
@@ -8477,11 +8514,13 @@ fn parse_entered_this_turn_under_opponent_control(
     parse_entered_this_turn_subject(input, suffix, 1, player)
 }
 
-/// Parse "there are [fewer than/more than] N [or more] [things] ..." conditions.
+/// Parse "there are [fewer than/more than] N [or more / at least N] [things] ..."
+/// conditions.
 ///
-/// Covers threshold ("seven or more cards"), delirium ("four or more card types"),
-/// mana values ("five or more mana values"), and typed cards ("creature cards",
-/// "instant and/or sorcery cards", "land cards", "historic cards", etc.).
+/// Covers threshold ("seven or more cards" / "at least three Lesson cards"),
+/// delirium ("four or more card types"), mana values ("five or more mana
+/// values"), and typed cards ("creature cards", "instant and/or sorcery cards",
+/// "land cards", "historic cards", "Zombie creature cards", etc.).
 ///
 /// Two comparator axes exist and they are mutually exclusive:
 /// - a strict-inequality **prefix** before N — "fewer than" (LT) / "more than"
@@ -8489,19 +8528,23 @@ fn parse_entered_this_turn_under_opponent_control(
 ///   (Shadowborn Demon) and "there are fewer than eight cards in your graveyard"
 ///   (The Warring Triad, where subtype/graveyard canonicalization composes with
 ///   the prefix);
-/// - a threshold **suffix** after N — "or more" (GE), e.g. "there are seven or
-///   more lands on the battlefield" (Impending Disaster).
+/// - a GE **threshold** via `parse_ge_threshold` — "N or more" or "at least N",
+///   e.g. "there are seven or more lands on the battlefield" (Impending Disaster)
+///   and "there are at least three Zombie creature cards in your graveyard".
 ///
 /// When neither is present — e.g. "there are five basic land types among lands
 /// you control" (A-Nael, Avizoa Aeronaut) — English grammar reads as "exactly
-/// N", so the comparator is EQ. A prefix and an "or more" suffix together
-/// ("fewer than N or more") is not English and is refused rather than guessed.
+/// N", so the comparator is EQ. A prefix and a GE threshold together
+/// ("fewer than N or more" / "fewer than at least N") is not English and is
+/// refused rather than guessed.
 ///
 /// CR 107.1: Magic numbers are integers; exact-value checks are distinct
-/// from threshold checks. Consumers evaluate the resulting comparison under
-/// CR 603.4 (intervening-"if" triggered abilities) and CR 611.3a (static
-/// continuous "as long as" gates), both of which re-read the condition against
-/// live game state at check time.
+/// from threshold checks (>= N vs exactly N). Consumers evaluate the resulting
+/// comparison under CR 603.4 (intervening-"if" triggered abilities) and
+/// CR 611.3a (static continuous "as long as" gates), both of which re-read the
+/// condition against live game state at check time. Activation-restriction
+/// consumers (CR 602.1b / CR 602.5) share this grammar; those rules are not
+/// this combinator's authority.
 fn parse_there_are_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
     parse_there_are_conditions_with_quantity(input, nom_quantity::parse_quantity_ref)
 }
@@ -8525,15 +8568,22 @@ fn parse_there_are_conditions_with_quantity(
 ) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = tag("there are ").parse(input)?;
     let (rest, prefix) = opt(parse_strict_comparator_prefix).parse(rest)?;
-    let (rest, n) = parse_number(rest)?;
-    let (rest, _) = tag(" ").parse(rest)?;
-    let (rest, or_more) = opt(tag("or more ")).parse(rest)?;
-    let comparator = match (prefix, or_more) {
-        // "fewer than N or more" is not English — refuse to guess.
-        (Some(_), Some(_)) => return Err(oracle_err(input)),
-        (Some(c), None) => c,
-        (None, Some(_)) => Comparator::GE,
-        (None, None) => Comparator::EQ,
+    // CR 107.1: GE is `"N or more "` / `"at least N "` via `parse_ge_threshold`;
+    // a following space is already consumed there, so do not `tag(" ")` after a
+    // GE hit. Bare N (EQ / strict-prefix remainder) is `parse_number` + space
+    // only when GE fails.
+    let (rest, (n, ge)) = alt((
+        map(parse_ge_threshold, |n| (n, true)),
+        map(terminated(parse_number, tag(" ")), |n| (n, false)),
+    ))
+    .parse(rest)?;
+    let comparator = match (prefix, ge) {
+        // "fewer than N or more" / "fewer than at least N" is not English —
+        // refuse to guess.
+        (Some(_), true) => return Err(oracle_err(input)),
+        (Some(c), false) => c,
+        (None, true) => Comparator::GE,
+        (None, false) => Comparator::EQ,
     };
     match parse_filtered_zone_card_count(rest) {
         Ok((rest, qty)) => return Ok((rest, make_quantity_comparison(qty, comparator, n))),
@@ -8607,6 +8657,16 @@ fn parse_filtered_zone_card_count(input: &str) -> OracleResult<'_, QuantityRef> 
 /// Limits the filtered zone-count bridge to card descriptions whose semantics
 /// remain valid in every counted zone. All other filter forms deliberately fall
 /// through to the legacy quantity grammar instead of being partially accepted.
+///
+/// CR 109.2a + CR 404.1: a card description that names a zone counts matching
+/// cards in that zone.
+/// CR 205.1 + CR 205.2a + CR 205.3m: juxtaposed subtype + non-`Card` core type
+/// ("Zombie creature cards") is a type-line conjunction (creature AND the
+/// Zombie creature type). Empty-`properties` nouns are admitted only in that
+/// shape, encoded as `filter: Some(Typed { .. })` so `matches_target_filter`
+/// ANDs the type filters. Property-free core-only ("creature cards") or
+/// subtype-only ("Lesson cards" / "Zombie cards") nouns stay on the legacy
+/// `card_types` path.
 fn is_admissible_zone_card_count_filter(filter: &TargetFilter) -> bool {
     match filter {
         TargetFilter::Typed(TypedFilter {
@@ -8617,10 +8677,13 @@ fn is_admissible_zone_card_count_filter(filter: &TargetFilter) -> bool {
             controller.is_none()
                 && !type_filters.is_empty()
                 && !type_filters.iter().any(type_filter_contains_any)
-                && !properties.is_empty()
-                && properties
-                    .iter()
-                    .all(is_admissible_zone_card_count_property)
+                && if properties.is_empty() {
+                    type_filters_are_juxtaposed_subtype_and_core(type_filters)
+                } else {
+                    properties
+                        .iter()
+                        .all(is_admissible_zone_card_count_property)
+                }
         }
         TargetFilter::Or { filters } => {
             !filters.is_empty() && filters.iter().all(is_admissible_zone_card_count_filter)
@@ -8650,6 +8713,39 @@ fn type_filter_contains_any(filter: &TypeFilter) -> bool {
         | TypeFilter::Card
         | TypeFilter::Subtype(_) => false,
     }
+}
+
+/// CR 205.2a: non-`Card` core types that can juxtapose with a subtype in a
+/// zone-card description. `Card` / `Any` / `Subtype` / `Non` / `AnyOf` are not
+/// cores for this gate — admitting them would steal `"creature cards"` /
+/// `"Lesson cards"` / `"instant or sorcery cards"` onto the filtered bridge.
+fn type_filter_is_non_card_core(filter: &TypeFilter) -> bool {
+    match filter {
+        TypeFilter::Creature
+        | TypeFilter::Land
+        | TypeFilter::Artifact
+        | TypeFilter::Enchantment
+        | TypeFilter::Instant
+        | TypeFilter::Sorcery
+        | TypeFilter::Planeswalker
+        | TypeFilter::Battle
+        | TypeFilter::Kindred
+        | TypeFilter::Permanent => true,
+        TypeFilter::Card
+        | TypeFilter::Any
+        | TypeFilter::Subtype(_)
+        | TypeFilter::Non(_)
+        | TypeFilter::AnyOf(_) => false,
+    }
+}
+
+/// CR 205.1 + CR 205.3m: a juxtaposed subtype + non-`Card` core type
+/// ("Zombie creature") is a type-line conjunction, not a disjunction.
+fn type_filters_are_juxtaposed_subtype_and_core(type_filters: &[TypeFilter]) -> bool {
+    type_filters
+        .iter()
+        .any(|filter| matches!(filter, TypeFilter::Subtype(_)))
+        && type_filters.iter().any(type_filter_is_non_card_core)
 }
 
 /// Only static card-description properties can be evaluated meaningfully in a
@@ -8973,7 +9069,8 @@ fn parse_zone_count_ref(input: &str) -> OracleResult<'_, ZoneRef> {
 ///
 /// Composes the same axes as `parse_source_has_counters`:
 /// - Quantity axis (`parse_has_counters_quantity`): "no" / "a" / "N or more"
-///   / "N or fewer" / "exactly N" / "one or more".
+///   / "N or fewer" / "exactly N" / "one or more" / "fewer than N"
+///   (`(0, Some(N-1))`) / "more than N" (`(N+1, None)`).
 /// - Counter type axis (`parse_typed_counter_noun` then `Any` fallback).
 /// - Source subject: any pronoun / `~` form accepted by
 ///   `parse_counter_on_source_subject`.
@@ -15029,10 +15126,31 @@ mod tests {
             parse_filtered_zone_card_count("historic card in your graveyard"),
             Err(nom::Err::Error(_))
         ));
+        let (rest, zombie_creature) =
+            parse_filtered_zone_card_count("Zombie creature cards in your graveyard")
+                .expect("juxtaposed subtype+core must take the filtered-count bridge");
+        assert_eq!(rest, "");
+        assert_eq!(
+            zombie_creature,
+            QuantityRef::ZoneCardCount {
+                zone: ZoneRef::Graveyard,
+                card_types: Vec::new(),
+                filter: Some(TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![
+                        TypeFilter::Creature,
+                        TypeFilter::Subtype("Zombie".to_string()),
+                    ],
+                    controller: None,
+                    properties: vec![],
+                })),
+                scope: CountScope::Controller,
+            }
+        );
         for text in [
             "creature cards in your graveyard",
             "Lesson cards in your graveyard",
             "instant or sorcery cards in your graveyard",
+            "Zombie cards in your graveyard",
         ] {
             assert!(
                 matches!(
@@ -15042,6 +15160,25 @@ mod tests {
                 "property-free filter must fall through to the legacy count parser for {text:?}"
             );
         }
+        let (rest, zombie_only) =
+            parse_inner_condition("there are three Zombie cards in your graveyard")
+                .expect("subtype-only nouns must retain the legacy card_types path");
+        assert_eq!(rest, "");
+        assert_eq!(
+            zombie_only,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ZoneCardCount {
+                        zone: ZoneRef::Graveyard,
+                        card_types: vec![TypeFilter::Subtype("Zombie".to_string())],
+                        filter: None,
+                        scope: CountScope::Controller,
+                    },
+                },
+                comparator: Comparator::EQ,
+                rhs: QuantityExpr::Fixed { value: 3 },
+            }
+        );
         assert!(matches!(
             parse_filtered_zone_card_count("artifact cards you control in your graveyard"),
             Err(nom::Err::Error(_))
@@ -15143,6 +15280,58 @@ mod tests {
         }
     }
 
+    /// CR 107.1: `"there are at least N"` is the GE dual of `"there are N or more"`
+    /// via `parse_ge_threshold`. Lesson-cards stay on the legacy `card_types` path.
+    #[test]
+    fn test_there_are_at_least_lesson_cards_in_graveyard_ge() {
+        let (rest, c) =
+            parse_inner_condition("there are at least three Lesson cards in your graveyard")
+                .unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(
+            c,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ZoneCardCount {
+                        zone: ZoneRef::Graveyard,
+                        card_types: vec![TypeFilter::Subtype("Lesson".to_string())],
+                        filter: None,
+                        scope: CountScope::Controller,
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 3 },
+            }
+        );
+    }
+
+    /// CR 107.1: `"there are at least seven lands on the battlefield"` is the GE
+    /// dual of the existing `"seven or more lands"` battlefield-count fallback.
+    #[test]
+    fn test_there_are_at_least_lands_on_battlefield_ge() {
+        let (rest, c) =
+            parse_inner_condition("there are at least seven lands on the battlefield").unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(
+            c,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: TargetFilter::Typed(TypedFilter {
+                            type_filters: vec![TypeFilter::Land],
+                            controller: None,
+                            properties: vec![FilterProp::InZone {
+                                zone: Zone::Battlefield,
+                            }],
+                        }),
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 7 },
+            }
+        );
+    }
+
     /// CR 107.1: bare-EQ regression — with neither prefix nor "or more" suffix
     /// the comparator is EQ. A-Nael shape, re-asserted through the deduped
     /// comparator computation.
@@ -15185,6 +15374,24 @@ mod tests {
             )
             .is_err(),
             "'fewer' without 'than ' is not a strict prefix; combinator must not claim it"
+        );
+    }
+
+    /// CR 107.1: `"there are at least"` without a numeral is not a GE threshold,
+    /// and mixed `"fewer than at least N"` is the same refuse arm as mixed
+    /// `"fewer than N or more"`.
+    #[test]
+    fn test_there_are_at_least_hostile_negatives() {
+        assert!(
+            parse_there_are_conditions("there are at least").is_err(),
+            "GE prefix without a numeral must not parse"
+        );
+        assert!(
+            parse_there_are_conditions(
+                "there are fewer than at least three cards in your graveyard"
+            )
+            .is_err(),
+            "mixed prefix + at-least GE must be refused"
         );
     }
 
@@ -15339,6 +15546,59 @@ mod tests {
                 rhs: QuantityExpr::Fixed { value: 3 },
             }
         );
+    }
+
+    /// CR 205.1 + CR 205.3m + CR 109.2a + CR 404.1: juxtaposed subtype + core
+    /// type ("Zombie creature cards") is admitted as an AND Typed filter, not
+    /// OR `card_types`. GE (`or more` / `at least`) and EQ share the noun path.
+    #[test]
+    fn test_there_are_juxtaposed_subtype_core_cards_in_graveyard() {
+        let expected_qty = QuantityRef::ZoneCardCount {
+            zone: ZoneRef::Graveyard,
+            card_types: Vec::new(),
+            filter: Some(TargetFilter::Typed(TypedFilter {
+                type_filters: vec![
+                    TypeFilter::Creature,
+                    TypeFilter::Subtype("Zombie".to_string()),
+                ],
+                controller: None,
+                properties: vec![],
+            })),
+            scope: CountScope::Controller,
+        };
+        let cases = [
+            (
+                "there are three or more Zombie creature cards in your graveyard",
+                Comparator::GE,
+                3,
+            ),
+            (
+                "there are at least three Zombie creature cards in your graveyard",
+                Comparator::GE,
+                3,
+            ),
+            (
+                "there are three Zombie creature cards in your graveyard",
+                Comparator::EQ,
+                3,
+            ),
+        ];
+        for (text, comparator, threshold) in cases {
+            let (rest, condition) = parse_inner_condition(text)
+                .unwrap_or_else(|error| panic!("must parse {text:?}: {error:?}"));
+            assert_eq!(rest, "", "unconsumed remainder for {text:?}");
+            assert_eq!(
+                condition,
+                StaticCondition::QuantityComparison {
+                    lhs: QuantityExpr::Ref {
+                        qty: expected_qty.clone(),
+                    },
+                    comparator,
+                    rhs: QuantityExpr::Fixed { value: threshold },
+                },
+                "exact AST for {text:?}",
+            );
+        }
     }
 
     #[test]
@@ -19650,12 +19910,12 @@ mod tests {
         );
     }
 
-    /// Regression for the coverage-honesty flip (#3084): the bare pronoun "it"
-    /// in an intervening-"if" trigger condition (Ayara's Oathsworn — "whenever ~
-    /// attacks, if it has three or more +1/+1 counters on it, …") is
-    /// source-referential. It must stay `HasCounters` (evaluated against the
-    /// triggering source), not `RecipientHasCounters`, which has no recipient at
-    /// trigger-evaluation time and is silently swallowed by the coverage gate.
+    /// Generic "N or more" sibling: the bare pronoun "it" in an intervening-"if"
+    /// trigger condition is source-referential. It must stay `HasCounters`
+    /// (evaluated against the triggering source), not `RecipientHasCounters`,
+    /// which has no recipient at trigger-evaluation time and is silently
+    /// swallowed by the coverage gate. Ayara's printed Oracle is "fewer than
+    /// four" — see `has_counters_fewer_than_four_pronoun_is_source`.
     #[test]
     fn parse_inner_condition_it_has_counters_is_source_referential() {
         let (rest, c) = parse_inner_condition("it has three or more +1/+1 counters on it").unwrap();
@@ -19941,6 +20201,130 @@ mod tests {
                 maximum: Some(2),
             }
         );
+    }
+
+    /// CR 107.1 + CR 122.1: "fewer than three" is the strict-LT integer band
+    /// {0,1,2}, encoded `(0, Some(2))` — the same AST as inclusive "two or fewer".
+    #[test]
+    fn has_counters_fewer_than_three_plus1() {
+        let expected = StaticCondition::HasCounters {
+            counters: CounterMatch::OfType(CounterType::Plus1Plus1),
+            minimum: 0,
+            maximum: Some(2),
+        };
+        for text in [
+            "~ has fewer than three +1/+1 counters on it",
+            "this creature has fewer than three +1/+1 counters on it",
+        ] {
+            let (rest, cond) = parse_source_has_counters(text)
+                .unwrap_or_else(|e| panic!("failed to parse {text:?}: {e:?}"));
+            assert_eq!(rest, "", "unconsumed remainder for {text:?}");
+            assert_eq!(cond, expected, "wrong condition for {text:?}");
+        }
+
+        let (_, or_fewer) = parse_source_has_counters("~ has two or fewer +1/+1 counters on it")
+            .expect("two or fewer sibling must still parse");
+        assert_eq!(or_fewer, expected);
+    }
+
+    /// Ayara's Oathsworn: intervening-if "if it has fewer than four +1/+1
+    /// counters on it" is source-referential `HasCounters`, not
+    /// `RecipientHasCounters`.
+    #[test]
+    fn has_counters_fewer_than_four_pronoun_is_source() {
+        let expected = StaticCondition::HasCounters {
+            counters: CounterMatch::OfType(CounterType::Plus1Plus1),
+            minimum: 0,
+            maximum: Some(3),
+        };
+        let (rest, inner) =
+            parse_inner_condition("it has fewer than four +1/+1 counters on it").unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(inner, expected);
+
+        let (rest, source) =
+            parse_source_has_counters("it has fewer than four +1/+1 counters on it").unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(source, expected);
+        assert!(
+            !matches!(inner, StaticCondition::RecipientHasCounters { .. }),
+            "source-referential `it` must not lower to RecipientHasCounters"
+        );
+    }
+
+    /// Adaptive Training Post: charge-counter type axis with the same LT bounds.
+    #[test]
+    fn has_counters_fewer_than_three_charge() {
+        let (rest, cond) =
+            parse_source_has_counters("this artifact has fewer than three charge counters on it")
+                .expect("ATP charge fewer-than form must parse");
+        assert_eq!(rest, "");
+        assert_eq!(
+            cond,
+            StaticCondition::HasCounters {
+                counters: CounterMatch::OfType(CounterType::Generic("charge".to_string())),
+                minimum: 0,
+                maximum: Some(2),
+            }
+        );
+    }
+
+    /// CR 107.1: "more than two" is the paired GT prefix → `(3, None)`, equal
+    /// to inclusive "three or more".
+    #[test]
+    fn has_counters_more_than_two_plus1() {
+        let expected = StaticCondition::HasCounters {
+            counters: CounterMatch::OfType(CounterType::Plus1Plus1),
+            minimum: 3,
+            maximum: None,
+        };
+        let (rest, more) =
+            parse_source_has_counters("~ has more than two +1/+1 counters on it").unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(more, expected);
+
+        let (_, or_more) = parse_source_has_counters("~ has three or more +1/+1 counters on it")
+            .expect("three or more sibling must still parse");
+        assert_eq!(or_more, expected);
+    }
+
+    /// Mixed "fewer than N or more" is not English and must fail rather than
+    /// swallow "or more +1/+1" as a Generic counter type. Reach-guard: the
+    /// unmixed fewer-than form is Ok.
+    #[test]
+    fn has_counters_fewer_than_mixed_or_more_is_err() {
+        let (rest, ok) = parse_source_has_counters("~ has fewer than three +1/+1 counters on it")
+            .expect("unmixed fewer-than form is the reach-guard");
+        assert_eq!(rest, "");
+        assert!(matches!(
+            ok,
+            StaticCondition::HasCounters {
+                minimum: 0,
+                maximum: Some(2),
+                ..
+            }
+        ));
+
+        assert!(
+            parse_source_has_counters("~ has fewer than three or more +1/+1 counters on it")
+                .is_err(),
+            "mixed fewer-than N or more must fail"
+        );
+
+        // CR 107.1: "fewer than 0" is not an English integer band.
+        assert!(parse_source_has_counters("~ has fewer than 0 +1/+1 counters on it").is_err());
+
+        // Sibling: "exactly three" is unchanged EQ.
+        let (_, exact) = parse_source_has_counters("~ has exactly three +1/+1 counters on it")
+            .expect("exactly N sibling must still parse");
+        assert!(matches!(
+            exact,
+            StaticCondition::HasCounters {
+                minimum: 3,
+                maximum: Some(3),
+                ..
+            }
+        ));
     }
 
     /// "no" variant — zero counters (min 0, max 0).
@@ -21900,6 +22284,37 @@ mod tests {
             StaticCondition::HasCounters {
                 counters: CounterMatch::Any,
                 minimum: 1,
+                maximum: None,
+            }
+        );
+    }
+
+    /// Same quantity axis: existential "there are fewer than N [type] counters
+    /// on ~" shares the LT encoding. Reach-guard: Mazemind "four or more" still
+    /// `(4, None)`.
+    #[test]
+    fn parse_source_counters_exist_fewer_than() {
+        let (rest, cond) =
+            parse_source_counters_exist("there are fewer than three charge counters on ~")
+                .expect("existential fewer-than form must parse");
+        assert_eq!(rest, "");
+        assert_eq!(
+            cond,
+            StaticCondition::HasCounters {
+                counters: CounterMatch::OfType(CounterType::Generic("charge".to_string())),
+                minimum: 0,
+                maximum: Some(2),
+            }
+        );
+
+        let (_, mazemind) =
+            parse_source_counters_exist("there are four or more page counters on ~")
+                .expect("Mazemind four-or-more reach-guard must still parse");
+        assert_eq!(
+            mazemind,
+            StaticCondition::HasCounters {
+                counters: CounterMatch::OfType(CounterType::Generic("page".to_string())),
+                minimum: 4,
                 maximum: None,
             }
         );

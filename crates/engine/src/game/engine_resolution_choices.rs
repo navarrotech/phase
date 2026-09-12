@@ -4364,6 +4364,7 @@ pub(super) fn handle_resolution_choice(
                     ));
                 }
             }
+
             // CR 608.2c: Enforce the printed-text selection restriction at the
             // submission boundary so the AI candidate filter and the engine
             // resolver agree on legality.
@@ -4654,12 +4655,24 @@ pub(super) fn handle_resolution_choice(
                                         .to_string(),
                                 )
                             })?;
-                        chosen_ids.push(effects::search_outside_game::put_outside_game_face_into(
+                        // CR 407.3: the offer already excluded the ante class,
+                        // so a refusal here means the selection named a card
+                        // that was never selectable — an invalid action, not a
+                        // silently dropped card.
+                        let object_id = effects::search_outside_game::put_outside_game_face_into(
                             state,
                             player,
                             &card,
                             destination,
-                        ));
+                        )
+                        .ok_or_else(|| {
+                            EngineError::InvalidAction(format!(
+                                "{} can't be brought into the game from outside the game while \
+                                 not playing for ante (CR 407.3)",
+                                card.name
+                            ))
+                        })?;
+                        chosen_ids.push(object_id);
                     }
                     OutsideGameSelection::FaceUpExile { object_id } => {
                         match effects::search_outside_game::put_face_up_exile_into(
@@ -5545,6 +5558,36 @@ pub(super) fn handle_resolution_choice(
                         "Selected card is no longer in {:?}",
                         zone
                     )));
+                }
+            }
+
+            // CR 701.24c-e + CR 400.3: once the choice is validated, publish
+            // its prospective owner population before any selected member enters
+            // the replacement pipeline. The prompt seam already retained an
+            // empty typed participant when necessary; this extends that set.
+            if matches!(effect_kind, EffectKind::ChangeZone) {
+                if let Some(continuation) = state
+                    .active_ability_continuation()
+                    .map(|continuation| (*continuation.chain).clone())
+                {
+                    if matches!(
+                        effects::tracked_set_publication_mode(&continuation),
+                        effects::TrackedSetPublicationMode::Prospective { .. }
+                    ) {
+                        let participants = effects::prospective_subject_participants(
+                            state,
+                            &continuation,
+                            &chosen,
+                        );
+                        effects::publish_tracked_set_for_resolution(
+                            state,
+                            &continuation,
+                            effects::TrackedSetPublicationInput::FinalizedSubjects {
+                                objects: &chosen,
+                                participants: &participants,
+                            },
+                        );
+                    }
                 }
             }
 
@@ -7881,6 +7924,27 @@ fn publish_effect_zone_choice_tracked_set(
     ) || state.active_ability_continuation().is_none()
     {
         return;
+    }
+    let active_continuation = state
+        .active_ability_continuation()
+        .map(|continuation| (*continuation.chain).clone());
+    if let Some(continuation) = active_continuation {
+        if matches!(
+            effects::tracked_set_publication_mode(&continuation),
+            effects::TrackedSetPublicationMode::Prospective { .. }
+        ) {
+            let participants =
+                effects::prospective_subject_participants(state, &continuation, chosen);
+            effects::publish_tracked_set_for_resolution(
+                state,
+                &continuation,
+                effects::TrackedSetPublicationInput::FinalizedSubjects {
+                    objects: chosen,
+                    participants: &participants,
+                },
+            );
+            return;
+        }
     }
     // Distinguish mid-pause "nothing to publish yet" from a genuine empty
     // narrowed set (PutAtLibraryPosition Bottom). The latter must still rebind

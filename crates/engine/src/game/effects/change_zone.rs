@@ -565,6 +565,22 @@ fn append_effect_resolved_after_counter_pause(
     );
 }
 
+fn publish_finalized_owner_library_subjects(
+    state: &mut GameState,
+    ability: &ResolvedAbility,
+    objects: &[ObjectId],
+) {
+    let participants = super::prospective_subject_participants(state, ability, objects);
+    super::publish_tracked_set_for_resolution(
+        state,
+        ability,
+        super::TrackedSetPublicationInput::FinalizedSubjects {
+            objects,
+            participants: &participants,
+        },
+    );
+}
+
 /// CR 614.12a + CR 614.13a: capture the battlefield immediately before a
 /// known single Devour entry. Both deterministic single-entry paths call this
 /// before `move_to_zone`, so the entrant cannot appear in its own sacrifice
@@ -774,13 +790,31 @@ pub fn resolve(
     let track_exiled_by_source =
         crate::game::exile_links::should_track_exiled_by_source(state, ability.source_id, ability);
 
+    // CR 608.2c + CR 609.3 (issue #8798): the immediate parent handed this
+    // "that card" move nothing to act on (an ExileTop/Dig on an empty library,
+    // an empty ChooseFromZone or reveal-choice). Resolve as a no-op here,
+    // before `resolved_targets`, whose unresolved-`ParentTarget` fallback would
+    // otherwise bind the ability's own source — an empty-library Tainted Pact
+    // would put itself into its controller's hand.
+    if matches!(target_filter, TargetFilter::ParentTarget)
+        && ability.parent_target_missing_reason.is_some()
+    {
+        events.push(GameEvent::EffectResolved {
+            kind: EffectKind::from(&ability.effect),
+            source_id: ability.source_id,
+            subject: None,
+        });
+        return Ok(completed_result(0));
+    }
+
     // CR 608.2c + 603.10a: Resolve the subject across self-ref → event-context →
     // chosen-targets, the unified 3-tier dispatch shared by zone-change-style
     // effects whose subject can be the source itself, an event-context
     // referent, or a pre-selected target. See `targeting::resolved_targets`.
-    let effective_targets = crate::game::targeting::resolved_targets(ability, target_filter, state);
+    // CR 608.2b: a `ParentTargetSlot` whose target was illegal as the ability
+    // resolved moves nothing (Goblin Welder's graveyard artifact card).
     let targeted_objects =
-        crate::game::effects::effect_object_targets(target_filter, &effective_targets);
+        crate::game::effects::resolved_effect_object_ids(state, ability, target_filter);
     // CR 730.3c: when this effect references the object that just left the
     // battlefield (a flicker/blink's "return it") and that object was a merged
     // permanent's survivor, act on the component cards it split into as well, so
@@ -804,6 +838,13 @@ pub fn resolve(
     } else {
         targeted_objects
     };
+
+    if !targeted_objects.is_empty() {
+        // CR 701.24c-e + CR 400.3: freeze the prospective owner population
+        // after target legality is known and before any replacement can redirect
+        // a member away from the library.
+        publish_finalized_owner_library_subjects(state, ability, &targeted_objects);
+    }
 
     if targeted_objects.is_empty() {
         // CR 115.6: "Up to one target" — if the player chose zero targets during
@@ -848,12 +889,28 @@ pub fn resolve(
         // that scan inert for ParentTarget today; this guard does not rely on
         // that distant `_ => false` arm.
         //
-        // Emits EffectResolved first, exactly as the three sibling guards in
-        // this block do (CR 115.6 optional targeting, CR 400.7 SelfRef,
-        // CR 701.23b fail-to-find): the trigger DID fire and DID resolve
+        // Emits EffectResolved first, exactly as the sibling guards in this
+        // block do (CR 115.6 optional targeting, CR 400.7 SelfRef, CR 608.2b
+        // slot, CR 701.23b fail-to-find): the trigger DID fire and DID resolve
         // (CR 603.7b) — it simply affected nothing, and the game log / event
         // observers / chain machinery must see that.
         if ability.pinned_object_targets_all_stale(state) {
+            events.push(GameEvent::EffectResolved {
+                kind: EffectKind::from(&ability.effect),
+                source_id: ability.source_id,
+                subject: None,
+            });
+            return Ok(completed_result(0));
+        }
+
+        // CR 608.2b: "Illegal targets, if any, won't be affected by parts of a
+        // resolving spell's effect for which they're illegal." A slot anaphor
+        // names one declared target, never a zone population, so an empty slot
+        // (its target illegal as the ability resolved, or its pinned referent
+        // gone) moves nothing. Return before the untargeted zone scan below,
+        // which would otherwise find nothing only through `filter.rs`'s slot
+        // arm and would set `cost_payment_failed_flag` on the way out.
+        if matches!(target_filter, TargetFilter::ParentTargetSlot { .. }) {
             events.push(GameEvent::EffectResolved {
                 kind: EffectKind::from(&ability.effect),
                 source_id: ability.source_id,
@@ -936,6 +993,9 @@ pub fn resolve(
             &scan_zones,
             dest_zone,
         );
+        // CR 701.24d-e: retain an explicitly designated typed player even when
+        // the source zone supplies zero eligible cards.
+        publish_finalized_owner_library_subjects(state, ability, &[]);
 
         let (choice_count, min_count, choice_up_to) =
             resolution_choice_cardinality(state, ability, eligible.len(), up_to);
@@ -972,6 +1032,7 @@ pub fn resolve(
         {
             let index = state.rng.random_range(0..eligible.len());
             let chosen = eligible[index];
+            publish_finalized_owner_library_subjects(state, ability, &[chosen]);
             capture_devour_snapshot_before_single_entry(state, chosen, dest_zone);
             let per_obj_enter_counters = enter_with_counters_for_object(
                 state,
@@ -1057,6 +1118,7 @@ pub fn resolve(
 
         if eligible.len() == 1 && !choice_up_to && choice_count == 1 {
             let chosen = eligible[0];
+            publish_finalized_owner_library_subjects(state, ability, &[chosen]);
             capture_devour_snapshot_before_single_entry(state, chosen, dest_zone);
             let per_obj_enter_counters = enter_with_counters_for_object(
                 state,
@@ -2063,11 +2125,17 @@ pub fn resolve_all(
         matching
     };
 
+    // CR 701.24c-e + CR 400.3: a mass owner-library shuffle publishes the full
+    // matched population, including typed empty-set participants, before order
+    // choices or the first zone-change replacement can run.
+    publish_finalized_owner_library_subjects(state, ability, &matching);
+
     // Clean up consumed tracked set after scanning.
     if let TargetFilter::TrackedSet { id } = &effective_filter {
         state.tracked_object_sets.remove(id);
         // CR 608.2c: drop the consumed set's member-cause provenance in lockstep.
         state.tracked_set_member_causes.remove(id);
+        state.tracked_set_participants.remove(id);
     }
 
     // CR 614.12a + CR 614.13a: when a mass entry brings in one or more devourers
@@ -2422,8 +2490,9 @@ mod tests {
     use crate::game::engine::apply_as_current;
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        ControllerRef, FilterProp, MultiTargetSpec, PlayerFilter, PtValue, QuantityExpr,
-        QuantityRef, StaticDefinition, TargetChoiceTiming, TargetFilter, TargetRef, TypeFilter,
+        AbilityDefinition, AbilityKind, ControllerRef, FilterProp, MultiTargetSpec, PlayerFilter,
+        PtValue, QuantityExpr, QuantityRef, ReplacementDefinition, ReplacementMode,
+        StaticDefinition, TargetChoiceTiming, TargetFilter, TargetRef, ThisWayCause, TypeFilter,
         TypedFilter,
     };
     use crate::types::actions::GameAction;
@@ -2434,6 +2503,7 @@ mod tests {
     use crate::types::identifiers::{CardId, ObjectId, TrackedSetId};
     use crate::types::keywords::Keyword;
     use crate::types::player::PlayerId;
+    use crate::types::replacements::ReplacementEvent;
     use crate::types::statics::{ProhibitionScope, StaticMode};
     use std::sync::Arc;
 
@@ -9582,6 +9652,174 @@ mod tests {
                 }
             )),
             "CantShuffle suppresses the terminal Shuffle and the paused member moves"
+        );
+    }
+
+    /// CR 614.12 + CR 701.24a: A parser-produced owner shuffle publishes its
+    /// complete owner population before the first replacement pause and keeps
+    /// that same ledger through every resumed member. The terminal shuffle then
+    /// runs once for the designated owner after both moves complete.
+    #[test]
+    fn prospective_owner_shuffle_survives_repeated_replacement_pauses() {
+        let mut state = GameState::new_two_player(42);
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        let first = create_object(
+            &mut state,
+            CardId(9_601),
+            PlayerId(0),
+            "First owned permanent".to_string(),
+            Zone::Battlefield,
+        );
+        let second = create_object(
+            &mut state,
+            CardId(9_602),
+            PlayerId(0),
+            "Second owned permanent".to_string(),
+            Zone::Battlefield,
+        );
+        for id in [first, second] {
+            state
+                .objects
+                .get_mut(&id)
+                .expect("owned permanent exists")
+                .card_types
+                .core_types
+                .push(CoreType::Creature);
+        }
+        let replacement_source = create_object(
+            &mut state,
+            CardId(9_603),
+            PlayerId(1),
+            "Optional library redirect".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&replacement_source)
+            .expect("replacement source exists")
+            .replacement_definitions
+            .push(
+                ReplacementDefinition::new(ReplacementEvent::Moved)
+                    .mode(ReplacementMode::Optional { decline: None })
+                    .execute(AbilityDefinition::new(
+                        AbilityKind::Spell,
+                        Effect::ChangeZone {
+                            origin: None,
+                            destination: Zone::Exile,
+                            target: TargetFilter::Any,
+                            owner_library: false,
+                            enter_transformed: false,
+                            enters_under: None,
+                            enter_tapped: EtbTapState::Unspecified,
+                            enters_attacking: false,
+                            up_to: false,
+                            enter_with_counters: vec![],
+                            conditional_enter_with_counters: vec![],
+                            face_down_profile: None,
+                            enters_modified_if: None,
+                        },
+                    ))
+                    .destination_zone(Zone::Library),
+            );
+
+        let definition = crate::parser::oracle_effect::parse_effect_chain(
+            "Shuffle all permanents you own into your library.",
+            AbilityKind::Spell,
+        );
+        assert!(matches!(
+            definition.effect.as_ref(),
+            Effect::ChangeZoneAll {
+                library_shuffle: MassLibraryShuffleMode::TerminalShuffle,
+                ..
+            }
+        ));
+        let ability = crate::game::ability_utils::build_resolved_from_def(
+            &definition,
+            ObjectId(9_600),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        super::super::resolve_ability_chain(&mut state, &ability, &mut events, 0)
+            .expect("owner shuffle reaches its first replacement pause");
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ));
+        let set_id = state
+            .chain_tracked_set_id
+            .expect("prospective publication establishes a tracked set");
+        assert_eq!(
+            state.tracked_object_sets.get(&set_id),
+            Some(&vec![first, second])
+        );
+        assert_eq!(
+            state.tracked_set_participants.get(&set_id),
+            Some(&vec![(
+                PlayerId(0),
+                ThisWayCause::OwnerLibraryShuffleSubject
+            )])
+        );
+
+        let first_resume = apply_as_current(&mut state, GameAction::ChooseReplacement { index: 1 })
+            .expect("decline first redirect");
+        events.extend(first_resume.events);
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ));
+        assert_eq!(state.chain_tracked_set_id, Some(set_id));
+        assert!(state.tracked_set_participants.get(&set_id).is_some_and(
+            |ledger| ledger.contains(&(PlayerId(0), ThisWayCause::OwnerLibraryShuffleSubject))
+        ));
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                GameEvent::PlayerPerformedAction {
+                    action: crate::types::events::PlayerActionKind::ShuffledLibrary,
+                    ..
+                }
+            )),
+            "the first resumed member must retain terminal-shuffle suppression"
+        );
+
+        let second_resume =
+            apply_as_current(&mut state, GameAction::ChooseReplacement { index: 1 })
+                .expect("decline second redirect");
+        events.extend(second_resume.events);
+        assert_eq!(state.objects[&first].zone, Zone::Library);
+        assert_eq!(state.objects[&second].zone, Zone::Library);
+        let shuffle_instructions = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    GameEvent::EffectResolved {
+                        kind: EffectKind::Shuffle,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            shuffle_instructions, 1,
+            "the resumed chain must execute exactly one terminal Shuffle instruction"
+        );
+        let shuffled_players: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                GameEvent::PlayerPerformedAction {
+                    player_id,
+                    action: crate::types::events::PlayerActionKind::ShuffledLibrary,
+                    ..
+                } => Some(*player_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shuffled_players,
+            vec![PlayerId(0)],
+            "the two resumed members must not auto-shuffle before the one terminal shuffle"
         );
     }
 

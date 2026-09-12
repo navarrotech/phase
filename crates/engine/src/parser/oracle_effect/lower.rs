@@ -3318,11 +3318,14 @@ pub(super) fn relink_gated_token_referent_consumers(defs: &mut [AbilityDefinitio
         else {
             continue;
         };
-        if !defs[publisher]
-            .condition
-            .as_ref()
-            .is_some_and(AbilityCondition::is_affirmative_reflexive_gate)
-        {
+        // CR 603.12 + CR 603.4 + CR 609.3: a root `WhenYouDo` marker identifies
+        // the separately-created reflexive trigger even when its flat `And`
+        // also carries an intervening-if guard; a referent consumer stays
+        // inside that trigger so it cannot read a stale created object when the
+        // guarded publisher did nothing.
+        if !defs[publisher].condition.as_ref().is_some_and(|condition| {
+            condition.has_when_you_do_marker() || condition.is_affirmative_reflexive_gate()
+        }) {
             continue;
         }
         if !gated_instruction_reaches(&defs[publisher..i]) {
@@ -3586,11 +3589,13 @@ pub(super) fn clone_would_transplant_gated_referent(
     else {
         return false;
     };
-    if !defs[publisher]
-        .condition
-        .as_ref()
-        .is_some_and(AbilityCondition::is_affirmative_reflexive_gate)
-    {
+    // CR 603.12 + CR 603.4 + CR 609.3: use the same guarded-reflexive
+    // classification as the production re-link pass before deciding whether a
+    // clone would move a referent consumer outside the trigger that created it
+    // and let it act on a stale created object.
+    if !defs[publisher].condition.as_ref().is_some_and(|condition| {
+        condition.has_when_you_do_marker() || condition.is_affirmative_reflexive_gate()
+    }) {
         return false;
     }
     let mut probe = defs.to_vec();
@@ -4780,20 +4785,21 @@ pub(crate) fn target_filter_is_single_object_target(filter: &TargetFilter) -> bo
 /// they aren't in `MULTI_TARGET_VERBS` (e.g. "put", "gain control of") — a
 /// `MULTI_TARGET_VERBS` verb like "exile" takes its min from
 /// `stripped_multi_target` upstream and never reaches this function. Scans at
-/// word boundaries for an "up to N target …" quantifier anywhere in the
-/// clause, not just immediately after the verb, so one detector covers every
-/// non-`MULTI_TARGET_VERBS` verb instead of each needing its own hardcoded
-/// prefix (the prior version only recognized "gain control of "). This does
-/// NOT recognize "any number of target …" — that arm lives in
-/// `strip_leading_quantifier`, which this function doesn't call; no card in
-/// the per-opponent-fanout class currently uses that form. Reusing
+/// word boundaries for an "up to N target …" / "any number of target …"
+/// quantifier anywhere in the clause, not just immediately after the verb, so
+/// one detector covers every non-`MULTI_TARGET_VERBS` verb instead of each
+/// needing its own hardcoded prefix (the prior version only recognized
+/// "gain control of "). When the article guard fires, "any number of
+/// [other|another] target …" is min 0 (CR 107.1c). Reusing
 /// `strip_optional_target_prefix` (rather than the bare `strip_leading_quantifier`
 /// used by `MULTI_TARGET_VERBS`) is the safety property this relies on: it only
 /// accepts a quantifier immediately followed by "target "/"other target "/
 /// "another target ", so it can't misfire on a resource-count quantifier that
 /// happens to precede the object noun (e.g. "put up to three +1/+1 counters on
 /// target creature" — the quantity there modifies the counters, not the
-/// target, and the "target " guard declines it).
+/// target, and the "target " guard declines it). The article guard — not
+/// "we don't recognize any number of" — is what keeps resource-count phrases
+/// from becoming optional target slots.
 fn per_opponent_target_fanout_min(text: &str) -> usize {
     let lower = text.to_ascii_lowercase();
     let found_optional_target_slot =
@@ -6090,35 +6096,45 @@ fn strip_performed_action_this_way_clause(
     ))
 }
 
+/// CR 607.2a + CR 108.3: The linked-exile owner subject — "the exiled card's
+/// owner", "the exiled cards' owners", "the owner of each card exiled with
+/// <source>" — naming the owner of each card the source's linked exile ability
+/// exiled. Consumes the trailing space, leaving the verb (or modal `may `).
+///
+/// Single authority for the subject grammar: the mandatory route
+/// (`strip_linked_exile_owner_subject`, Skyclave Apparition) and the optional
+/// route (`clause_shell::try_peel_opponent_may_prefix`, Spell Queller) both
+/// compose it, so the two cannot drift apart.
+pub(crate) fn parse_linked_exile_owner_subject(i: &str) -> OracleResult<'_, PlayerFilter> {
+    alt((
+        value(
+            PlayerFilter::OwnersOfCardsExiledBySource,
+            tag("the exiled card's owner "),
+        ),
+        value(
+            PlayerFilter::OwnersOfCardsExiledBySource,
+            tag("the exiled cards' owners "),
+        ),
+        // CR 406.2 + CR 610.3: "the owner of each card exiled with <source> "
+        // — the source-linked exile cleanup subject (Trial of a Time Lord IV:
+        // "the owner of each card exiled with ~ puts that card on the bottom
+        // of their library"). The self-ref token is `~` after normalization,
+        // or the literal "this saga" pre-normalization; compose the prefix
+        // with the source token rather than verbatim-matching the card name.
+        value(
+            PlayerFilter::OwnersOfCardsExiledBySource,
+            preceded(
+                tag("the owner of each card exiled with "),
+                (alt((tag("~"), tag("this saga"))), tag(" ")),
+            ),
+        ),
+    ))
+    .parse(i)
+}
+
 fn strip_linked_exile_owner_subject(text: &str) -> (Option<PlayerFilter>, String) {
     let lower = text.to_lowercase();
-    let scope_rest = nom_on_lower(text, &lower, |i| {
-        alt((
-            value(
-                PlayerFilter::OwnersOfCardsExiledBySource,
-                tag::<_, _, OracleError<'_>>("the exiled card's owner "),
-            ),
-            value(
-                PlayerFilter::OwnersOfCardsExiledBySource,
-                tag("the exiled cards' owners "),
-            ),
-            // CR 406.2 + CR 610.3: "the owner of each card exiled with <source> "
-            // — the source-linked exile cleanup subject (Trial of a Time Lord IV:
-            // "the owner of each card exiled with ~ puts that card on the bottom
-            // of their library"). The self-ref token is `~` after normalization,
-            // or the literal "this saga" pre-normalization; compose the prefix
-            // with the source token rather than verbatim-matching the card name.
-            value(
-                PlayerFilter::OwnersOfCardsExiledBySource,
-                preceded(
-                    tag("the owner of each card exiled with "),
-                    (alt((tag("~"), tag("this saga"))), tag(" ")),
-                ),
-            ),
-        ))
-        .parse(i)
-    });
-    let Some((scope, rest)) = scope_rest else {
+    let Some((scope, rest)) = nom_on_lower(text, &lower, parse_linked_exile_owner_subject) else {
         return (None, text.to_string());
     };
 
@@ -6770,6 +6786,98 @@ pub(super) fn strip_temporal_suffix(text: &str) -> (&str, Option<DelayedTriggerC
     (text, None)
 }
 
+/// CR 603.7 (issue #8721): the cast-permission back-reference gate — "if you cast
+/// a spell this way, …" / "when you cast that spell, …".
+///
+/// CR 608.2g is the CONTRAST rule here, not an authority for this lowering, and
+/// an earlier version of this header cited it as though it were: 608.2g governs
+/// an effect that "specifically instructs or allows a player to cast a spell
+/// during resolution", which is precisely what this class is NOT. If a member of
+/// it ever lowered to that shape, the delayed trigger would be created after its
+/// own event and never fire (CR 603.7a).
+///
+/// The consequent is gated on a cast that HAS NOT HAPPENED when the granting
+/// ability resolves: in every case measured over the full-corpus parse dump the
+/// permission outlives the granting resolution (the default
+/// `CastFromZoneDriver::LingeringPermission`, which the dump shows as an absent
+/// `driver` key), so the granted spell is cast later under priority rather than
+/// inside it. So the consequent is a delayed
+/// triggered ability keyed to that later cast, and lowering it as a sequential
+/// instruction of this resolution applies it unconditionally (issue #8721).
+///
+/// Deliberately stated about the PERMISSION, not about one effect variant. The
+/// recognizer itself checks only the two wordings — it does not verify that a
+/// permission is present; the call site's two EXCLUSIONS do the deciding: one
+/// asks the parsed consequent what it is, the other asks whether the chain
+/// declared an object referent at all.
+///
+/// `valid_card: ParentTarget` is what scopes it to THAT spell: at delayed-trigger
+/// creation `bind_contextual_filter_to_condition` rewrites it through
+/// `concrete_parent_target_filter` to the granting ability's chosen target.
+/// (NOT `parent_target_snapshot` — `condition_uses_creation_time_provenance`
+/// returns false for `WhenNextEvent`, so that path never runs here.)
+///
+/// It FAILS OPEN, and that is why the call site declines a chain with no declared
+/// object referent: with no object target, `parent_targets_filter` returns
+/// `TargetFilter::Any`, `delayed_trigger::resolve`'s over-fire guard then refuses
+/// installation, and the consequent is LOST rather than re-timed. Measured, one
+/// corpus card is that shape (Discord, Lord of Disharmony) and it is left
+/// unchanged; see the decline at the call site in `oracle_effect::mod`.
+///
+/// `ThisTurn` rather than `Reflexive` for exactly that reason: CR 603.12 has a
+/// reflexive ability "checked immediately after being created" and triggering on
+/// whether its event occurred EARLIER DURING THE RESOLUTION that created it —
+/// precisely the window in which this cast cannot occur. (Not "one shot":
+/// CR 603.12a triggers it once per occurrence.)
+///
+/// And `ThisTurn` rather than a persistent lifetime, which is the other question
+/// a hard-coded lifetime invites: MEASURED, the permission itself expires at
+/// cleanup. `cast_from_zone::record_lingering_permissions` caps an in-place
+/// graveyard grant with `duration: None` at `UntilEndOfTurn` (`granted_duration`'s
+/// `None => in_place.then_some(...)` arm), and both cards this recognizer changes
+/// carry `duration: None`. A longer-lived trigger could never fire, because the
+/// cast it waits for can no longer happen.
+///
+/// Two prefixes, not three: `"if you cast it this way, "` has ZERO corpus
+/// members (26 cards print `"if you cast a spell this way, "`, 7 print
+/// `"when you cast that spell, "`), so it is not carried here on the strength of
+/// a sibling recognizer that happens to list it.
+///
+/// EXCLUSION BY DELEGATION, not by a hand-typed list: the enters-with-counter
+/// rider peels the SAME prefix and is owned by
+/// `parse_cast_this_way_enters_with_counter`, which lowers it to `CastFromZone`
+/// permission metadata instead. Ask that authority rather than
+/// re-deciding its grammar here.
+pub(crate) fn strip_cast_this_way_gate(text: &str) -> Option<(&str, DelayedTriggerCondition)> {
+    let lower = text.to_lowercase();
+    if crate::parser::oracle_effect::parse_cast_this_way_enters_with_counter(&lower).is_some() {
+        return None;
+    }
+    let (_, rest) = nom_on_lower(text, &lower, |i| {
+        value(
+            (),
+            alt((
+                tag::<_, _, OracleError<'_>>("if you cast a spell this way, "),
+                tag("when you cast that spell, "),
+            )),
+        )
+        .parse(i)
+    })?;
+    let trigger = crate::types::ability::TriggerDefinition::new(
+        crate::types::triggers::TriggerMode::SpellCast,
+    )
+    .valid_target(TargetFilter::Controller)
+    .valid_card(TargetFilter::ParentTarget);
+    Some((
+        rest,
+        DelayedTriggerCondition::WhenNextEvent {
+            trigger: Box::new(trigger),
+            or_trigger: None,
+            lifetime: crate::types::ability::DelayedTriggerLifetime::ThisTurn,
+        },
+    ))
+}
+
 /// CR 603.7a: Strip temporal prefix indicating a delayed trigger condition.
 /// Symmetric to `strip_temporal_suffix` but handles prefix form:
 /// "At the beginning of the next end step, untap up to two lands."
@@ -7106,10 +7214,11 @@ pub(super) fn extract_deal_damage_multi_target(text: &str) -> Option<MultiTarget
 
 /// CR 115.1d + CR 613.4d: Recover the `MultiTargetSpec` for the prepositional
 /// SwitchPT form ("switch the power and toughness of <subject>"). The
-/// imperative parser strips "each of" and "any number of" so `parse_target`
-/// sees a bare target phrase; this helper rebuilds the spec from the original
-/// text. Mirrors `extract_double_counter_multi_target` — the only axis of
-/// variation is the verb prefix.
+/// imperative parser strips "each of" and the optional-target quantifier so
+/// `parse_target` sees a bare target phrase; this helper rebuilds the spec from
+/// the original text via `strip_optional_target_prefix` after the verb prefix
+/// and optional `each of`. Mirrors `extract_double_counter_multi_target` — the
+/// only axis of variation is the verb prefix.
 pub(super) fn extract_switch_pt_multi_target(text: &str) -> Option<MultiTargetSpec> {
     let lower = text.to_lowercase();
     let (_, target_text) = preceded(
@@ -7125,20 +7234,6 @@ pub(super) fn extract_switch_pt_multi_target(text: &str) -> Option<MultiTargetSp
         .parse(target_text)
         .map(|(rest, _)| rest)
         .unwrap_or(target_text);
-    if let Ok((after_any_number, _)) =
-        tag::<_, _, OracleError<'_>>("any number of ").parse(after_each_of)
-    {
-        if alt((
-            tag::<_, _, OracleError<'_>>("target "),
-            tag("other target "),
-            tag("another target "),
-        ))
-        .parse(after_any_number)
-        .is_ok()
-        {
-            return Some(MultiTargetSpec::unlimited(0));
-        }
-    }
     let (_, multi_target) = strip_optional_target_prefix(after_each_of);
     multi_target
 }
@@ -7170,20 +7265,6 @@ pub(super) fn extract_double_counter_multi_target(text: &str) -> Option<MultiTar
     )
     .parse(lower.as_str())
     .ok()?;
-    if let Ok((after_any_number, _)) =
-        tag::<_, _, OracleError<'_>>("any number of ").parse(target_text)
-    {
-        if alt((
-            tag::<_, _, OracleError<'_>>("target "),
-            tag("other target "),
-            tag("another target "),
-        ))
-        .parse(after_any_number)
-        .is_ok()
-        {
-            return Some(MultiTargetSpec::unlimited(0));
-        }
-    }
     let (_, multi_target) = strip_optional_target_prefix(target_text);
     multi_target
 }
@@ -7493,8 +7574,32 @@ fn strip_distribute_among_target_quantifier<'a>(
 /// Strip optional target-count prefixes before a targeted phrase.
 /// For spells, CR 115.1a + CR 115.6 + CR 601.2c: the caster announces
 /// zero through the stated maximum legal targets as the spell is cast.
+/// CR 115.1d + CR 603.3d: triggered abilities choose the same optional
+/// target set after they are put on the stack.
 pub(crate) fn strip_optional_target_prefix(text: &str) -> (&str, Option<MultiTargetSpec>) {
     let lower = text.to_ascii_lowercase();
+    fn followed_by_target_article(input: &str) -> bool {
+        alt((
+            tag::<_, _, OracleError<'_>>("target "),
+            tag("other target "),
+            tag("another target "),
+        ))
+        .parse(input)
+        .is_ok()
+    }
+
+    // CR 107.1c + CR 115.6: "any number of [other|another] target …" includes
+    // zero and is legal with no chosen targets. Prefix match without the
+    // article guard must not consume, and must not fall through to "up to".
+    if let Ok((remainder, _)) = tag::<_, _, OracleError<'_>>("any number of ").parse(lower.as_str())
+    {
+        if followed_by_target_article(remainder) {
+            let consumed = lower.len() - remainder.len();
+            return (&text[consumed..], Some(MultiTargetSpec::unlimited(0)));
+        }
+        return (text, None);
+    }
+
     let Ok((after_up_to, _)) = tag::<_, _, OracleError<'_>>("up to ").parse(lower.as_str()) else {
         return (text, None);
     };
@@ -7503,15 +7608,7 @@ pub(crate) fn strip_optional_target_prefix(text: &str) -> (&str, Option<MultiTar
     };
     let consumed = lower.len() - remainder.len();
     let rest = text[consumed..].trim_start();
-    let rest_lower = rest.to_ascii_lowercase();
-    if alt((
-        tag::<_, _, OracleError<'_>>("target "),
-        tag("other target "),
-        tag("another target "),
-    ))
-    .parse(rest_lower.as_str())
-    .is_err()
-    {
+    if !followed_by_target_article(&rest.to_ascii_lowercase()) {
         return (text, None);
     }
     (rest, Some(MultiTargetSpec::up_to(max)))
@@ -10523,6 +10620,7 @@ pub(super) fn apply_where_x_effect_expression(
     // representable. Recorded here and converted to a gap node after the match
     // (the arms hold a mutable borrow of `effect`'s fields).
     let mut unbound_where_x: Option<String> = None;
+    let mut unbound_prevention_where_x: Option<String> = None;
     match effect {
         Effect::DealDamage { amount, .. }
         | Effect::DamageAll { amount, .. }
@@ -10804,7 +10902,10 @@ pub(super) fn apply_where_x_effect_expression(
                     crate::types::ability::PreventionAmount::All
                         | crate::types::ability::PreventionAmount::AllBut(_)
                 ) {
-                    *amount_dynamic = parse_where_x_quantity_expression(expr);
+                    match parse_where_x_quantity_expression(expr) {
+                        Some(quantity) => *amount_dynamic = Some(quantity),
+                        None => unbound_prevention_where_x = Some(expr.to_string()),
+                    }
                 }
             }
         }
@@ -10897,6 +10998,14 @@ pub(super) fn apply_where_x_effect_expression(
     // clause DEFINED X and an unbound X survived the rewrite, report the gap. A control
     // with an escape hatch is not a control.
     //
+    if let Some(expression) = unbound_prevention_where_x {
+        *effect = Effect::unimplemented(
+            "prevent",
+            format!("prevent X of that damage, where X is {expression}"),
+        );
+        return;
+    }
+
     // The guard is keyed on the EXPRESSION, never on tree-presence of `Variable("X")`.
     // Some expressions legitimately bind TO the placeholder, and for those a surviving
     // `Variable("X")` is the CORRECT binding, not a fabrication:

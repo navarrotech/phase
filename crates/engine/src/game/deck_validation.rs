@@ -4,13 +4,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::database::legality::{LegalityFormat, LegalityStatus};
 use crate::database::CardDatabase;
+use crate::game::ante::face_uses_ante;
 use crate::game::companion::{companion_starting_deck, is_eligible_companion};
 use crate::game::deck_loading::{deserialize_draft_set_codes, DeckEntry};
 use crate::parser::oracle::{compute_deck_copy_limit_from_text, oracle_text_allows_commander};
 use crate::types::card::{CardFace, CardRules, PrintedCardRef};
 use crate::types::card_type::{CoreType, Supertype};
 use crate::types::custom_format::{
-    passes_legacy_axis_gate, CommandZoneMode, LegalityRules, SetCode,
+    passes_legacy_axis_gate, AntePolicy, CommandZoneMode, LegalityRules, SetCode,
 };
 use crate::types::format::{
     DeckCopyLimit, FormatConfig, GameFormat, SelectedFormat, SideboardPolicy,
@@ -603,15 +604,20 @@ impl CardPoolAuthority<'_> {
 }
 
 /// A custom format's resolved card pool: which cards are IN the pool (by
-/// printing — `legal_sets: None` means unrestricted), overlaid with its
-/// banned/restricted lists. Built once per evaluation by [`Self::resolve`]
-/// from a [`LegalityRules`] value, never assembled piecemeal.
+/// printing — `legal_sets: None` means unrestricted — or by name, via
+/// `legal_cards`), overlaid with its banned/restricted lists. Built once per
+/// evaluation by [`Self::resolve`] from a [`LegalityRules`] value, never
+/// assembled piecemeal.
 ///
 /// `Debug` is required because [`CardPoolAuthority`] borrows this type and
 /// derives `Debug` itself.
 #[derive(Debug)]
 struct DeclaredPool {
     legal_sets: Option<Vec<SetCode>>,
+    /// CR 201.3b canonical names, like `banned`/`restricted` below: a ruleset
+    /// naming a card individually must match a decklist spelling it by either
+    /// face. Unioned with `legal_sets` — see `LegalityRules::legal_cards`.
+    legal_cards: HashSet<String>,
     /// CR 201.3b: canonical (`canonical_deck_count_key`) names, so a banned
     /// entry naming a split/DFC's whole-card identity ("Fire // Ice") matches
     /// a decklist naming just one face ("Fire"). A banned/restricted entry
@@ -626,6 +632,11 @@ impl DeclaredPool {
     fn resolve(db: &CardDatabase, rules: &LegalityRules) -> Self {
         Self {
             legal_sets: rules.legal_sets.clone(),
+            legal_cards: rules
+                .legal_cards
+                .iter()
+                .map(|name| canonical_deck_count_key(db, name))
+                .collect(),
             banned: rules
                 .banned
                 .iter()
@@ -646,12 +657,24 @@ impl DeclaredPool {
     /// {format_label})" message in the shared evaluator, so the two card-pool
     /// authorities must report absence identically.
     fn status(&self, db: &CardDatabase, name: &str) -> Option<LegalityStatus> {
+        let canonical = canonical_deck_count_key(db, name);
         if let Some(sets) = &self.legal_sets {
-            if !printed_in_any_set(db, name, sets) {
+            // A named card is in the pool whether or not any legal set contains
+            // it — the two membership tests are a union, because a ruleset that
+            // names a card is stating a legality its set list could not.
+            //
+            // Checked only inside the `Some` arm: `legal_sets: None` already
+            // admits everything, so widening an unrestricted pool is a no-op.
+            if !self.legal_cards.contains(&canonical) && !printed_in_any_set(db, name, sets) {
                 return None;
             }
         }
-        let canonical = canonical_deck_count_key(db, name);
+        // CR 407.3 is deliberately NOT checked here. It is not a property of
+        // this format's declared card pool — it holds for every format that is
+        // not played for ante — and enforcing it in this authority would reach
+        // only constructed-shaped formats, leaving the commander validator and
+        // the FreeForAll / TwoHeadedGiant / Limited routes to disagree with it.
+        // `ante_deck_violations` applies it once, for all of them.
         if self.banned.contains(&canonical) {
             return Some(LegalityStatus::Banned);
         }
@@ -2034,9 +2057,53 @@ fn tiny_leaders_category_banned(face: &CardFace) -> bool {
         .to_ascii_lowercase();
     face.card_type.subtypes.iter().any(|subtype| {
         subtype.eq_ignore_ascii_case("Conspiracy") || subtype.eq_ignore_ascii_case("Attraction")
-    }) || text.contains("playing for ante")
+    }) || face_uses_ante(face)
         || text.contains("sticker")
         || text.contains("attraction")
+}
+
+/// CR 407.3: "When not playing for ante, players can't include these cards in
+/// their decks or sideboards." Returns the offending cards, by display name.
+///
+/// Applied once per evaluation, beside the other cross-format rules at the
+/// dispatch seam, rather than inside a card-pool authority. Three routes decide
+/// per-card legality — `CardPoolAuthority::LegalityTable` for built-in
+/// constructed formats, `CardPoolAuthority::Declared` for custom ones, and the
+/// commander validator — while FreeForAll, TwoHeadedGiant and Limited answer
+/// `true` with no per-card check at all. CR 407.3 binds all four: it is not a
+/// card-pool restriction a permissive format may waive, but a rule about
+/// whether this game is played for ante. Enforcing it in any one authority
+/// would let the others diverge — and the permissive route, which has no
+/// authority to enforce it in, is exactly where an ante card would slip
+/// through.
+///
+/// Scans `construction_deck_cards`, so the deck and the sideboard are covered
+/// by the same pass; CR 407.3 names both. Unknown names are skipped — they are
+/// reported separately, by name, and an unresolvable spelling is not evidence
+/// of an ante card.
+fn ante_deck_violations(
+    db: &CardDatabase,
+    request: &DeckCompatibilityRequest,
+    unknown_cards: &BTreeSet<String>,
+    format_rules: &FormatConfig,
+) -> BTreeSet<String> {
+    // CR 407.2: a format actually played for ante admits the class.
+    if crate::game::ante::policy_of(format_rules) == AntePolicy::Enabled {
+        return BTreeSet::new();
+    }
+    construction_deck_cards(request)
+        .filter(|name| !unknown_cards.contains(*name))
+        .filter(|name| deck_entry_uses_ante(db, name))
+        .map(|name| display_name(db, name))
+        .collect()
+}
+
+/// Whether a decklist entry resolves to a card of the CR 407.3 ante class.
+/// Reads the entry's resolved face, the same way `tiny_leaders_category_banned`'s
+/// call site does; an unknown name is not an ante card (unknown entries are
+/// reported separately, by name, before any legality verdict is formed).
+fn deck_entry_uses_ante(db: &CardDatabase, name: &str) -> bool {
+    db.get_face_by_name(name).is_some_and(face_uses_ante)
 }
 
 fn name_in_list(name: &str, list: &[&str]) -> bool {
@@ -2533,11 +2600,19 @@ fn evaluate_selected_format_summary(
         GameFormat::Custom(_) => quick_custom_format_check(db, request, &format_rules),
     };
 
-    (
-        Some(result.reason.is_none()),
-        result.reason.into_iter().collect(),
-        result.unknown_cards,
-    )
+    // CR 407.3, same cross-format rule the authoritative path applies — so the
+    // UI hint and the game-creation gate cannot disagree about an ante card.
+    let mut reasons: Vec<String> = result.reason.into_iter().collect();
+    let ante_cards = ante_deck_violations(db, request, &result.unknown_cards, &format_rules);
+    if !ante_cards.is_empty() {
+        reasons.push(summarize_cards(
+            "Can't be in a deck or sideboard unless the game is played for ante",
+            &ante_cards,
+            6,
+        ));
+    }
+
+    (Some(reasons.is_empty()), reasons, result.unknown_cards)
 }
 
 struct QuickCheckResult {
@@ -3034,6 +3109,19 @@ fn evaluate_selected_format(
             check.compatible
         }
     };
+
+    // CR 407.3: ante cards are barred from decks and sideboards regardless of
+    // format — see `ante_deck_violations` for why this cannot live inside any
+    // one of the per-format arms above.
+    let ante_cards = ante_deck_violations(db, request, unknown_cards, &format_rules);
+    if !ante_cards.is_empty() {
+        compatible = false;
+        reasons.push(summarize_cards(
+            "Can't be in a deck or sideboard unless the game is played for ante",
+            &ante_cards,
+            6,
+        ));
+    }
 
     // CR 100.4 × MatchType::Bo3: BO3 requires a sideboard regardless of format.
     // `SideboardPolicy::Unlimited` formats (FreeForAll, TwoHeadedGiant) impose
@@ -4177,8 +4265,8 @@ mod tests {
 
     use crate::types::custom_format::{
         CombatDamageTiming, CommanderEligibilityRule, CustomFormatDef, CustomFormatId,
-        CustomFormatRules, LegacyRuleSet, LegendRuleScope, ManaBurnPolicy, PrintingFidelity,
-        ReprintPolicy, StructuralRules, WishOutsideGameScope,
+        CustomFormatRules, LegacyRuleSet, LegendRuleScope, PrintingFidelity, ReprintPolicy,
+        StructuralRules, WishOutsideGameScope,
     };
     use crate::types::format::DeckSizeRule;
     use crate::types::keywords::PartnerType;
@@ -9232,6 +9320,7 @@ mod tests {
             },
             legality: LegalityRules {
                 legal_sets: None,
+                legal_cards: Vec::new(),
                 banned: Vec::new(),
                 restricted: Vec::new(),
                 legacy: LegacyRuleSet::default(),
@@ -9313,6 +9402,44 @@ mod tests {
         Value::Object(cards).to_string()
     }
 
+    /// `legal_cards` is UNIONED with the set check, never a substitute for it,
+    /// and never an override of `banned`/`restricted`.
+    ///
+    /// The real case: Old School 95 names Mana Crypt legal AND restricts it.
+    /// Its only era printing is in no legal set, so without the union the
+    /// restriction would name a card that could never reach a deck — a dead
+    /// list entry rather than a one-copy limit.
+    #[test]
+    fn declared_pool_unions_named_cards_with_the_set_check() {
+        let db = CardDatabase::from_json_str(&custom_pool_db_json()).unwrap();
+        let rules = LegalityRules {
+            legal_sets: Some(vec![SetCode("MH3".to_string())]),
+            legal_cards: vec!["Out Of Pool Card".to_string()],
+            banned: Vec::new(),
+            restricted: vec!["Out Of Pool Card".to_string()],
+            legacy: LegacyRuleSet::default(),
+        };
+        let pool = DeclaredPool::resolve(&db, &rules);
+
+        // Named but printed only outside `legal_sets`: in the pool, and the
+        // restricted list still applies to it. Both halves matter — `Legal`
+        // here would mean the union skipped the later lists.
+        assert_eq!(
+            pool.status(&db, "Out Of Pool Card"),
+            Some(LegalityStatus::Restricted)
+        );
+
+        // Paired controls on the SAME pool: the set check still admits what it
+        // always did, and a card that is neither printed in a legal set nor
+        // named is still absent. Without these, a `legal_cards` that admitted
+        // everything would pass the assertion above.
+        assert_eq!(
+            pool.status(&db, "In Pool Card"),
+            Some(LegalityStatus::Legal)
+        );
+        assert_eq!(pool.status(&db, "No Printings Card"), None);
+    }
+
     /// Every non-negative pool assertion here is paired with a positive on the
     /// SAME `DeclaredPool` (same `rules` value), so a `printed_in_any_set`
     /// that always returned `false` would fail the positives instead of
@@ -9326,6 +9453,7 @@ mod tests {
         // rules-side direction.
         let rules = LegalityRules {
             legal_sets: Some(vec![SetCode("mh3".to_string())]),
+            legal_cards: Vec::new(),
             banned: Vec::new(),
             restricted: Vec::new(),
             legacy: LegacyRuleSet::default(),
@@ -9357,6 +9485,354 @@ mod tests {
         assert_eq!(pool.status(&db, "No Printings Card"), None);
     }
 
+    /// CR 407.3: the ante class is identified by the cards' own printed text,
+    /// so this fixture gives two of them the templated clause and withholds it
+    /// from the controls. All four cards are printed in sets Swedish Old
+    /// School declares legal, so pool membership never confounds the verdict.
+    fn ante_db_json() -> String {
+        let mut cards = serde_json::Map::new();
+        let ante_text = "Remove this card from your deck before playing if you're not playing for \
+                         ante.";
+        for (key, name, printing, oracle_text) in [
+            // On the format's restricted list AND an ante card.
+            (
+                "contract from below",
+                "Contract from Below",
+                "LEA",
+                Some(ante_text),
+            ),
+            // An ante card the format's own lists never mention.
+            ("jeweled bird", "Jeweled Bird", "ARN", Some(ante_text)),
+            // Restricted, not ante — the paired control that keeps the
+            // restricted verdict reachable.
+            ("black lotus", "Black Lotus", "LEA", None),
+            // In pool, on no list, not ante.
+            ("savannah lions", "Savannah Lions", "LEA", None),
+        ] {
+            let mut card = card_json_with_printings(name, &[printing]);
+            card["oracle_text"] = match oracle_text {
+                Some(text) => Value::String(text.to_string()),
+                None => Value::Null,
+            };
+            cards.insert(key.to_string(), card);
+        }
+        // Basic land, printed in a Swedish-legal set, so the pipeline tests
+        // below can build a real 60-card deck: `deck_with_copies`/
+        // `legal_60_main` pad with Plains, and the CR 100.2a basic-land
+        // exemption keeps 56 copies under the format's 4-copy ceiling.
+        let mut plains = card_json_with_printings("Plains", &["LEA"]);
+        plains["card_type"] = serde_json::json!({
+            "supertypes": ["Basic"],
+            "core_types": ["Land"],
+            "subtypes": ["Plains"]
+        });
+        cards.insert("plains".to_string(), plains);
+        Value::Object(cards).to_string()
+    }
+
+    /// `DeclaredPool` answers ONLY the format's own declared card pool. CR 407.3
+    /// is not part of that — it is applied once for every format by
+    /// `ante_deck_violations` — so an ante card gets whatever verdict the
+    /// preset's own lists give it here, and nothing more. Pinning that keeps a
+    /// future change from quietly reintroducing the rule in this authority,
+    /// where the permissive formats could never see it.
+    #[test]
+    fn declared_pool_judges_only_the_declared_lists_not_the_ante_rule() {
+        let db = CardDatabase::from_json_str(&ante_db_json()).unwrap();
+        let rules = crate::types::custom_format::swedish_old_school()
+            .rules
+            .legality;
+        let pool = DeclaredPool::resolve(&db, &rules);
+
+        // Restricted AND an ante card: `Restricted` is the pool's honest
+        // answer. The deck gate rejects it outright, one layer up.
+        assert_eq!(
+            pool.status(&db, "Contract from Below"),
+            Some(LegalityStatus::Restricted)
+        );
+
+        // An ante card the preset's lists never mention is simply legal AS FAR
+        // AS THE POOL IS CONCERNED — `validate_deck_for_format` is what keeps it
+        // out of a deck.
+        assert_eq!(
+            pool.status(&db, "Jeweled Bird"),
+            Some(LegalityStatus::Legal)
+        );
+
+        // Paired controls on the same pool value.
+        assert_eq!(
+            pool.status(&db, "Black Lotus"),
+            Some(LegalityStatus::Restricted)
+        );
+        assert_eq!(
+            pool.status(&db, "Savannah Lions"),
+            Some(LegalityStatus::Legal)
+        );
+    }
+
+    /// CR 407.3 must reach the SUMMARY dispatch too, not only the
+    /// authoritative one.
+    ///
+    /// `evaluate_selected_format_summary` carries its own copy of the check,
+    /// with a comment promising the UI hint cannot disagree with the
+    /// game-creation gate about an ante card. Nothing tested that promise:
+    /// every other ante test drives `validate_deck_for_format`, and
+    /// `summary_only` defaults to `false`, so deleting that block left the
+    /// whole suite green while the deck builder silently showed a deck as
+    /// legal that game creation would then refuse.
+    ///
+    /// Loops the flag rather than testing the summary path alone, matching
+    /// `commander_listed_by_composite_and_front_name_is_one_card` — the two
+    /// verdicts agreeing is the property worth pinning, and asserting the
+    /// summary result in isolation would not catch the two drifting apart.
+    #[test]
+    fn both_dispatches_agree_that_an_ante_card_is_illegal() {
+        let db = CardDatabase::from_json_str(&ante_db_json()).unwrap();
+        let config = FormatConfig::for_custom_rules(
+            &crate::types::custom_format::swedish_old_school().rules,
+        );
+
+        for summary_only in [false, true] {
+            // Paired control FIRST, on the same config and flag: a legal deck
+            // is accepted. The summary path answers `None` ("no opinion") for
+            // several shapes, and a `None` would satisfy neither assertion
+            // below — this proves the path is actually forming a verdict
+            // rather than declining to.
+            let legal = DeckCompatibilityRequest {
+                main_deck: expand("Plains", 60),
+                selected_format: Some(SelectedFormat::Resolved(Box::new(config.clone()))),
+                summary_only,
+                player_count: default_player_count(),
+                ..Default::default()
+            };
+            assert_eq!(
+                evaluate_deck_compatibility(&db, &legal).selected_format_compatible,
+                Some(true),
+                "summary_only={summary_only}: a clean deck must be accepted"
+            );
+
+            let with_ante = DeckCompatibilityRequest {
+                main_deck: legal_60_main("Jeweled Bird"),
+                selected_format: Some(SelectedFormat::Resolved(Box::new(config.clone()))),
+                summary_only,
+                player_count: default_player_count(),
+                ..Default::default()
+            };
+            let result = evaluate_deck_compatibility(&db, &with_ante);
+            assert_eq!(
+                result.selected_format_compatible,
+                Some(false),
+                "summary_only={summary_only}: CR 407.3 must reject the deck on BOTH dispatches, \
+                 got reasons {:?}",
+                result.selected_format_reasons
+            );
+            assert!(
+                result
+                    .selected_format_reasons
+                    .iter()
+                    .any(|reason| reason.contains("Jeweled Bird")),
+                "summary_only={summary_only}: the rejection must name the ante card, got {:?}",
+                result.selected_format_reasons
+            );
+        }
+    }
+
+    /// CR 407.3 across the routes that decide deck admission by DIFFERENT
+    /// authorities: permissive formats with no card-pool check at all
+    /// (FreeForAll / TwoHeadedGiant answer `true` unconditionally) and a custom
+    /// format on its own `DeclaredPool`. They must agree, which is the whole
+    /// reason the rule sits at the dispatch seam rather than inside one
+    /// authority — the permissive routes have no authority to put it in.
+    ///
+    /// The `LegalityTable` route is deliberately absent: an ante card is
+    /// already `NotLegal` in every sanctioned format's table, so a built-in
+    /// constructed format would reject this deck with or without CR 407.3 and
+    /// prove nothing. The permissive routes are where the rule is load-bearing.
+    #[test]
+    fn every_deck_admission_route_rejects_an_ante_card() {
+        let db = CardDatabase::from_json_str(&ante_db_json()).unwrap();
+
+        for format in [
+            // The routes with no card-pool authority to hide the rule in — the
+            // ones that would silently admit an ante card if CR 407.3 lived in
+            // `CardPoolAuthority`.
+            FormatConfig::free_for_all(),
+            FormatConfig::two_headed_giant(),
+            // DeclaredPool route, for contrast: a format that DOES consult a
+            // card pool must reach the same verdict by the same rule.
+            FormatConfig::for_custom_rules(
+                &crate::types::custom_format::swedish_old_school().rules,
+            ),
+        ] {
+            let label = format.format.label();
+            let request = DeckCompatibilityRequest {
+                main_deck: legal_60_main("Jeweled Bird"),
+                selected_format: Some(SelectedFormat::Resolved(Box::new(format.clone()))),
+                player_count: default_player_count(),
+                ..Default::default()
+            };
+            let Err(reasons) = validate_deck_for_format(&db, &request) else {
+                panic!("{label} must reject an ante card (CR 407.3)");
+            };
+            assert!(
+                reasons.iter().any(|reason| reason.contains("Jeweled Bird")),
+                "{label}: the rejection must name the ante card, got {reasons:?}"
+            );
+
+            // Same format, same deck shape, no ante card: accepted. Without
+            // this the loop would pass against a validator that rejected
+            // everything — and the permissive formats in particular accept
+            // essentially any deck, so a spurious rejection there would
+            // otherwise be invisible.
+            let control = DeckCompatibilityRequest {
+                main_deck: expand("Plains", 60),
+                selected_format: Some(SelectedFormat::Resolved(Box::new(format))),
+                player_count: default_player_count(),
+                ..Default::default()
+            };
+            assert!(
+                validate_deck_for_format(&db, &control).is_ok(),
+                "{label}: the same deck without the ante card must be accepted"
+            );
+        }
+    }
+
+    /// CR 407.3 through the ACTUAL admission route, not the private helper:
+    /// `FormatConfig::for_custom_rules` → `SelectedFormat::Resolved` →
+    /// `validate_deck_for_format` → `evaluate_custom_format` →
+    /// `custom_format_pool` → `DeclaredPool`. The sibling test above proves the
+    /// pure function; this proves the wiring that reaches it in production, so
+    /// a future refactor that stopped calling it would fail here.
+    ///
+    /// **Both halves of CR 407.3's boundary — "their decks or sideboards".**
+    /// The sideboard reaches the check only because `construction_deck_cards`
+    /// chains it; a main-deck-only regression would not notice if that stopped,
+    /// and the sideboard is exactly where a player would try to hide an ante
+    /// card. Uses `swedish_old_school()`'s real rules rather than a synthetic
+    /// config, since the preset is what ships.
+    #[test]
+    fn validate_deck_for_format_rejects_ante_cards_in_deck_and_sideboard() {
+        let db = CardDatabase::from_json_str(&ante_db_json()).unwrap();
+        let config = FormatConfig::for_custom_rules(
+            &crate::types::custom_format::swedish_old_school().rules,
+        );
+
+        let request_with = |main: Vec<String>, sideboard: Vec<String>| DeckCompatibilityRequest {
+            main_deck: main,
+            sideboard,
+            selected_format: Some(SelectedFormat::Resolved(Box::new(config.clone()))),
+            player_count: default_player_count(),
+            ..Default::default()
+        };
+
+        // Paired positive control on the SAME config: a legal 60-card deck with
+        // a legal sideboard is ACCEPTED. Without it, both rejections below
+        // would still pass against a validator that rejected every deck for
+        // some unrelated reason (deck size, pool membership, copy limit).
+        assert!(
+            validate_deck_for_format(&db, &request_with(expand("Plains", 60), Vec::new())).is_ok(),
+            "a 60-card Swedish-legal deck must be accepted, or the rejections below prove nothing"
+        );
+        assert!(
+            validate_deck_for_format(
+                &db,
+                &request_with(expand("Plains", 60), expand("Savannah Lions", 4))
+            )
+            .is_ok(),
+            "a legal sideboard must be accepted"
+        );
+
+        // CR 407.3, main deck.
+        let in_deck = validate_deck_for_format(
+            &db,
+            &request_with(legal_60_main("Jeweled Bird"), Vec::new()),
+        )
+        .expect_err("an ante card in the main deck must be rejected end-to-end");
+        assert!(
+            in_deck.iter().any(|reason| reason.contains("Jeweled Bird")),
+            "the rejection must name the offending card, got: {in_deck:?}"
+        );
+
+        // CR 407.3, sideboard — the half a main-deck-only test would miss.
+        let in_sideboard = validate_deck_for_format(
+            &db,
+            &request_with(expand("Plains", 60), expand("Jeweled Bird", 1)),
+        )
+        .expect_err("an ante card in the sideboard must be rejected end-to-end (CR 407.3)");
+        assert!(
+            in_sideboard
+                .iter()
+                .any(|reason| reason.contains("Jeweled Bird")),
+            "the sideboard rejection must name the offending card, got: {in_sideboard:?}"
+        );
+
+        // An ante card that is ALSO on the restricted list is rejected
+        // outright, not downgraded to "one copy is fine" — the ordering inside
+        // `DeclaredPool::status`, observed from outside it. Exactly ONE copy,
+        // which the restricted rule alone would permit: at four copies this
+        // would be rejected for the copy limit whether or not the ante rule
+        // exists, and would prove nothing about the ordering.
+        let restricted_ante = validate_deck_for_format(
+            &db,
+            &request_with(deck_with_copies("Contract from Below", 1, 60), Vec::new()),
+        )
+        .expect_err(
+            "one copy of a restricted ante card is legal under the restricted rule alone, so \
+             rejecting it is attributable to CR 407.3",
+        );
+        assert!(
+            restricted_ante
+                .iter()
+                .any(|reason| reason.contains("Contract from Below")),
+            "got: {restricted_ante:?}"
+        );
+    }
+
+    /// CR 407.2: playing for ante makes the class legal again.
+    ///
+    /// Pinned at `ante_deck_violations` rather than end-to-end, and the reason
+    /// is worth recording: `AntePolicy::Enabled` cannot reach deck evaluation
+    /// at all today, because `custom_format_pool`'s legacy-axis gate rejects
+    /// the whole format first — declaring an ante zone the engine does not
+    /// implement is refused before any card is looked at. An end-to-end
+    /// assertion here would therefore be testing the gate, not this rule. When
+    /// `LegacyAxis::Ante` joins `IMPLEMENTED_LEGACY_AXES`, the deck half is
+    /// already correct and this test is what says so.
+    #[test]
+    fn ante_deck_violations_admit_the_class_when_playing_for_ante() {
+        let db = CardDatabase::from_json_str(&ante_db_json()).unwrap();
+        let request = DeckCompatibilityRequest {
+            main_deck: legal_60_main("Jeweled Bird"),
+            sideboard: expand("Jeweled Bird", 1),
+            ..Default::default()
+        };
+
+        let mut for_ante = crate::types::custom_format::swedish_old_school().rules;
+        for_ante.legality.legacy.ante = AntePolicy::Enabled;
+        assert!(
+            ante_deck_violations(
+                &db,
+                &request,
+                &BTreeSet::new(),
+                &FormatConfig::for_custom_rules(&for_ante),
+            )
+            .is_empty(),
+            "CR 407.2: a format played for ante admits the class"
+        );
+
+        // Paired control on the SAME request: the default policy flags exactly
+        // that card, so the emptiness above is the policy taking effect and not
+        // a request the scan never looked at.
+        let excluded = FormatConfig::for_custom_rules(
+            &crate::types::custom_format::swedish_old_school().rules,
+        );
+        assert!(
+            ante_deck_violations(&db, &request, &BTreeSet::new(), &excluded)
+                .contains("Jeweled Bird"),
+            "the same deck under the default Excluded policy must flag the ante card"
+        );
+    }
+
     /// CR 201.3b: a banned/restricted entry naming a split/DFC's whole-card
     /// identity ("Fire // Ice") must match a decklist naming just one face
     /// ("Fire"), and banned beats restricted when a name (implausibly)
@@ -9366,6 +9842,7 @@ mod tests {
         let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
         let rules = LegalityRules {
             legal_sets: None,
+            legal_cards: Vec::new(),
             banned: vec!["Legal Standard".to_string()],
             restricted: vec!["Legal Standard".to_string(), "Not Standard".to_string()],
             legacy: LegacyRuleSet::default(),
@@ -9580,16 +10057,16 @@ mod tests {
     fn custom_format_rejects_every_undeclared_legacy_axis() {
         let db = CardDatabase::from_json_str(&test_db_json()).unwrap();
         // Loops over every axis NOT in `IMPLEMENTED_LEGACY_AXES` — currently
-        // all four, since that list is empty; a future phase populating it
+        // all five, since that list is empty; a future phase populating it
         // narrows this loop automatically (each entry is still exercised
         // above by `passes_legacy_axis_gate`'s own direct assertion, so a
         // freshly-implemented axis fails loudly here instead of silently
         // dropping out).
         let non_default_rulesets = [
-            LegacyRuleSet {
-                mana_burn: ManaBurnPolicy::Obsolete,
-                ..LegacyRuleSet::default()
-            },
+            // Mana burn is NOT in this list any more: Phase 2b implemented it,
+            // so it is no longer an undeclared axis and the gate correctly
+            // accepts it. This is the loop narrowing itself exactly as its
+            // comment above promised.
             LegacyRuleSet {
                 damage_timing: CombatDamageTiming::OnStack,
                 ..LegacyRuleSet::default()
@@ -9600,6 +10077,14 @@ mod tests {
             },
             LegacyRuleSet {
                 legend_rule_scope: LegendRuleScope::PreM14AnyController,
+                ..LegacyRuleSet::default()
+            },
+            // CR 407.2/407.4: only `Enabled` is a declared axis — it promises
+            // an ante zone and the ante action. The default `Excluded` is
+            // enforced (CR 407.3) and so is deliberately NOT gated, which is
+            // why it does not appear in this list.
+            LegacyRuleSet {
+                ante: AntePolicy::Enabled,
                 ..LegacyRuleSet::default()
             },
         ];
@@ -9675,7 +10160,9 @@ mod tests {
 
         let mut legacy_rules =
             base_custom_rules(DeckSizeRule::Minimum(60), DeckCopyLimit::Unlimited);
-        legacy_rules.legality.legacy.mana_burn = ManaBurnPolicy::Obsolete;
+        // Damage timing, not mana burn: Phase 2b implemented mana burn, so a
+        // mana-burn config is no longer rejected here.
+        legacy_rules.legality.legacy.damage_timing = CombatDamageTiming::OnStack;
         let legacy_config = FormatConfig::for_custom_rules(&legacy_rules);
         let legacy_request = DeckCompatibilityRequest {
             main_deck: expand("Plains", 60),

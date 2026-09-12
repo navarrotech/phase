@@ -246,6 +246,7 @@ fn resolved_ability_axes(a: &ResolvedAbility, mode: ScanMode) -> Axes {
         force_block_attacker: _,   // exact force-block referent, no dynamic read
         target_incarnations: _,    // CR 400.7 referent pins, no dynamic read
         selected_target_incarnations: _, // CR 400.7 selected-target pins, no dynamic read
+        illegal_target_slots: _,   // CR 608.2b resolution legality stamp, no dynamic read
         controller: _,             // player id
         original_controller: _,    // player id
         scoped_player: _,          // player id (iteration binding)
@@ -2941,7 +2942,7 @@ fn scan_ability_condition(x: &AbilityCondition, mode: ScanMode) -> Axes {
         AbilityCondition::TargetHasKeywordInstead { keyword: _ } => Axes::NONE,
         // `subject_slot: _` is a target-slot INDEX selector (CR 608.2c): `Some(n)`
         // tests `filter` against declared chain slot `n` (via
-        // `resolve_parent_slot_from_root`), `None` against the local most-recent
+        // `resolve_live_parent_slot_from_root`), `None` against the local most-recent
         // target. It reroutes WHICH already-declared target the filter reads and
         // introduces no new event/sibling/projected resource — the game-state read
         // is entirely through `filter` (scanned below). Axes-neutral; destructured
@@ -3107,7 +3108,16 @@ fn scan_ability_condition(x: &AbilityCondition, mode: ScanMode) -> Axes {
         }
         AbilityCondition::DayNightIsNeither => Axes::NONE,
         AbilityCondition::DayNightIs { state: _ } => Axes::NONE,
-        AbilityCondition::NthResolutionThisTurn { n: _ } => Axes {
+        // Both tallies are per-turn counters projected from this ability's own
+        // `(source_id, ability_index)` ledger entry — neither reads the
+        // triggering event nor any sibling's output, so the axes are identical
+        // for `Resolved` and `Activated`. Destructured without `..` so a future
+        // field forces re-classification here.
+        AbilityCondition::AbilityUseCountThisTurn {
+            tally: _,
+            comparator: _,
+            n: _,
+        } => Axes {
             event: false,
             sibling: false,
             projected: true,
@@ -7562,7 +7572,7 @@ mod tests {
         // from `typed_filter_axes`, so this IS that arm's verdict for this shape.
         let by_target = typed_filter_axes(&target, ScanMode::LoopFirewall);
         let by_condition = scan_ability_condition(
-            &AbilityCondition::NthResolutionThisTurn { n: 2 },
+            &AbilityCondition::nth_resolution_this_turn(2),
             ScanMode::LoopFirewall,
         );
         let refs = [
@@ -7596,7 +7606,7 @@ mod tests {
         ];
         for (label, axes) in [
             ("ControllerMatches{OpponentLostLife}", by_target),
-            ("NthResolutionThisTurn", by_condition),
+            ("AbilityUseCountThisTurn", by_condition),
         ]
         .into_iter()
         .chain(
@@ -9085,7 +9095,7 @@ mod tests {
         ));
         // Ability-condition branch selector reading the per-ability resolution count.
         assert!(ability_condition_reads_projected_resource(
-            &AbilityCondition::NthResolutionThisTurn { n: 10 }
+            &AbilityCondition::nth_resolution_this_turn(10)
         ));
         // Static-condition dormant reader (poison).
         assert!(static_condition_reads_projected_resource(

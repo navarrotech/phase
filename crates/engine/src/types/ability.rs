@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::fmt;
+use std::num::NonZeroU32;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
@@ -1808,6 +1809,13 @@ pub enum DamageRedirectTarget {
     /// "...to you instead" — the replacement source's controller (Jade Monolith,
     /// Goblin Psychopath).
     Controller,
+    /// "...to its/that source's/that spell's controller instead" — the
+    /// prospective damage source's controller, read when the damage event is
+    /// replaced (Mirror Strike, Reverberation, Reflect Damage). This is distinct
+    /// from [`Self::Controller`], which is the replacement host's controller.
+    ///
+    /// CR 614.9: a redirection effect may redirect damage to another player.
+    DamageSourceController,
     /// "...to ~ instead" / "...dealt to this creature instead" — the replacement
     /// source object itself (Beacon of Destiny).
     SourceObject,
@@ -2358,7 +2366,7 @@ pub enum ChosenAttribute {
     /// cannot be confused at a read site, and so `game::visibility` redacts on
     /// the type rather than on a condition it might forget to check.
     RevealedNumber(u32),
-    /// Stores the chosen opponent/player ID (CR 800.4a).
+    /// Stores the chosen opponent/player ID.
     Player(PlayerId),
     /// Stores two chosen colors as a pair.
     TwoColors([ManaColor; 2]),
@@ -2594,7 +2602,6 @@ impl ChoiceValue {
                     .then_some(Self::CardPredicate(predicate))
             }
             ChoiceType::LandType => Some(Self::LandType(value.to_string())),
-            // CR 800.4a: Parse player ID from string.
             ChoiceType::Opponent { .. } | ChoiceType::Player { .. } => value
                 .parse::<u8>()
                 .ok()
@@ -6835,6 +6842,10 @@ pub mod source_exclusion_bool_compat {
 /// action), distinguished by destination (battlefield vs. hand).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ThisWayCause {
+    /// CR 701.24c-e + CR 400.3: the member (or an explicitly designated empty
+    /// population) is the subject of a compound instruction that moves cards
+    /// into their owners' libraries and then shuffles those libraries.
+    OwnerLibraryShuffleSubject,
     /// CR 701.13a: the member was exiled this way.
     Exiled,
     /// CR 701.21a: the member was sacrificed this way (cause survives a
@@ -18994,6 +19005,47 @@ pub enum VoteVisibility {
 }
 
 impl TargetFilter {
+    /// CR 608.2c + CR 701.24c: True only for the mixed-zone owner population
+    /// used by compound all-player shuffles. One operand is the iterated
+    /// player's hand; the other is every permanent that player owns. Ordinary
+    /// private-zone wheels retain explicit origins and do not use this shape.
+    pub(crate) fn is_all_player_owner_shuffle_population(&self) -> bool {
+        let TargetFilter::Or { filters } = self else {
+            return false;
+        };
+        if filters.len() != 2 {
+            return false;
+        }
+
+        let is_scoped_hand = |filter: &TargetFilter| {
+            matches!(
+                filter,
+                TargetFilter::Typed(TypedFilter {
+                    type_filters,
+                    controller: Some(ControllerRef::ScopedPlayer),
+                    properties,
+                }) if type_filters.is_empty()
+                    && properties.as_slice() == [FilterProp::InZone { zone: Zone::Hand }]
+            )
+        };
+        let is_owned_permanent = |filter: &TargetFilter| {
+            matches!(
+                filter,
+                TargetFilter::Typed(TypedFilter {
+                    type_filters,
+                    controller: None,
+                    properties,
+                }) if type_filters.as_slice() == [TypeFilter::Permanent]
+                    && properties.as_slice() == [FilterProp::Owned {
+                        controller: ControllerRef::ScopedPlayer,
+                    }]
+            )
+        };
+
+        (is_scoped_hand(&filters[0]) && is_owned_permanent(&filters[1]))
+            || (is_scoped_hand(&filters[1]) && is_owned_permanent(&filters[0]))
+    }
+
     /// CR 508.3d + CR 508.5a: True when this filter denotes a PLAYER population
     /// rather than an object population — the distinction
     /// `trigger_matchers::matching_attack_events` uses to decide whether an
@@ -19781,7 +19833,7 @@ impl Effect {
     /// for the non-targeted population tier. Their targeted/anaphoric recipients
     /// are resolved on separate paths: `MultiplyCounter` through
     /// `counters::resolve_defined_or_targets`, `Double { Counters }` through
-    /// `effects::double::resolve_object_targets` → `targeting::resolved_targets`.
+    /// `effects::resolved_effect_object_ids` → `targeting::resolved_targets`.
     /// Single authority for that pair so the swallow detector and the
     /// multi-target fixup cannot drift apart.
     pub(crate) fn is_counter_multiplication(&self) -> bool {
@@ -23270,7 +23322,9 @@ pub enum ActivationRestriction {
     /// Read from `GameObject::harnessed`. Sibling of `IsSolved` (CR 719.3c) — a
     /// per-object designation activation gate, not a parameterization of it.
     SourceIsHarnessed,
-    /// CR 716.4: Level N+1 ability can only activate when the source Class is at exactly this level.
+    /// CR 716.2a: "[Cost]: Level N" activates only while the source Class is at
+    /// exactly this level (N-1). CR 716.4 is the disjoint leveler-card rule and
+    /// explicitly does not interact with Class levels.
     ClassLevelIs {
         level: u8,
     },
@@ -23462,8 +23516,12 @@ pub struct AbilityDefinition {
     /// any-opponent permission. Requires `optional: true`; prompts use APNAP order.
     pub optional_for: Option<OpponentMayScope>,
     /// Variable-count targeting: min/max targets the player can choose.
-    /// When present, resolution enters MultiTargetSelection instead of immediate resolve.
-    /// CR 601.2c + CR 115.1d.
+    /// When present, target choice emits one `TargetSelectionSlot` per allowed
+    /// target (up to the resolved max), with slots at or above the resolved min
+    /// marked optional (CR 115.6: a targeted spell or ability may allow zero
+    /// targets). The slots surface via `WaitingFor::TargetSelection` for spells
+    /// (CR 601.2c) and activated abilities (CR 602.2b), or via
+    /// `WaitingFor::TriggerTargetSelection` for triggered abilities (CR 603.3d).
     pub multi_target: Option<MultiTargetSpec>,
     /// CR 115.1 + CR 601.2c: Additional legality constraints across selected targets.
     pub target_constraints: Vec<TargetSelectionConstraint>,
@@ -23952,7 +24010,7 @@ impl SubAbilityLink {
 /// (Thieving Skydiver's "If that artifact is an Equipment" presupposes
 /// `GainControl` produced a target), so it is skipped alongside a failed
 /// predecessor. The sole narrow exception is a direct dependent
-/// `SequentialSibling` whose condition is `NthResolutionThisTurn`: ordinal
+/// `SequentialSibling` whose condition is `AbilityUseCountThisTurn`: ordinal
 /// clauses are evaluated in their written order under CR 608.2c even after an
 /// earlier ordinal is false. `ReplicatedOrBranch` marks a sibling produced by per-item
 /// keyword-list replication ("The same is true for…" is CR 702.1c; "Repeat
@@ -24370,6 +24428,32 @@ pub enum EffectOutcomeSignal {
     Guessed { outcome: GuessOutcome },
 }
 
+/// CR 602.2a + CR 608.2c: which per-turn tally of a single printed ability
+/// [`AbilityCondition::AbilityUseCountThisTurn`] reads.
+///
+/// Both tallies are keyed `(source_id, ability_index)` and cleared together at
+/// end-of-turn cleanup; they differ only in which point of an ability's life
+/// increments them. The distinction is rules-visible: an activation that is
+/// countered before it resolves still counts as an activation (CR 602.2a puts
+/// the ability on the stack at announcement) but never counts as a resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum AbilityUseTally {
+    /// CR 608.2c: times this ability has RESOLVED this turn.
+    /// Reads `GameState::ability_resolutions_this_turn`.
+    #[default]
+    Resolved,
+    /// CR 602.2a: times this ability has been ACTIVATED this turn.
+    /// Reads `GameState::activated_abilities_this_turn`.
+    Activated,
+}
+
+impl AbilityUseTally {
+    /// `skip_serializing_if` predicate — the historical default needs no JSON byte.
+    pub fn is_resolved(tally: &Self) -> bool {
+        matches!(tally, Self::Resolved)
+    }
+}
+
 /// Condition on an ability within a sub_ability chain.
 /// Checked during resolve_ability_chain before executing the ability.
 /// The condition is a pure predicate — it describes WHAT to check, not the outcome.
@@ -24687,7 +24771,7 @@ pub enum AbilityCondition {
         use_lki: bool,
         /// CR 608.2c: When `Some(n)`, the anaphoric subject tests the object in
         /// declared chain slot `n` (resolved from the flattened root chain via
-        /// `resolve_parent_slot_from_root`) rather than this node's local
+        /// `resolve_live_parent_slot_from_root`) rather than this node's local
         /// most-recent target. `None` (default) preserves the legacy
         /// first-object / `TriggeringSource` behavior. Set by the two-target
         /// counter-chain rewrite in `lower_effect_chain_ir` so a condition on the
@@ -24856,14 +24940,45 @@ pub enum AbilityCondition {
         state: crate::types::game_state::DayNight,
     },
     /// CR 608.2c: Ordinary resolution-time condition (not an intervening-if
-    /// condition under CR 603.4) for "if this is the [Nth] time this ability has
-    /// resolved this turn". Counter is keyed by `(source_id, ability_index)` and
-    /// incremented at the top of `resolve_ability_chain` (depth 0). The condition is
-    /// satisfied when, after the increment, the per-turn resolution count equals `n`.
-    /// Cleared at end-of-turn cleanup alongside other per-turn counters.
-    /// Used by Omnath, Locus of Creation and the broader nth-resolution class
-    /// (Ashling the Pilgrim, Nissa Resurgent Animist, Teething Wurmlet, etc.).
-    NthResolutionThisTurn { n: u32 },
+    /// condition under CR 603.4) gating on how many times THIS printed ability
+    /// has been used so far this turn.
+    ///
+    /// Both tallies this reads are keyed by the same `(source_id,
+    /// ability_index)` pair, are cleared together at end-of-turn cleanup, and
+    /// address the same subject — one printed ability on one object — so
+    /// `tally` is a leaf parameter here rather than a second variant:
+    ///
+    /// - [`AbilityUseTally::Resolved`] reads
+    ///   `GameState::ability_resolutions_this_turn`, incremented at the top of
+    ///   `resolve_ability_chain` (depth 0), so the current resolution is already
+    ///   included. Prints as "if this is the [Nth] time this ability has
+    ///   resolved this turn" (Omnath, Locus of Creation; Ashling the Pilgrim;
+    ///   Nissa, Resurgent Animist; Teething Wurmlet).
+    /// - [`AbilityUseTally::Activated`] reads
+    ///   `GameState::activated_abilities_this_turn`, incremented in
+    ///   `ledger::record_ability_activation` from `push_ability_entry` — i.e. at
+    ///   CR 602.2a announcement, so an activation that is later countered still
+    ///   counts, and the announcing activation is included by the time it
+    ///   resolves. Prints as "if this ability has been activated [N] or more
+    ///   times this turn" (Dragon Whelp, Nalathni Dragon, Farrelite Priest,
+    ///   Initiates of the Ebon Hand).
+    ///
+    /// `comparator` is the second printed axis: the resolved family compares
+    /// `EQ` ("the second time"), the activated family `GE` ("four or more
+    /// times"). Both serde-elide their historical defaults, so every card that
+    /// parsed to the former `NthResolutionThisTurn { n }` is byte-identical
+    /// apart from the variant tag, which `serde(alias)` still accepts.
+    #[serde(alias = "NthResolutionThisTurn")]
+    AbilityUseCountThisTurn {
+        #[serde(default, skip_serializing_if = "AbilityUseTally::is_resolved")]
+        tally: AbilityUseTally,
+        #[serde(
+            default = "AbilityCondition::default_use_comparator",
+            skip_serializing_if = "AbilityCondition::is_default_use_comparator"
+        )]
+        comparator: Comparator,
+        n: u32,
+    },
     /// CR 702.x: True when the source permanent does not have the specified keyword.
     /// Inverse of keyword presence check — used by "if ~ doesn't have [keyword]" gates.
     SourceLacksKeyword { keyword: Keyword },
@@ -24908,6 +25023,138 @@ impl AbilityCondition {
 
     pub fn is_effect_outcome(&self) -> bool {
         matches!(self, AbilityCondition::EffectOutcome { .. })
+    }
+
+    /// CR 603.12 + CR 603.4 + CR 608.2a: Builds the flat root condition for a
+    /// reflexive trigger with an intervening-if guard. The `WhenYouDo` member
+    /// marks the separate triggered ability; `guard` is checked when that
+    /// trigger would be created and again when it resolves.
+    pub fn when_you_do_with_guard(guard: AbilityCondition) -> Self {
+        AbilityCondition::WhenYouDo.with_when_you_do_guard(guard)
+    }
+
+    /// Appends an ordinary guard to a root `WhenYouDo` marker, flattening only
+    /// root-level `And` members. Deliberately does not descend through `Or`,
+    /// `Not`, or nested `And`: those are distinct condition expressions, not
+    /// reflexive-body membership markers.
+    pub fn with_when_you_do_guard(self, guard: AbilityCondition) -> Self {
+        debug_assert!(self.has_when_you_do_marker());
+
+        let mut conditions = match self {
+            AbilityCondition::And { conditions } => conditions,
+            condition => vec![condition],
+        };
+        match guard {
+            AbilityCondition::And { conditions: guards } => conditions.extend(guards),
+            guard => conditions.push(guard),
+        }
+        AbilityCondition::And { conditions }
+    }
+
+    /// Whether this condition carries the CR 603.12 creation marker at its
+    /// root. A marker inside `Or`, `Not`, or a nested `And` is intentionally
+    /// not a reflexive-body marker.
+    ///
+    /// Exhaustive, with no wildcard: this is the single classifier used by
+    /// `take_when_you_do_marker`, so a new variant requires a deliberate
+    /// compiler-guided decision before either helper can accept it.
+    pub fn has_when_you_do_marker(&self) -> bool {
+        match self {
+            AbilityCondition::WhenYouDo => true,
+            AbilityCondition::And { conditions } => conditions
+                .iter()
+                .any(|condition| matches!(condition, AbilityCondition::WhenYouDo)),
+            AbilityCondition::TriggerEventTargetDamagedBySourceThisTurn
+            | AbilityCondition::AdditionalCostPaidInstead
+            | AbilityCondition::AlternativeManaCostPaid
+            | AbilityCondition::EffectOutcome { .. }
+            | AbilityCondition::EventOutcomeWon
+            | AbilityCondition::SourceEnteredThisTurn
+            | AbilityCondition::HasMaxSpeed
+            | AbilityCondition::IsMonarch
+            | AbilityCondition::IsInitiative
+            | AbilityCondition::HasCityBlessing
+            | AbilityCondition::HasEnduringStory
+            | AbilityCondition::ControlsCommander { .. }
+            | AbilityCondition::DiscardedCardMatchesFilter { .. }
+            | AbilityCondition::IsRingBearer
+            | AbilityCondition::HasObjectTarget
+            | AbilityCondition::IsYourTurn
+            | AbilityCondition::FirstCombatPhaseOfTurn
+            | AbilityCondition::FirstEndStepOfTurn
+            | AbilityCondition::SourceIsTapped
+            | AbilityCondition::SourceAttachedToCreature
+            | AbilityCondition::DayNightIsNeither
+            | AbilityCondition::AdditionalCostPaid { .. }
+            | AbilityCondition::CoinFlipOutcome { .. }
+            | AbilityCondition::WasCast { .. }
+            | AbilityCondition::CastDuringPhase { .. }
+            | AbilityCondition::CurrentPhaseIs { .. }
+            | AbilityCondition::CastTimingPermission { .. }
+            | AbilityCondition::ManaColorSpent { .. }
+            | AbilityCondition::RevealedHasCardType { .. }
+            | AbilityCondition::ObjectsShareQuality { .. }
+            | AbilityCondition::TargetSharesNameWithOtherExiledThisWay { .. }
+            | AbilityCondition::CastVariantPaid { .. }
+            | AbilityCondition::CastVariantPaidInstead { .. }
+            | AbilityCondition::QuantityCheck { .. }
+            | AbilityCondition::PreviousEffectAmount { .. }
+            | AbilityCondition::CompletedDungeon { .. }
+            | AbilityCondition::TargetHasKeywordInstead { .. }
+            | AbilityCondition::TargetMatchesFilter { .. }
+            | AbilityCondition::TriggeringSpellTargetsFilter { .. }
+            | AbilityCondition::SourceMatchesFilter { .. }
+            | AbilityCondition::PostReplacementDamageSourceMatchesFilter { .. }
+            | AbilityCondition::ZoneChangeObjectMatchesFilter { .. }
+            | AbilityCondition::ControllerControlsMatching { .. }
+            | AbilityCondition::ControllerControlledMatchingAsCast { .. }
+            | AbilityCondition::WasStartingPlayer { .. }
+            | AbilityCondition::SpellCastWithVariantThisTurn { .. }
+            | AbilityCondition::ZoneChangedThisWay { .. }
+            | AbilityCondition::CostPaidObjectMatchesFilter { .. }
+            | AbilityCondition::ConditionInstead { .. }
+            | AbilityCondition::Or { .. }
+            | AbilityCondition::Not { .. }
+            | AbilityCondition::DayNightIs { .. }
+            | AbilityCondition::AbilityUseCountThisTurn { .. }
+            | AbilityCondition::SourceLacksKeyword { .. }
+            | AbilityCondition::ScopedPlayerMatches { .. } => false,
+        }
+    }
+
+    /// Removes only root-level CR 603.12 creation markers from `condition`.
+    /// The residual ordinary guard is preserved for the separately-created
+    /// trigger, and the root collapses from zero/one/many members to
+    /// `None`/the member/`And`, respectively.
+    ///
+    /// This intentionally does not recurse through `Or`, `Not`, or nested
+    /// `And`; those shapes do not designate a reflexive-body boundary.
+    pub fn take_when_you_do_marker(condition: &mut Option<AbilityCondition>) -> bool {
+        let Some(condition_value) = condition.take() else {
+            return false;
+        };
+
+        // `has_when_you_do_marker` is the single exhaustive classifier. Any
+        // future `AbilityCondition` variant must be classified there before it
+        // can reach this consuming transformation.
+        if !condition_value.has_when_you_do_marker() {
+            *condition = Some(condition_value);
+            return false;
+        }
+        if matches!(&condition_value, AbilityCondition::WhenYouDo) {
+            return true;
+        }
+
+        let AbilityCondition::And { mut conditions } = condition_value else {
+            unreachable!("the exhaustive marker classifier only accepts WhenYouDo or root And")
+        };
+        conditions.retain(|member| !matches!(member, AbilityCondition::WhenYouDo));
+        *condition = match conditions.len() {
+            0 => None,
+            1 => conditions.pop(),
+            _ => Some(AbilityCondition::And { conditions }),
+        };
+        true
     }
 
     /// CR 603.12 + CR 608.2c: True for the AFFIRMATIVE reflexive-conditional
@@ -25008,7 +25255,7 @@ impl AbilityCondition {
             | AbilityCondition::Or { .. }
             | AbilityCondition::Not { .. }
             | AbilityCondition::DayNightIs { .. }
-            | AbilityCondition::NthResolutionThisTurn { .. }
+            | AbilityCondition::AbilityUseCountThisTurn { .. }
             | AbilityCondition::SourceLacksKeyword { .. }
             | AbilityCondition::ScopedPlayerMatches { .. } => false,
         }
@@ -25059,6 +25306,35 @@ impl AbilityCondition {
     #[allow(clippy::trivially_copy_pass_by_ref)]
     pub(crate) fn is_subject_source(value: &ObjectScope) -> bool {
         matches!(value, ObjectScope::Source)
+    }
+
+    /// CR 608.2c: Default `comparator` for `AbilityUseCountThisTurn` is `EQ` —
+    /// the ordinal "if this is the [Nth] time" reading the variant had before
+    /// the comparator axis existed. Used by serde `#[serde(default = ...)]` so
+    /// every previously-serialized ordinal payload round-trips unchanged.
+    pub(crate) fn default_use_comparator() -> Comparator {
+        Comparator::EQ
+    }
+
+    /// Skip-serialization predicate: omit `comparator` from JSON when it equals
+    /// the default (`EQ`). Keeps card-data.json compact for the ordinal family.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    pub(crate) fn is_default_use_comparator(value: &Comparator) -> bool {
+        matches!(value, Comparator::EQ)
+    }
+
+    /// CR 608.2c: Construct the ordinal-shape `AbilityUseCountThisTurn`
+    /// condition — "if this is the [Nth] time this ability has resolved this
+    /// turn". Equivalent to the legacy `NthResolutionThisTurn { n }` variant;
+    /// preserves call sites in `parser/oracle_effect/conditions.rs` and the
+    /// resolution-ordering tests in `game/effects/mod.rs` and
+    /// `analysis/resource.rs`.
+    pub fn nth_resolution_this_turn(n: u32) -> Self {
+        AbilityCondition::AbilityUseCountThisTurn {
+            tally: AbilityUseTally::Resolved,
+            comparator: Comparator::EQ,
+            n,
+        }
     }
 
     /// Construct the default-shape `AdditionalCostPaid` condition: any single
@@ -27897,14 +28173,14 @@ pub enum DamageModification {
     /// shared `Minus` applier arm: subtraction is applied by the SAME match arm
     /// as `Minus`, and only this provenance additionally emits `DamagePrevented`
     /// bookkeeping plus the CR 615.5 prevented-amount handoff for
-    /// "damage prevented this way" continuations. A `value` of `u32::MAX` is
+    /// "damage prevented this way" continuations. A fixed value of `u32::MAX` is
     /// the continuous prevent-all sentinel (saturating-subtraction yields 0 for
     /// any amount; the replacement is not consumed — continuous, not
     /// shield-style, distinct from `ShieldKind::Prevention { All }`).
     ///
     /// Provenance is a sibling variant rather than a field on `Minus` to
     /// preserve the established `Minus { value }` construction shape.
-    PreventionMinus { value: u32 },
+    PreventionMinus { value: PreventionFormula },
     /// CR 614.1a: Conditional — if amount < source's power, set amount = source's power.
     /// References the replacement source's (not the damage source's) current post-layer power.
     /// Used by Ojer Axonil: "deals damage equal to ~'s power instead."
@@ -27921,6 +28197,33 @@ pub enum DamageModification {
     /// Used by Worship: "damage that would reduce your life total to less
     /// than 1 reduces it to 1 instead."
     LifeFloor { minimum: i32 },
+}
+
+/// CR 615.1a + CR 107.1a: amount removed from each matching damage event.
+///
+/// The numeric `Fixed` form serializes as the legacy bare value inside
+/// `DamageModification::PreventionMinus`, so existing card data continues to
+/// load and round-trip unchanged. `Quantity` is evaluated when the replacement
+/// applies; `Fraction` is evaluated from the in-flight damage event, not from a
+/// game-state quantity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PreventionFormula {
+    Fixed(u32),
+    Quantity {
+        quantity: QuantityExpr,
+    },
+    Fraction {
+        numerator: u32,
+        denominator: NonZeroU32,
+        rounding: RoundingMode,
+    },
+}
+
+impl PreventionFormula {
+    pub const fn fixed(value: u32) -> Self {
+        Self::Fixed(value)
+    }
 }
 
 /// CR 614.1a: Quantity modification for replacement effects (tokens, counters).
@@ -28096,10 +28399,11 @@ pub enum CombatDamageScope {
 /// corpus by `scripts/draw_replacement_census.py`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DrawReplacementScope {
-    /// Modifies the draw *instruction*'s count before any individual draw happens
-    /// (CR 121.2a). Quantum Riddler — "if you would draw one or more cards, you
-    /// draw that many cards plus one instead" — is the only card in the pool that
-    /// does this.
+    /// Applies to the draw *instruction* before any individual draw happens
+    /// (CR 121.2a): it modifies the instruction's count (Quantum Riddler — "if you
+    /// would draw one or more cards, you draw that many cards plus one instead") or,
+    /// behind a count-form threshold, replaces it (Alms Collector — "If an opponent
+    /// would draw two or more cards, instead you and that player each draw a card").
     InstructionCount,
     /// Replaces or prevents a single individual card draw (CR 121.6b). Dredge,
     /// Notion Thief, Hullbreacher, and the runtime "you can't draw" shields.
@@ -28181,6 +28485,26 @@ pub enum ReplacementMode {
     },
 }
 
+/// Authority for an optional replacement's accept/decline prompt.
+/// CR 109.5 assigns a source's "you may" choice to that source's controller;
+/// CR 616.1 separately assigns the affected player the ordering of multiple
+/// applicable replacement or prevention effects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplacementChoiceAuthority {
+    /// The affected player, used by the default optional-replacement prompt.
+    #[default]
+    AffectedPlayer,
+    /// CR 109.5: "you" in a source's optional replacement text means that
+    /// source's controller (for example, "you may prevent").
+    SourceController,
+}
+
+impl ReplacementChoiceAuthority {
+    pub const fn is_affected_player(&self) -> bool {
+        matches!(self, Self::AffectedPlayer)
+    }
+}
+
 /// CR 614.6 + CR 615.5: Continuation effect that runs after a replacement
 /// effect's modifications complete. Stashed by the replacement pipeline,
 /// drained by callers (`engine_replacement`, `stack`, `deal_damage`,
@@ -28247,6 +28571,15 @@ pub struct ReplacementDefinition {
     pub runtime_execute: Option<Box<ResolvedAbility>>,
     #[serde(default)]
     pub mode: ReplacementMode,
+    /// CR 109.5: an optional "you may prevent" choice belongs to the
+    /// replacement source's controller. Defaults to the affected player for
+    /// compatibility; CR 616.1 still governs ordering multiple applicable
+    /// replacement or prevention effects.
+    #[serde(
+        default,
+        skip_serializing_if = "ReplacementChoiceAuthority::is_affected_player"
+    )]
+    pub choice_authority: ReplacementChoiceAuthority,
     #[serde(default)]
     pub valid_card: Option<TargetFilter>,
     #[serde(default)]
@@ -28588,6 +28921,7 @@ impl ReplacementDefinition {
             execute: None,
             runtime_execute: None,
             mode: ReplacementMode::Mandatory,
+            choice_authority: ReplacementChoiceAuthority::AffectedPlayer,
             valid_card: None,
             description: None,
             condition: None,
@@ -28636,6 +28970,11 @@ impl ReplacementDefinition {
 
     pub fn mode(mut self, mode: ReplacementMode) -> Self {
         self.mode = mode;
+        self
+    }
+
+    pub fn choice_authority(mut self, authority: ReplacementChoiceAuthority) -> Self {
+        self.choice_authority = authority;
         self
     }
 
@@ -29545,13 +29884,13 @@ impl CopyCountStatus {
 }
 
 /// CR 608.2c: Distinguishes WHY an immediately-chained `ParentTarget` child
-/// ability was handed off with nothing to act on. The three sources are
-/// mutually exclusive per hand-off (only one effect can be the immediate
-/// parent of a given child). Downstream consumers inspect the typed reason only
-/// when their exact `ParentTarget` operation needs to distinguish a missing
-/// referent from an ordinary empty target list. These used to be three parallel
-/// boolean fields on `ResolvedAbility` / `GameState` before being consolidated
-/// here (see the PR #5834/#5836 review that requested this).
+/// ability was handed off with nothing to act on. The sources are mutually
+/// exclusive per hand-off (only one effect can be the immediate parent of a
+/// given child). Downstream consumers inspect the typed reason only when their
+/// exact `ParentTarget` operation needs to distinguish a missing referent from
+/// an ordinary empty target list. The first three used to be parallel boolean
+/// fields on `ResolvedAbility` / `GameState` before being consolidated here
+/// (see the PR #5834/#5836 review that requested this).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ParentTargetMissingReason {
     /// CR 401.5 (issue #1365): A `Dig` looked at an empty library. Consulted
@@ -29580,6 +29919,15 @@ pub enum ParentTargetMissingReason {
     /// objects to a hard no-op (CR 608.2c: nothing to choose) instead of the
     /// whole-hand fallback.
     RevealHandChoice,
+    /// CR 609.3 + CR 608.2c (issue #8798, Tainted Pact): an `ExileTop` found
+    /// an empty library, so no card was exiled and nothing was bound as
+    /// "that card" for the chained `ParentTarget` child. Consulted by the
+    /// `ParentTarget` `ChangeZone` no-op guard (`change_zone.rs`) and by the
+    /// optional-effect feasibility probe (`optional_effect_is_infeasible`):
+    /// "you may put that card into your hand" with no exiled card is neither
+    /// an offerable option (CR 608.2d) nor a license for the generic
+    /// source fallback, which would move the resolving spell itself.
+    ExileTop,
 }
 
 /// CR 608.2c: what a chain split — a `player_scope` fan-out, or a multi-target
@@ -29795,6 +30143,18 @@ pub struct ResolvedAbility {
     /// whose keyed pins are reserved for delayed-trigger referents.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub selected_target_incarnations: Vec<ObjectIncarnationRef>,
+    /// CR 608.2b: Declared target slots — numbered as
+    /// `ability_utils::flatten_targets_in_chain` numbers this chain — whose
+    /// target failed the legality check made as the chain began to resolve.
+    /// Stamped only on the resolution carrier's root by `stack::resolve_top`
+    /// (overwritten on every resolution, empty when nothing was checked) and
+    /// read only from the carrier by
+    /// `targeting::resolve_live_parent_slot_from_root`, which drops those
+    /// slots' targets. A clone of the carrier (a spell copying
+    /// itself, CR 707.10) carries the stamp unread until its own resolution
+    /// overwrites it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub illegal_target_slots: Vec<usize>,
     pub controller: PlayerId,
     /// CR 109.5: The controller of the spell or ability before any
     /// resolution-time player-scope iteration rebinds the acting player.
@@ -30003,10 +30363,15 @@ pub struct ResolvedAbility {
     pub amassed_army_object: Option<CostPaidObjectSnapshot>,
     /// CR 608.2c: Index of the printed ability this resolution came from on the
     /// source object's ability list. Identifies "this ability" for per-turn
-    /// ordinary-resolution-condition tracking (`AbilityCondition::NthResolutionThisTurn`),
-    /// not an intervening-if condition under CR 603.4. `None` for
-    /// synthesized/runtime-only abilities (prowess, firebending) and activated
-    /// abilities for which nth-resolution gating is not yet wired through.
+    /// ordinary-resolution-condition tracking (`AbilityCondition::AbilityUseCountThisTurn`),
+    /// not an intervening-if condition under CR 603.4. `None` ONLY for
+    /// synthesized/runtime-only abilities (prowess, firebending), which have no
+    /// printed `abilities[]` entry to index. Activated abilities ARE stamped:
+    /// both paths that put one on the stack — `casting_costs::push_ability_entry`
+    /// and `planeswalker::push_loyalty_ability_entry` — assign this field
+    /// immediately before `push_to_stack`, and each pairs that stamp with the
+    /// `restrictions::record_ability_activation` call that keys
+    /// `GameState::activated_abilities_this_turn` by the SAME index.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ability_index: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -30063,7 +30428,7 @@ pub struct ResolvedAbility {
     /// Kathril) and must be evaluated by `resolve_chain_body` regardless of a
     /// preceding sibling's failed gate. `Dependent` (default) preserves the
     /// prior skip-with-failed-predecessor behavior, except the narrow direct
-    /// `NthResolutionThisTurn` ordinal-sibling case described by
+    /// `AbilityUseCountThisTurn` ordinal-sibling case described by
     /// [`SiblingCondition`]. See [`SiblingCondition`].
     #[serde(default, skip_serializing_if = "SiblingCondition::is_default")]
     pub sibling_condition: SiblingCondition,
@@ -30183,6 +30548,7 @@ impl ResolvedAbility {
             force_block_attacker: None,
             target_incarnations: Vec::new(),
             selected_target_incarnations: Vec::new(),
+            illegal_target_slots: Vec::new(),
             modal: None,
             mode_abilities: Vec::new(),
             parent_target_missing_reason: None,
@@ -31428,6 +31794,69 @@ mod tests {
                 .expect("deserializes");
         assert_eq!(round_tripped, stamped);
         assert!(round_tripped.is_resolution_installed());
+    }
+
+    #[test]
+    fn when_you_do_marker_with_guard_is_a_flat_root_and() {
+        let condition = AbilityCondition::when_you_do_with_guard(AbilityCondition::And {
+            conditions: vec![AbilityCondition::IsYourTurn, AbilityCondition::IsMonarch],
+        });
+
+        assert_eq!(
+            condition,
+            AbilityCondition::And {
+                conditions: vec![
+                    AbilityCondition::WhenYouDo,
+                    AbilityCondition::IsYourTurn,
+                    AbilityCondition::IsMonarch,
+                ],
+            }
+        );
+        assert!(condition.has_when_you_do_marker());
+        assert!(
+            !AbilityCondition::Not {
+                condition: Box::new(AbilityCondition::WhenYouDo),
+            }
+            .has_when_you_do_marker(),
+            "only bare/root-flat markers designate a reflexive body"
+        );
+        assert!(
+            !AbilityCondition::And {
+                conditions: vec![AbilityCondition::And {
+                    conditions: vec![AbilityCondition::WhenYouDo],
+                }],
+            }
+            .has_when_you_do_marker(),
+            "nested conjunctions are ordinary expressions, not reflexive markers"
+        );
+    }
+
+    #[test]
+    fn take_when_you_do_marker_preserves_and_collapses_root_guard() {
+        let mut bare = Some(AbilityCondition::WhenYouDo);
+        assert!(AbilityCondition::take_when_you_do_marker(&mut bare));
+        assert_eq!(bare, None);
+
+        let mut one_guard = Some(AbilityCondition::And {
+            conditions: vec![AbilityCondition::WhenYouDo, AbilityCondition::IsYourTurn],
+        });
+        assert!(AbilityCondition::take_when_you_do_marker(&mut one_guard));
+        assert_eq!(one_guard, Some(AbilityCondition::IsYourTurn));
+
+        let mut many_guards = Some(AbilityCondition::And {
+            conditions: vec![
+                AbilityCondition::WhenYouDo,
+                AbilityCondition::IsYourTurn,
+                AbilityCondition::IsMonarch,
+            ],
+        });
+        assert!(AbilityCondition::take_when_you_do_marker(&mut many_guards));
+        assert_eq!(
+            many_guards,
+            Some(AbilityCondition::And {
+                conditions: vec![AbilityCondition::IsYourTurn, AbilityCondition::IsMonarch],
+            })
+        );
     }
 
     #[test]
@@ -33576,6 +34005,34 @@ mod tests {
         assert_eq!(ability, deserialized);
     }
 
+    /// CR 608.2b: a resolution carrier's illegal-slot stamp survives a
+    /// persist/restore round trip, and an unstamped ability omits the field.
+    #[test]
+    fn resolved_ability_illegal_target_slots_roundtrip() {
+        let mut ability = ResolvedAbility::new(
+            Effect::TargetOnly {
+                target: TargetFilter::Any,
+            },
+            vec![
+                TargetRef::Object(ObjectId(10)),
+                TargetRef::Object(ObjectId(11)),
+            ],
+            ObjectId(1),
+            PlayerId(0),
+        );
+        let unstamped = serde_json::to_string(&ability).unwrap();
+        assert!(
+            !unstamped.contains("illegal_target_slots"),
+            "an empty stamp is not serialized"
+        );
+
+        ability.illegal_target_slots = vec![1];
+        let json = serde_json::to_string(&ability).unwrap();
+        let deserialized: ResolvedAbility = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.illegal_target_slots, vec![1]);
+        assert_eq!(ability, deserialized);
+    }
+
     #[test]
     fn resolved_ability_with_sub_ability_roundtrips() {
         let sub = ResolvedAbility::new(
@@ -33807,6 +34264,19 @@ mod tests {
         let json = serde_json::to_string(&replacement).unwrap();
         let deserialized: ReplacementDefinition = serde_json::from_str(&json).unwrap();
         assert_eq!(replacement, deserialized);
+    }
+
+    #[test]
+    fn prevention_formula_keeps_legacy_fixed_json_shape() {
+        let legacy = r#"{"type":"PreventionMinus","value":2}"#;
+        let formula: DamageModification = serde_json::from_str(legacy).unwrap();
+        assert_eq!(
+            formula,
+            DamageModification::PreventionMinus {
+                value: PreventionFormula::Fixed(2),
+            }
+        );
+        assert_eq!(serde_json::to_string(&formula).unwrap(), legacy);
     }
 
     #[test]
@@ -36801,6 +37271,74 @@ mod static_condition_traversal_tests {
         assert_eq!(
             serde_json::from_value::<Effect>(terminal_json).expect("terminal mode deserializes"),
             terminal
+        );
+    }
+}
+
+#[cfg(test)]
+mod ability_use_count_serde_tests {
+    use super::*;
+
+    /// CR 608.2c: Every card serialized before the tally/comparator axes existed
+    /// carried the `NthResolutionThisTurn` tag with a bare `n`. That payload
+    /// still lives in saved game states (an `AbilityCondition` reaches the wire
+    /// inside a `ResolvedAbility` on the stack), so the legacy tag must
+    /// deserialize to the ordinal reading rather than failing the whole state.
+    #[test]
+    fn legacy_nth_resolution_tag_deserializes_to_the_ordinal_reading() {
+        let legacy = r#"{"type":"NthResolutionThisTurn","n":3}"#;
+        let parsed: AbilityCondition = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed, AbilityCondition::nth_resolution_this_turn(3));
+    }
+
+    /// The two new axes serde-elide their historical defaults, so an ordinal
+    /// condition's JSON gains no bytes beyond the renamed tag. This is what
+    /// keeps the card-data diff for the 27-card resolved family a pure rename.
+    #[test]
+    fn ordinal_reading_elides_both_new_axes() {
+        let json = serde_json::to_string(&AbilityCondition::nth_resolution_this_turn(2)).unwrap();
+        assert_eq!(json, r#"{"type":"AbilityUseCountThisTurn","n":2}"#);
+    }
+
+    /// The activation reading must serialize both axes — eliding either would
+    /// silently reinterpret Dragon Whelp as the ordinal "second time it
+    /// resolved" condition on the next load.
+    #[test]
+    fn activation_reading_serializes_both_axes_and_round_trips() {
+        let condition = AbilityCondition::AbilityUseCountThisTurn {
+            tally: AbilityUseTally::Activated,
+            comparator: Comparator::GE,
+            n: 4,
+        };
+        let json = serde_json::to_string(&condition).unwrap();
+        assert!(json.contains(r#""tally":"Activated""#), "got {json}");
+        assert!(json.contains(r#""comparator":"GE""#), "got {json}");
+        assert_eq!(
+            serde_json::from_str::<AbilityCondition>(&json).unwrap(),
+            condition
+        );
+    }
+}
+
+#[cfg(test)]
+mod damage_redirect_target_serde_tests {
+    use super::*;
+
+    #[test]
+    fn damage_source_controller_round_trips_without_changing_legacy_variants() {
+        let new_value = DamageRedirectTarget::DamageSourceController;
+        assert_eq!(
+            serde_json::from_str::<DamageRedirectTarget>(
+                &serde_json::to_string(&new_value).expect("new redirect target serializes"),
+            )
+            .expect("new redirect target deserializes"),
+            new_value
+        );
+        assert_eq!(
+            serde_json::to_string(&DamageRedirectTarget::Controller)
+                .expect("legacy controller serializes"),
+            r#"{"type":"Controller"}"#,
+            "adding the source-controller authority must preserve existing card data"
         );
     }
 }

@@ -63,6 +63,12 @@ name = "set-check"
 path = "src/bin/set_check.rs"
 
 [[bin]]
+name = "preset-audit"
+path = "src/bin/preset_audit.rs"
+# Test-enabled: inline tests pin how Scryfall responses are classified, with
+# canned bodies and no network access.
+
+[[bin]]
 name = "parser-gap-analyzer"
 path = "src/bin/parser_gap_analyzer.rs"
 test = false
@@ -119,6 +125,11 @@ serde_json = "1"
 
 [dev-dependencies]
 flate2 = "1"
+# Test-only. `game_state_stack_high_water.rs` queries the running thread's real
+# stack bounds (`pthread_getattr_np` / `pthread_get_stackaddr_np`) instead of
+# inferring them from a local address. Already in Cargo.lock transitively, so
+# this vendors nothing new.
+libc = "0.2"
 engine = { path = ".", package = "phase-engine", features = ["test-support"] }
 tempfile = "3"
 insta = { version = "1", features = ["json"] }

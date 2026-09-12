@@ -1,6 +1,7 @@
 pub mod ability_rw;
 pub mod ability_scan;
 pub mod ability_utils;
+pub(crate) mod ante;
 pub mod arithmetic;
 pub mod attractions;
 pub mod augment;
@@ -85,6 +86,7 @@ pub mod life_safety;
 mod lifecycle;
 pub mod log;
 pub mod mana_abilities;
+pub(crate) mod mana_burn;
 pub mod mana_payment;
 pub mod mana_sources;
 pub mod match_flow;

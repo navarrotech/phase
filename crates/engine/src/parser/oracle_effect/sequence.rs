@@ -1528,6 +1528,66 @@ pub(super) fn split_clause_sequence(text: &str) -> Vec<ClauseChunk> {
     chunks
 }
 
+/// CR 608.2c: split a subject-elided "… and gains control of …" continuation
+/// off its head only when `head_carries_subject` confirms the head's subject
+/// will be carried into it; the split and the carry share one classifier. The
+/// probe sees the chain-entry context, so a per-chunk scope override (a chosen
+/// player or "its controller" re-seeding `relative_player_scope`) is not visible
+/// to it — no printed card reaches that case today. The generic splitter
+/// cannot admit this conjugated form: where no carry applies,
+/// a clause such as Coveted Jewel's "that player draws three cards and gains
+/// control of this artifact" must remain a single instruction.
+pub(super) fn split_subject_elided_control_continuations(
+    chunks: Vec<ClauseChunk>,
+    head_carries_subject: impl Fn(&str) -> bool,
+) -> Vec<ClauseChunk> {
+    let mut split = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let lower = chunk.text.to_ascii_lowercase();
+        let Some(((), tail)) = nom_on_lower(&chunk.text, &lower, |input| {
+            value(
+                (),
+                terminated(
+                    take_until::<_, _, OracleError<'_>>(" and gains control of "),
+                    tag(" and "),
+                ),
+            )
+            .parse(input)
+        }) else {
+            split.push(chunk);
+            continue;
+        };
+        let Some(head_end) = chunk
+            .text
+            .len()
+            .checked_sub(tail.len())
+            .and_then(|end| end.checked_sub(" and ".len()))
+        else {
+            split.push(chunk);
+            continue;
+        };
+        let Some(head) = chunk.text.get(..head_end) else {
+            split.push(chunk);
+            continue;
+        };
+        if head.trim().is_empty() || tail.trim().is_empty() || !head_carries_subject(head.trim()) {
+            split.push(chunk);
+            continue;
+        }
+        split.push(ClauseChunk {
+            text: head.trim().to_string(),
+            boundary_after: Some(ClauseBoundary::Comma),
+            leading_duration: chunk.leading_duration.clone(),
+        });
+        split.push(ClauseChunk {
+            text: tail.trim().to_string(),
+            boundary_after: chunk.boundary_after,
+            leading_duration: chunk.leading_duration,
+        });
+    }
+    split
+}
+
 /// CR 114.1: True when the clause-so-far begins with the emblem-creation head
 /// (`you get an emblem with "…"` or the subject-stripped `get an emblem with
 /// "…"`). Combinator-only dispatch mirroring `try_parse_emblem_creation`'s prefix
@@ -3266,7 +3326,7 @@ fn starts_bare_and_clause_lower(s: &str) -> bool {
     // abilities") on the un-split path: those are never followed by a player
     // action count such as "a card" or "1 life". Sibling-clause X-binding
     // (`compute_sentence_where_x`) and player-subject inheritance
-    // (`carried_targeted_player_subject`) handle the rest once both chunks
+    // (`CarriedPlayerSubject`) handle the rest once both chunks
     // reach the chain loop.
     if let Ok((rest, _)) = alt((
         tag::<_, _, OracleError<'_>>("draws "),
@@ -9933,6 +9993,34 @@ mod tests {
         assert!(starts_bare_and_clause(
             "attach an Equipment that was attached to ~ to that creature"
         ));
+    }
+
+    #[test]
+    fn control_continuation_splits_when_its_head_carries_the_subject() {
+        let chunks = split_subject_elided_control_continuations(
+            split_clause_sequence("that player untaps Karona and gains control of it."),
+            // allow-noncombinator: test stub classifier, not parser dispatch.
+            |head| head == "that player untaps Karona",
+        );
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].text, "that player untaps Karona");
+        assert_eq!(chunks[0].boundary_after, Some(ClauseBoundary::Comma));
+        assert_eq!(chunks[1].text, "gains control of it");
+        assert_eq!(chunks[1].boundary_after, Some(ClauseBoundary::Sentence));
+    }
+
+    #[test]
+    fn control_continuation_stays_whole_when_its_head_carries_no_subject() {
+        let chunks = split_subject_elided_control_continuations(
+            split_clause_sequence("that player untaps Karona and gains control of it."),
+            |_| false,
+        );
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            chunks[0].text,
+            "that player untaps Karona and gains control of it"
+        );
+        assert_eq!(chunks[0].boundary_after, Some(ClauseBoundary::Sentence));
     }
 
     #[test]

@@ -29,6 +29,9 @@ use crate::parser::oracle_nom::bridge::{nom_on_lower, nom_parse_lower, split_onc
 use crate::parser::oracle_nom::enters_under::{bind_control_clause, name_entry_control_antecedent};
 use crate::parser::oracle_nom::filter as nom_filter;
 use crate::parser::oracle_nom::filter::ControlledPermanentsConjunct;
+use crate::parser::oracle_nom::prevention::{
+    has_each_time_event_relative_prevention, has_event_relative_prevention_amount,
+};
 use crate::parser::oracle_nom::primitives as nom_primitives;
 use crate::parser::oracle_nom::quantity as nom_quantity;
 use crate::parser::oracle_nom::target as nom_target;
@@ -44,11 +47,11 @@ use crate::types::ability::{
     CounterKindDomain, DigSource, DoorLockOp, Duration, Effect, EffectScope, FaceDownProfile,
     FilterProp, ForceBlockAttackerRef, GrantedAbilityScope, LibraryPosition,
     MassLibraryShuffleMode, MultiTargetSpec, ObjectSelectionCardinality,
-    ObjectSelectionEligibility, OutsideGameSourcePool, PerPlayerScope, PlayerScope,
-    PreventionAmount, PreventionScope, PtStat, PtValue, QuantityExpr, QuantityRef,
-    ReassembleControlMode, SearchSelectionConstraint, StaticDefinition, StickerTicketCostPayment,
-    TapStateChange, TargetFilter, TargetSelectionMode, ThisWayCause, TypeFilter, TypedFilter,
-    ZoneOwner,
+    ObjectSelectionEligibility, OutsideGameSourcePool, PerPlayerScope, PlayerFilter,
+    PlayerRelation, PlayerScope, PossessionAxis, PreventionAmount, PreventionScope, PtStat,
+    PtValue, QuantityExpr, QuantityRef, ReassembleControlMode, SearchSelectionConstraint,
+    StaticDefinition, StickerTicketCostPayment, TapStateChange, TargetFilter, TargetSelectionMode,
+    ThisWayCause, TypeFilter, TypedFilter, ZoneOwner,
 };
 use crate::types::card_type::CoreType;
 use crate::types::phase::Phase;
@@ -7007,6 +7010,20 @@ fn parse_prevent_effect(text: &str, parent_target_available: bool) -> Effect {
         .map(|(r, _)| r)
         .unwrap_or(&lower);
 
+    // CR 615.1a + CR 107.1a: an activated/spell prevention clause cannot use
+    // the generic one-damage fallback for an event-relative fraction. Static
+    // replacements lower this grammar through `PreventionFormula`; imperative
+    // routes that lack the required event-relative representation stay visible
+    // as an explicit gap. Leave `X of that damage` to the existing chain-level
+    // fold (Errant Minion / Power Leak), which has the preceding damage event.
+    if has_event_relative_prevention_amount(rest)
+        && nom_primitives::scan_at_word_boundaries(rest, |input| {
+            tag::<_, _, OracleError<'_>>("half that damage").parse(input)
+        })
+        .is_some()
+    {
+        return Effect::unimplemented("prevent", text);
+    }
     // Determine scope: combat damage only vs all damage
     let scope = if nom_primitives::scan_contains(rest, "combat damage") {
         PreventionScope::CombatDamage
@@ -8204,6 +8221,48 @@ fn parse_shuffle_origin_zones(input: &str) -> nom::IResult<&str, Vec<Zone>, Orac
     .parse(input)
 }
 
+/// CR 701.24c + CR 400.3: parse a compound all-subject shuffle whose operands
+/// span a private zone and the battlefield (The Great Aurora class). The two
+/// independently typed operands lower through one `TargetFilter::Or`, allowing
+/// `ChangeZoneAll` to freeze one complete prospective population.
+fn parse_compound_all_subjects_to_library(lower: &str) -> Option<TargetFilter> {
+    let (input, _) = tag::<_, _, OracleError<'_>>("shuffle ").parse(lower).ok()?;
+    let (input, _) = tag::<_, _, OracleError<'_>>("all cards from ")
+        .parse(input)
+        .ok()?;
+    let (input, _) = parse_possessive_determiner(input).ok()?;
+    let (input, _) = tag::<_, _, OracleError<'_>>(" hand and ")
+        .parse(input)
+        .ok()?;
+    let (input, _) = tag::<_, _, OracleError<'_>>("all permanents ")
+        .parse(input)
+        .ok()?;
+    let (input, _) = alt((tag::<_, _, OracleError<'_>>("they own"), tag("you own")))
+        .parse(input)
+        .ok()?;
+    let (input, _) = tag::<_, _, OracleError<'_>>(" into ").parse(input).ok()?;
+    let (input, _) = parse_possessive_determiner(input).ok()?;
+    let (input, _) = tag::<_, _, OracleError<'_>>(" library").parse(input).ok()?;
+    let (_, _) = eof::<_, OracleError<'_>>(input).ok()?;
+
+    Some(TargetFilter::Or {
+        filters: vec![
+            TargetFilter::Typed(TypedFilter {
+                type_filters: vec![],
+                controller: Some(ControllerRef::You),
+                properties: vec![FilterProp::InZone { zone: Zone::Hand }],
+            }),
+            TargetFilter::Typed(TypedFilter {
+                type_filters: vec![TypeFilter::Permanent],
+                controller: None,
+                properties: vec![FilterProp::Owned {
+                    controller: ControllerRef::ScopedPlayer,
+                }],
+            }),
+        ],
+    })
+}
+
 /// Parse "shuffle [the cards {from|in}] {possessive} {zone-list} into
 /// {possessive} library" and return the origin zones.
 ///
@@ -8344,6 +8403,14 @@ pub(super) fn parse_shuffle_ast(text: &str, lower: &str) -> Option<ShuffleImpera
     if let Ok((_, target)) = parse_shuffle_library_target(lower) {
         return Some(ShuffleImperativeAst::ShuffleLibrary { target });
     }
+    if let Some(target) = parse_compound_all_subjects_to_library(lower) {
+        return Some(ShuffleImperativeAst::TargetedChangeZoneToLibrary {
+            target,
+            origin: None,
+            all: true,
+            multi_target: None,
+        });
+    }
     // CR 701.24c + CR 400.3: "shuffle <pronoun> into <possessive> library" —
     // covers "shuffle it into its owner's library" (Cavalier cycle), "shuffle
     // ~ into its owner's library" (Green Sun's Zenith, Beacon cycle, Nexus of
@@ -8391,11 +8458,8 @@ pub(super) fn parse_shuffle_ast(text: &str, lower: &str) -> Option<ShuffleImpera
         // "their" is ambiguous (controller vs owner vs plural antecedent)
         // and would mis-classify "each player shuffles their library".
         // "your library" leaves owner_library: false (the default).
-        // TODO(CR 400.3): When `owner_library: true`, the `Shuffle` sub_ability
-        // produced by `with_shuffle_sub_ability` still targets `Controller`,
-        // so a stolen creature shuffles its current controller's library
-        // instead of its owner's. Fixing this requires lifting `Effect::Shuffle`
-        // to accept an owner-of-target binding (separate commit).
+        // `with_shuffle_sub_ability` publishes the prospective subject owners
+        // before delivery, then scopes the terminal shuffle to that typed set.
         let owner_library = nom_primitives::scan_at_word_boundaries(lower, |input| {
             alt((
                 value((), tag::<_, _, OracleError<'_>>("its owner's library")),
@@ -8485,9 +8549,24 @@ pub(super) fn parse_shuffle_ast(text: &str, lower: &str) -> Option<ShuffleImpera
         // Only accept a real typed object target — never a whole-zone phrase
         // (which the mass-move paths above already handled).
         if matches!(target, TargetFilter::Typed(_)) {
-            return Some(ShuffleImperativeAst::ChangeZoneToLibrary {
-                target,
-                owner_library: true,
+            let all = preceded(
+                tag::<_, _, OracleError<'_>>("shuffle "),
+                alt((tag("all "), tag("each "))),
+            )
+            .parse(lower)
+            .is_ok();
+            return Some(if all {
+                ShuffleImperativeAst::TargetedChangeZoneToLibrary {
+                    target,
+                    origin: None,
+                    all: true,
+                    multi_target: None,
+                }
+            } else {
+                ShuffleImperativeAst::ChangeZoneToLibrary {
+                    target,
+                    owner_library: true,
+                }
             });
         }
     }
@@ -8585,7 +8664,7 @@ pub(super) fn lower_shuffle_ast(ast: ShuffleImperativeAst) -> ParsedEffectClause
             // CR 701.24c + CR 400.3: `target` and `owner_library` are
             // populated by `parse_shuffle_ast`'s combinator-based pronoun /
             // possessive classification. See the construction site for the
-            // detection grammar and the TODO on the `Shuffle` sub-target.
+            // detection grammar and the owner-scoped terminal Shuffle.
             let effect = Effect::ChangeZone {
                 origin: None,
                 destination: Zone::Library,
@@ -8911,16 +8990,19 @@ fn lower_target_referenced_search_library(
 
 /// Wrap an effect with a `Shuffle` sub_ability for compound "X into library" operations.
 pub(super) fn with_shuffle_sub_ability(mut effect: Effect) -> ParsedEffectClause {
-    // CR 400.3: When the parent `ChangeZone` routes to the target's owner's
-    // library (`owner_library: true`), the implicit shuffle must randomize that
-    // same library — not the spell controller's (Chaos Warp stolen-permanent case).
     let shuffle_target = match &effect {
+        // CR 400.3: A single object going to its owner's library keeps that
+        // object's owner as the anaphoric shuffle subject. Unlike a mass move,
+        // this already has one exact parent object and needs no tracked-set
+        // population fan-out (Chaos Warp and prevention follow-ups).
         Effect::ChangeZone {
             owner_library: true,
             ..
         } => TargetFilter::ParentTargetOwner,
+        Effect::ChangeZoneAll { .. } => TargetFilter::ScopedPlayer,
         _ => TargetFilter::Controller,
     };
+    let tracks_owner_population = matches!(&effect, Effect::ChangeZoneAll { .. });
     if let Effect::ChangeZoneAll {
         destination: Zone::Library,
         library_shuffle,
@@ -8929,12 +9011,23 @@ pub(super) fn with_shuffle_sub_ability(mut effect: Effect) -> ParsedEffectClause
     {
         *library_shuffle = MassLibraryShuffleMode::TerminalShuffle;
     }
-    let shuffle = AbilityDefinition::new(
+    // CR 701.24c-e + CR 400.3: the terminal shuffle is driven by the owners of
+    // the exact prospective subject population. Cause filtering prevents an
+    // unrelated tracked-set producer in the same chain from selecting players.
+    let mut shuffle = AbilityDefinition::new(
         AbilityKind::Spell,
         Effect::Shuffle {
             target: shuffle_target,
         },
     );
+    if tracks_owner_population {
+        shuffle.player_scope = Some(PlayerFilter::TrackedSetPossessor {
+            relation: PlayerRelation::All,
+            possession: PossessionAxis::Owner,
+            filter: TargetFilter::Any,
+            caused_by: Some(ThisWayCause::OwnerLibraryShuffleSubject),
+        });
+    }
     ParsedEffectClause {
         effect,
         duration: None,
@@ -8967,7 +9060,6 @@ fn lower_change_zone_all_to_library(origins: Vec<Zone>) -> ParsedEffectClause {
     let (first, rest) = origins
         .split_first()
         .expect("ChangeZoneAllToLibrary must have at least one origin");
-    let first = *first;
 
     let mut tail: Option<Box<AbilityDefinition>> = Some(Box::new(AbilityDefinition::new(
         AbilityKind::Spell,
@@ -8984,7 +9076,7 @@ fn lower_change_zone_all_to_library(origins: Vec<Zone>) -> ParsedEffectClause {
         tail = Some(Box::new(def));
     }
 
-    let mut clause = parsed_clause(change_zone_all_to_library_effect(first));
+    let mut clause = parsed_clause(change_zone_all_to_library_effect(*first));
     clause.sub_ability = tail;
     clause
 }
@@ -10994,6 +11086,16 @@ pub(super) fn parse_imperative_family_ast(
     // `parse_oneshot_draw_replacement`; on failure it returns `None`.
     if let Some(effect) = crate::parser::oracle_replacement::parse_oneshot_draw_replacement(lower) {
         return Some(ImperativeFamilyAst::GainKeyword(effect));
+    }
+
+    // CR 615.1 + CR 615.1a: An each-time prevention formula is a continuous,
+    // repeatable watcher of damage events. The imperative AST cannot represent
+    // that watcher or its event-relative amount, so fail at the outer clause
+    // rather than lowering its inner `prevent X` to the Next(1) fallback.
+    if has_each_time_event_relative_prevention(lower) {
+        return Some(ImperativeFamilyAst::GainKeyword(Effect::unimplemented(
+            "prevent", text,
+        )));
     }
 
     if all_consuming(terminated(parse_note_mana_spent_clause, opt(tag("."))))
@@ -24545,5 +24647,47 @@ mod tests {
             parse_dig_library_owner("your library", &ctx, DigOwnerPhrase::AtOwnerBoundary),
             Some(TargetFilter::Controller)
         );
+    }
+
+    #[test]
+    fn unsupported_event_relative_prevention_never_becomes_next_one_damage() {
+        assert!(matches!(
+            parse_prevent_effect("Prevent half that damage, rounded down.", false),
+            Effect::Unimplemented { .. }
+        ));
+    }
+
+    /// CR 615.1 + CR 615.1a: Event-relative formulas need a continuous,
+    /// repeatable prevention-event watcher that this imperative parser does not
+    /// yet model. Refuse the complete Tornellan Protector clause rather than
+    /// falling through to the ordinary `PreventDamage::Next(1)` convenience
+    /// default.
+    #[test]
+    fn event_relative_prevention_formula_is_unimplemented_in_imperative_dispatch() {
+        let text = "Until end of turn, each time damage is dealt to target creature or player, \
+                    prevent X of that damage, where X is a number from 1 to 3 chosen at random \
+                    each time.";
+        let lower = text.to_lowercase();
+        let parsed = parse_imperative_family_ast(text, &lower, &mut ParseContext::default());
+        assert!(matches!(
+            parsed,
+            Some(ImperativeFamilyAst::GainKeyword(Effect::Unimplemented { name, .. }))
+                if name == "prevent"
+        ));
+    }
+
+    /// The simple half-damage wording takes the same imperative route as the
+    /// fuller Tornellan formula. Keep it as an explicit `prevent` gap until the
+    /// AST can represent the continuous event watcher.
+    #[test]
+    fn each_time_half_damage_formula_is_unimplemented_in_imperative_dispatch() {
+        let text = "Each time a source would deal damage to you, prevent half that damage.";
+        let lower = text.to_lowercase();
+        let parsed = parse_imperative_family_ast(text, &lower, &mut ParseContext::default());
+        assert!(matches!(
+            parsed,
+            Some(ImperativeFamilyAst::GainKeyword(Effect::Unimplemented { name, .. }))
+                if name == "prevent"
+        ));
     }
 }
