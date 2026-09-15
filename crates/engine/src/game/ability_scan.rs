@@ -3295,6 +3295,14 @@ fn scan_target_filter(x: &TargetFilter, ctx: FilterReadContext, mode: ScanMode) 
             sibling: false,
             projected: false,
         },
+        // Engine classification: reads `DamageDealt.target` off the firing
+        // event, so it carries the same `event` walker axis as `EventTarget`
+        // and `TriggeringSourceController`. Not a rules decision.
+        TargetFilter::EventTargetController => Axes {
+            event: true,
+            sibling: false,
+            projected: false,
+        },
         TargetFilter::ParentTarget => Axes {
             event: true,
             sibling: false,
@@ -4860,6 +4868,12 @@ fn scan_controller_ref(x: &ControllerRef) -> Axes {
             sibling: false,
             projected: false,
         },
+        // Engine classification: event-axis read, same as the sibling above.
+        ControllerRef::EventTargetController => Axes {
+            event: true,
+            sibling: false,
+            projected: false,
+        },
         ControllerRef::ParentTargetOwner => Axes {
             event: true,
             sibling: false,
@@ -5022,6 +5036,14 @@ fn ability_definition_axes(def: &AbilityDefinition, mode: ScanMode) -> Axes {
         sub_link: _,
         iteration_kind_binding: _,
         sibling_condition: _,
+        // Parser scratch, not runtime state: `parse_oracle_pipeline` settles every
+        // deferred guard verdict before it hands a tree out, so this is `None` on
+        // every tree that pipeline produces — which is every tree a runtime walker
+        // sees — and expresses no resolution-time read. (NOT a universal claim about
+        // the field: `parse_effect_chain` outside the pipeline leaves marks intact,
+        // and no runtime path reaches such a tree. See
+        // `types::ability::UnloweredGuard`.)
+        unlowered_guard: _,
     } = def;
 
     let mut acc = scan_effect(effect, mode);

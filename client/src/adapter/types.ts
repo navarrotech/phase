@@ -450,7 +450,12 @@ export interface LobbyGame {
 export interface DraftLobbyMetadata {
   /** Three-letter set code (e.g. "MKM", "OTJ"). For cube drafts, "custom-cube". */
   setCode: string;
-  /** Draft kind: "Quick", "Premier", or "Traditional". */
+  /**
+   * Draft kind, as the serialized name of a `DraftKind`. Deliberately not
+   * enumerated here: `DRAFT_KINDS` in `adapter/draft-adapter.ts` is the single
+   * authority, and a second enumeration in a doc comment goes stale silently
+   * (this one already had, naming three of the then-five kinds).
+   */
   draftKind: string;
   /** Human-readable cube name when the pod is a cube draft. Absent for set drafts. */
   cubeName?: string;
@@ -1608,30 +1613,40 @@ export interface CopyEffectInstanceRef {
   modification_index: number;
 }
 
+export interface TriggerPrintedOrigin {
+  printed_ref: PrintedCardRef;
+  printed_occurrence: number;
+}
+
 export type TriggerDefinitionOccurrenceRef =
-  | { Printed: { base_set: number; printed_index: number } }
+  | { type: "Printed"; data: { base_set: number; printed_index: number } }
   | {
-      CopiedValue: {
+      type: "CopiedValue";
+      data: {
         copy_effect: CopyEffectInstanceRef;
         copied_slot: number;
+        printed_origin?: TriggerPrintedOrigin;
       };
     }
   | {
-      KeywordCompanion: {
+      type: "KeywordCompanion";
+      data: {
         grant_instance: number;
         companion_index: number;
       };
     }
   | {
-      CopyRetained: {
+      type: "CopyRetained";
+      data: {
         grant_instance: number;
         source_base_set: number;
         source_printed_index: number;
       };
     }
-  | { Granted: { grant_instance: number } }
+  | { type: "Granted"; data: { grant_instance: number } }
   | {
-      ExpandedGrant: {
+      type: "ExpandedGrant";
+      data: {
         grant_instance: number;
         provider: TriggerDefinitionRef;
         provider_output_index: number;
@@ -2633,6 +2648,7 @@ export type DebugAction =
         attach_to?: AttachTarget;
         run_etb: boolean;
         nonlegendary: boolean;
+        creation_kind: "Card" | "Token";
         count: number;
       };
     }

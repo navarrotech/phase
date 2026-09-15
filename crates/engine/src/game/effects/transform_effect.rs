@@ -245,7 +245,7 @@ fn resolve_all(
     target: &crate::types::ability::TargetFilter,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
-    let effective_filter = crate::game::effects::resolved_object_filter(ability, target);
+    let effective_filter = crate::game::effects::resolved_object_filter(state, ability, target);
 
     // CR 107.3a + CR 601.2b: ability-context filter evaluation.
     let ctx = crate::game::filter::FilterContext::from_ability(ability);
@@ -322,6 +322,7 @@ mod tests {
         obj.base_color = vec![ManaColor::Green];
         obj.back_face = Some(crate::game::game_object::BackFaceData {
             is_swap_snapshot: false,
+            trigger_printed_origins: Vec::new(),
             name: "Back Face".to_string(),
             power: Some(4),
             toughness: Some(4),

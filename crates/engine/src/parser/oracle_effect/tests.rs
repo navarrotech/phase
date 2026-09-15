@@ -1,8 +1,10 @@
+use super::gap_diagnosis::diagnose_clause_gap;
 use super::lower::{
     rewrite_parent_target_to_last_created, target_filter_is_explicit_target_player_graveyard_card,
 };
 use super::*;
 use crate::parser::oracle_ir::ast::EntersUnderSpec;
+use crate::parser::oracle_ir::diagnostic::{ClauseGap, ClauseGapKind};
 use crate::parser::oracle_nom::enters_under::{
     bind_control_clause, ControlAnaphorAntecedent, ControlClausePossessor,
 };
@@ -5685,6 +5687,36 @@ fn effect_damage_compound_each_creature_and_each_player() {
     }
 }
 
+/// Inflame — "each creature dealt damage this turn" is a
+/// REDUCED passive relative clause (no "that was"). Regression for a bug where
+/// the missing relative pronoun caused the "dealt damage this turn" restriction
+/// to be dropped entirely, producing an unrestricted `DamageAll{Creature}` that
+/// hit every creature instead of only those already damaged this turn.
+#[test]
+fn effect_damage_all_creature_reduced_was_dealt_damage_clause() {
+    let e = parse_effect("~ deals 2 damage to each creature dealt damage this turn");
+    match e {
+        Effect::DamageAll {
+            amount: QuantityExpr::Fixed { value: 2 },
+            target: TargetFilter::Typed(tf),
+            player_filter: None,
+            damage_source: None,
+        } => {
+            assert!(tf
+                .type_filters
+                .iter()
+                .any(|t| matches!(t, TypeFilter::Creature)));
+            assert!(
+                tf.properties
+                    .iter()
+                    .any(|p| matches!(p, FilterProp::WasDealtDamageThisTurn)),
+                "expected WasDealtDamageThisTurn property, got {tf:?}"
+            );
+        }
+        other => panic!("expected DamageAll{{Creature, WasDealtDamageThisTurn}}, got {other:?}"),
+    }
+}
+
 /// Hurricane class — "each creature with flying and each player". The
 /// property suffix on the type half must be preserved, and the player
 /// filter must still be populated.
@@ -7116,6 +7148,39 @@ fn destroy_target_was_dealt_damage_preserves_relative_clause() {
     );
     let Effect::Destroy { target, .. } = &*def.effect else {
         panic!("expected Destroy, got {:?}", def.effect);
+    };
+    let TargetFilter::Typed(tf) = target else {
+        panic!("expected typed creature target, got {0:?}", target);
+    };
+    assert!(tf.type_filters.contains(&TypeFilter::Creature));
+    assert!(
+        tf.properties
+            .iter()
+            .any(|prop| matches!(prop, FilterProp::WasDealtDamageThisTurn)),
+        "expected damage-history target property, got {:?}",
+        tf.properties
+    );
+    assert!(
+        def.duration.is_none(),
+        "damage-history target clause must not become a duration: {:?}",
+        def.duration
+    );
+}
+
+/// Number-agreement sibling of the test above — a plural
+/// head noun takes "were" instead of "was" ("all other creatures that WERE
+/// dealt damage this turn", Death-Rattle Oni). Regression: the "was"-only
+/// `VERB_PHRASES` row left "that were dealt damage this turn" unrecognized,
+/// which the trailing-duration stripper then mistook for a genuine
+/// until-end-of-turn duration and amputated before the target parser ran.
+#[test]
+fn destroy_all_were_dealt_damage_preserves_relative_clause() {
+    let def = parse_effect_chain(
+        "Destroy all other creatures that were dealt damage this turn.",
+        AbilityKind::Spell,
+    );
+    let Effect::DestroyAll { target, .. } = &*def.effect else {
+        panic!("expected DestroyAll, got {:?}", def.effect);
     };
     let TargetFilter::Typed(tf) = target else {
         panic!("expected typed creature target, got {0:?}", target);
@@ -41060,11 +41125,11 @@ fn leading_conditional_threads_condition_through_ast() {
         matches!(
             ast,
             ClauseAst::Conditional {
-                condition: Some(_),
+                guard: ConditionalGuard::Lowered(_),
                 ..
             }
         ),
-        "expected Conditional with Some condition, got: {ast:?}"
+        "expected Conditional with a lowered guard, got: {ast:?}"
     );
     let clause = lower_clause_ast(ast, &mut ParseContext::default());
     assert!(
@@ -41079,22 +41144,48 @@ fn leading_conditional_threads_condition_through_ast() {
     );
 }
 
+/// An unrecognized STATE guard is DELIBERATELY fall-through: the guard is dropped, the
+/// body is emitted, and the loss is reported by `swallow_check`'s `Condition_If` detector.
+///
+/// CR 608.2c gives a leading "if" that names no event the STATE reading, and CR 614.1 /
+/// CR 614.6 — the "would" split — bound the EVENT reading that gaps. Only the EVENT half
+/// gaps, because only a replacement effect makes the unguarded body a behaviour the card
+/// does not print.
+///
+/// **This assertion is a codebase-wide contract, not a local preference.** Gapping here
+/// would mint an `Effect::Unimplemented`, and `swallow_check`'s
+/// `any_ability_has_unimplemented` early-`continue` then suppresses every detector on the
+/// whole unit — trading a counted, visible loss for an uncounted one. Six in-tree tests
+/// assert that channel by name on this exact clause shape (an unrepresentable state guard
+/// over a body that lowers cleanly):
+///   - `oracle_trigger_tests::extract_didnt_have_non_keyword_stays_swallowed`
+///   - `oracle_trigger_tests::extract_didnt_have_landwalk_stays_swallowed`
+///   - `oracle_trigger_tests::extract_didnt_have_keyword_on_etb_trigger_stays_swallowed`
+///   - `oracle_trigger_tests::extract_didnt_have_keyword_on_ltb_trigger_stays_swallowed`
+///   - `swallow_check::tests::represented_typed_rider_does_not_hide_an_unrepresented_pronoun_rider`
+///   - `oracle_effect::tests::keyword_anaphor_strict_fails_when_kind_does_not_identify_the_ability`
+///
+/// Venue S: the entry point IS the producer, so no chunk loop sits between the literal
+/// and the comparand.
 #[test]
 fn leading_conditional_unrecognized_produces_none() {
-    // An unrecognized condition should produce condition: None (backward-compatible).
     let ast = parse_clause_ast(
         "if a random unrecognized condition, draw a card",
         &mut ParseContext::default(),
     );
+    // Paired positive: a green row must not be a fixture that produced no Conditional.
+    // `Unlowered(State)` is the post-§P2.3 spelling of this row's base assertion
+    // `ClauseAst::Conditional { condition: None, .. }` — the guard field replaced the
+    // `Option<AbilityCondition>`, so the shape claim is restated, not weakened.
     assert!(
         matches!(
             ast,
             ClauseAst::Conditional {
-                condition: None,
+                guard: ConditionalGuard::Unlowered(GuardReading::State),
                 ..
             }
         ),
-        "expected Conditional with None condition for unrecognized text, got: {ast:?}"
+        "expected an unlowered STATE guard, got: {ast:?}"
     );
     let clause = lower_clause_ast(ast, &mut ParseContext::default());
     assert!(
@@ -41102,6 +41193,425 @@ fn leading_conditional_unrecognized_produces_none() {
         "expected None condition for unrecognized text, got: {:?}",
         clause.condition
     );
+    assert!(
+        matches!(clause.effect, Effect::Draw { .. }),
+        "a STATE guard is dropped with its body INTACT — a gap here would suppress the \
+         Condition_If detector for the whole unit, got: {:?}",
+        clause.effect
+    );
+}
+
+/// V2s — the ladder swap's discriminator, asserted at the producing function.
+///
+/// `parse_clause_ast` lowers a leading guard through `lower_instead_condition`, the
+/// single condition authority (CR 608.2c), not through the nom rung alone. The paired
+/// rung assertions are what make the row discriminate: without them the fixture could
+/// be a guard both paths accept, and the test would pass identically before the swap.
+///
+/// Venue S is load-bearing. At venue C the same guard is consumed upstream by
+/// `strip_leading_general_conditional`, whose ladder is a superset, and the row would
+/// pass with or without the swap.
+#[test]
+fn leading_conditional_lowers_through_the_ladder_not_the_nom_rung_alone() {
+    let mut ctx = ParseContext::default();
+    assert!(
+        conditions::try_nom_condition_as_ability_condition("X is 1 or more", &mut ctx).is_none(),
+        "control: the nom rung alone must refuse this guard, or the row cannot discriminate"
+    );
+    assert!(
+        conditions::lower_instead_condition("X is 1 or more", &mut ctx).is_some(),
+        "control: the full ladder must accept it"
+    );
+
+    let ast = parse_clause_ast(
+        "if X is 1 or more, draw a card",
+        &mut ParseContext::default(),
+    );
+    let ClauseAst::Conditional { guard, .. } = &ast else {
+        panic!("expected a Conditional, got: {ast:?}");
+    };
+    assert_eq!(
+        *guard,
+        ConditionalGuard::Lowered(Box::new(AbilityCondition::QuantityCheck {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::CostXPaid
+            },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 1 },
+        })),
+        "the ladder's lowered value, not merely that something lowered"
+    );
+    let clause = lower_clause_ast(ast, &mut ParseContext::default());
+    assert!(
+        matches!(clause.effect, Effect::Draw { .. }),
+        "a lowered guard leaves its body intact, got: {:?}",
+        clause.effect
+    );
+}
+
+/// V2c — a **control**, not a discriminator for the §P2.3 ladder swap.
+///
+/// Stated plainly because the row's own shape forecloses the stronger reading: revert the
+/// swap and this fixture stays green. `"X is 1 or more"` would then fail to lower, and
+/// `condition_names_an_event` on it is false (no "would"), so the guard reads STATE and
+/// falls through with its body intact — no gap, which is exactly what the row asserts. The
+/// difference between "lowered" and "dropped" lives in the `condition` field, and this
+/// fixture cannot see it: the outer `"If you do,"` clobbers the slot (see the aliasing note
+/// below). **`leading_conditional_lowers_through_the_ladder_not_the_nom_rung_alone` (V2s) is
+/// the sole witness for the swap**, and it discriminates because it pins the ladder's
+/// lowered VALUE against a paired control proving the nom rung alone refuses the guard.
+///
+/// What V2c does carry: the production-path companion on the nested-guard shape that is the
+/// only shape reaching the seam on a chain (an outer `"If you do,"` already occupies the
+/// definition's condition slot, so no upstream stripper can consume the inner guard). It
+/// holds the chain path clean — the inner guard is not gapped and the body survives.
+///
+/// The occupancy reach-guard is asserted on the node that CARRIES the guarded body, not on
+/// the chain root: `parse_effect_chain` puts `"You may pay {X}"` at node 0 as a `PayCost`
+/// with `condition: None`, and threads the outer `"If you do,"` onto node 1 beside the
+/// `Draw` it gates. The row as first written asserted it on node 0, which is `None` at base
+/// and under this change alike — so it could never have been green.
+///
+/// The inner condition's VALUE is deliberately not asserted: `lower_clause_ast` has one
+/// `condition` slot and nested `ClauseAst::Conditional`s clobber it, so the outer
+/// `"If you do,"` overwrites the inner `"if X is 1 or more"`. That is pre-existing
+/// condition-slot aliasing at `88e58e96`, out of scope here, and asserting around it would
+/// pin behaviour this phase does not own.
+#[test]
+fn nested_leading_guard_lowers_on_the_chain() {
+    let def = parse_effect_chain(
+        "You may pay {X}. If you do, if X is 1 or more, draw a card",
+        AbilityKind::Spell,
+    );
+    let nodes = guard_chain_nodes(&def);
+
+    // Occupancy reach-guard, on the node that carries the body: without it the row could be
+    // green because the inner guard was consumed upstream rather than lowered here.
+    let gated = nodes
+        .iter()
+        .find(|node| matches!(*node.effect, Effect::Draw { .. }))
+        .expect("V2c reach-guard: the Draw body must be on the chain");
+    assert!(
+        matches!(
+            gated.condition,
+            Some(AbilityCondition::EffectOutcome {
+                signal: EffectOutcomeSignal::OptionalEffectPerformed
+            })
+        ),
+        "V2c reach-guard: the outer \"If you do,\" must occupy the gated node's condition \
+         slot, got: {:?}",
+        gated.condition
+    );
+    assert!(
+        guard_chain_gaps(&def).is_empty(),
+        "V2c: the inner guard lowers, so nothing gaps, got: {:?}",
+        guard_chain_gaps(&def)
+    );
+}
+
+/// V17 — the five-arm leading-conditional prefix production is the one `parse_clause_ast`
+/// uses. Stated as single-authority hygiene, not as coverage: no corpus guard reaches
+/// the seam with a `"then if"` connector.
+///
+/// The paired production assertion is what makes the row discriminate — it pins the
+/// fixture as one the narrower alternative could not have stripped.
+#[test]
+fn leading_conditional_accepts_the_then_if_connector() {
+    assert_eq!(
+        conditions::parse_leading_conditional_prefix("then if it's your turn"),
+        Some("it's your turn"),
+        "control: the shared production must strip the connector"
+    );
+    let ast = parse_clause_ast(
+        "then if it's your turn, draw a card",
+        &mut ParseContext::default(),
+    );
+    assert!(
+        matches!(
+            ast,
+            ClauseAst::Conditional {
+                guard: ConditionalGuard::Lowered(ref boxed),
+                ..
+            } if **boxed == AbilityCondition::IsYourTurn
+        ),
+        "expected the connector-prefixed guard to lower, got: {ast:?}"
+    );
+    let clause = lower_clause_ast(ast, &mut ParseContext::default());
+    assert!(
+        matches!(clause.effect, Effect::Draw { .. }),
+        "expected the body intact, got: {:?}",
+        clause.effect
+    );
+}
+
+/// V13 — a non-rider EVENT body gaps rather than lowering. At `PHASE_BASE_SHA` the
+/// guard was dropped and `Effect::PreventDamage` was emitted unconditionally.
+///
+/// No terminating period: `push_clause_chunk` strips one before the seam sees the text,
+/// so a fixture ending in `.` cannot produce a byte-equal description. Do not weaken
+/// the byte-equality if this goes red — the equality is the reach-guard.
+#[test]
+fn non_rider_event_guard_gaps_over_the_whole_clause() {
+    const CLAUSE: &str =
+        "If damage would be dealt to you this turn by a source of your choice, prevent that damage";
+    let def = parse_effect_chain(CLAUSE, AbilityKind::Activated);
+
+    let gaps = guard_chain_gaps(&def);
+    assert_eq!(
+        gaps.len(),
+        1,
+        "V13: expected exactly one gap over the clause, got {gaps:?}"
+    );
+    assert_eq!(gaps[0].0, "unparsed_replacement");
+    assert_eq!(gaps[0].1.as_deref(), Some(CLAUSE));
+    assert!(
+        !guard_chain_nodes(&def)
+            .iter()
+            .any(|node| matches!(*node.effect, Effect::PreventDamage { .. })),
+        "V13: the guarded body must be emitted nowhere"
+    );
+}
+
+/// V18 — the re-record arm: a clause whose body already lowered to an `Unimplemented`
+/// is re-recorded under the guard's own reading over the FULL clause text, so the
+/// antecedent is recoverable instead of being a bare body fragment.
+///
+/// Fixture is Jeska, Thrice Reborn's `[0]` clause verbatim, written without its
+/// `"Until your next turn, "` duration prefix and without terminating punctuation,
+/// because the chunk loop peels both before the seam.
+#[test]
+fn unlowerable_event_guard_re_records_over_the_full_clause() {
+    const CLAUSE: &str = "if that creature would deal combat damage to one of your opponents, it \
+                          deals triple that damage to that player instead";
+    let def = parse_effect_chain(CLAUSE, AbilityKind::Activated);
+
+    let gaps = guard_chain_gaps(&def);
+    assert_eq!(
+        gaps.len(),
+        1,
+        "V18: expected exactly one gap on the clause, got {gaps:?}"
+    );
+    assert_eq!(gaps[0].0, "unparsed_replacement");
+    let description = gaps[0]
+        .1
+        .as_deref()
+        .expect("V18: the gap must carry the clause it was recorded over");
+    assert_eq!(
+        description, CLAUSE,
+        "V18: the re-record must span the whole clause, not the body fragment"
+    );
+    assert_eq!(
+        diagnose_clause_gap(description),
+        ClauseGap::Replacement {
+            antecedent: "that creature would deal combat damage to one of your opponents"
+                .to_string()
+        },
+        "V18: the antecedent must be recoverable from the recorded text"
+    );
+}
+
+// V10c — WITHDRAWN with the O2 apparatus it was the last surviving half of.
+//
+// V10c asserted that the seam DEFERS a CR 615.5 "prevented this way" rider — i.e. that
+// `is_ownership_candidate`'s second disjunct (`prevented_this_way_rider_source_gate`) mints
+// a mark for it. That disjunct is deleted, because every mark it could mint was taken and
+// discarded unread:
+//
+//   * `oracle::guard_owner` is called only when `reading == GuardReading::Event`;
+//   * its O2 arm additionally required `prevented_this_way_rider_source_gate(clause_text)`,
+//     whose grammar is `("when "|"whenever "|"if ") "damage" [" from a[n] <type> source"]
+//     " is prevented this way,"` — a fixed prefix through the comma at which
+//     `split_leading_conditional` splits, so the guard body the reading is computed from is
+//     one of seven fixed strings, none containing "would";
+//   * `condition_names_an_event` IS `scan_contains(lower, "would")`, so such a clause reads
+//     `State` by construction and the two conjuncts were mutually exclusive.
+//
+// A `State` mark is `take()`n by the resolver and falls through to the base behaviour —
+// guard dropped, body emitted, loss counted by `swallow_check`'s Condition_If detector —
+// which is exactly what happens now that no mark is minted at all. The gate function itself
+// stays: `oracle_effect::assembly` is a live caller for its own `PreventDamage` fold, and
+// `oracle_replacement`'s own rows still cover its grammar.
+//
+// The venue-P companion `guard_ownership::v10_*` was already withdrawn for a different
+// reason (it would have fired on Ria Ivor, whose shield merely failed to parse).
+
+/// The `Event` conjunct on `is_ownership_candidate` (and on `guard_owner`'s O1a arm) is
+/// load-bearing: an O1a rider SHAPE under a STATE guard is not an ownership candidate.
+///
+/// **Venue S, at the producing functions — the two other venues cannot host this claim,
+/// both measured rather than assumed.** Venue C cannot: on a chain the clause is absorbed
+/// by the pre-existing `instead_condition` last resort before the seam sees it, which is
+/// how this row's predecessor (V11c, a venue-C row) failed — "the seam must DEFER this
+/// clause rather than decide it". Venue P cannot: the `CastFromZone` head is not in the
+/// assembled tree for this text, so the venue-P twin `guard_ownership::v11_*` failed on
+/// its own reach-guard under the shipped candidate and under this change alike. Both rows
+/// are withdrawn; the claim survives here.
+///
+/// **Declared synthetic, three real donors, one composed pairing:** head clause is
+/// Torrential Gearhulk's printed sentence minus its trigger prefix; the guard is Clockwork
+/// Servant's printed guard verbatim, which carries no "would" and so reads STATE
+/// (CR 608.2c); the rider body is Torrential Gearhulk's printed `"exile it instead"`
+/// verbatim. Only the pairing is composed — no corpus text pairs a STATE guard with an O1a
+/// rider shape, which is exactly why the row exists: it forward-guards the `Event` conjunct
+/// against a later widening.
+///
+/// **What this row can and cannot claim.** Its predecessor V11 asserted a BEHAVIOURAL
+/// consequence (`!has_exile_parent_target_rider` — the body emitted nowhere). That claim is
+/// false under the amended rule and was withdrawn with the row: a STATE guard does not gap,
+/// so the body IS emitted. No behavioural venue replaces it, and none can — measured from
+/// the source, not assumed:
+///
+///   * the mark is written by `lower_clause_ast` and read only by
+///     `oracle::resolve_guards_in_ability` (plus `assembly`'s field copy and the exhaustive
+///     `unlowered_guard: _` destructurings in `ability_rw` / `ability_scan` / `quantity` /
+///     `shortcut_efficacy`); nothing between them branches on it;
+///   * that reader settles a verdict only for `GuardReading::Event`, and takes-and-discards
+///     a STATE mark;
+///   * so for a STATE guard, candidate and non-candidate produce the identical tree.
+///
+/// The conjunct's value is therefore hygiene, not behaviour: it stops the seam minting a
+/// mark no owner arm can settle, which would otherwise have to survive
+/// `resolve_unlowered_guards`' no-live-mark invariant on some future unrecursed key. The
+/// row asserts exactly that, plus the observable outcome, and claims nothing more.
+#[test]
+fn an_o1a_rider_shape_under_a_state_guard_is_not_an_ownership_candidate() {
+    let ast = parse_clause_ast(
+        "if at least three mana of the same color was spent to cast it, exile it instead",
+        &mut ParseContext::default(),
+    );
+    let ClauseAst::Conditional { guard, .. } = &ast else {
+        panic!("expected a Conditional, got {ast:?}")
+    };
+    // Reach-guard 1: the fixture's guard really is the STATE reading.
+    assert_eq!(
+        *guard,
+        ConditionalGuard::Unlowered(GuardReading::State),
+        "reach-guard: the fixture must carry the STATE reading, or the row proves nothing"
+    );
+    let clause = lower_clause_ast(ast, &mut ParseContext::default());
+    // Reach-guard 2: the body really IS the O1a rider shape, so only the reading can refuse it.
+    assert!(
+        crate::game::effects::cast_from_zone::graveyard_destination_rider(&clause.effect).is_some(),
+        "reach-guard: the body must be the graveyard-redirect rider shape, got {:?}",
+        clause.effect
+    );
+    // The claim: shape alone does not make it a candidate.
+    assert!(
+        clause.unlowered_guard.is_none(),
+        "a STATE guard over an O1a shape must not be marked, got {:?}",
+        clause.unlowered_guard
+    );
+    // The observable outcome, stated so the row is not purely white-box: the STATE guard is
+    // dropped and the body emitted intact. This is the SAME outcome with or without the
+    // `Event` conjunct — which is the point of the doc above, not a second control.
+    assert!(
+        clause.condition.is_none(),
+        "the unlowerable STATE guard is dropped, not lowered into the condition slot, got \
+         {:?}",
+        clause.condition
+    );
+    assert!(
+        !matches!(clause.effect, Effect::Unimplemented { .. }),
+        "a STATE guard must not gap its body, got {:?}",
+        clause.effect
+    );
+}
+
+/// **Venue S: the precondition two venue-P rows rest on and neither can assert.**
+///
+/// `guard_ownership::v17_a_gap_this_pass_minted_does_not_pardon_the_guards_below_it` and
+/// `guard_ownership::v7s_o1b_event_guarded_exile_rider_under_counter_is_owned` both
+/// discriminate only while their rider clauses are DEFERRED at this seam — marked, and left
+/// for `oracle::resolve_unlowered_guards` to settle on the assembled tree. If either clause
+/// stopped being an ownership candidate, `lower_clause_ast` would gap it HERE instead, and
+/// the two gaps are byte-identical: the deferred path and the seam path both call
+/// `gap_diagnosis::clause_gap_unimplemented_as(ClauseGapKind::Replacement, &clause_text)` on
+/// the same clause text. Venue P therefore cannot tell them apart — same gap name, same
+/// description, same absent body, same chain shape — so V17 would go green with its claim
+/// unexercised, and V7s would go red for a reason that has nothing to do with the O1b arm.
+///
+/// The two clause texts are the two rider shapes `graveyard_destination_rider` classifies
+/// that the corpus actually prints: the `Exile` member (Torrential Gearhulk's printed rider,
+/// which is also V7s's rider and V17's first) and the `Library` member (V17's second). Both
+/// are written the way the other venue-S/C rows in this file write clause text — lowercase,
+/// no terminal period — since the seam's inputs are clause fragments, not printed sentences.
+///
+/// **Revert-to-red:** drop the `reading == GuardReading::Event` conjunct's partner, i.e. make
+/// `is_ownership_candidate` return `false` for these shapes (narrow `graveyard_destination_rider`,
+/// or add any further conjunct they fail), and both cases below fail on the final assertion
+/// while venue P stays green — which is exactly the silent-stop-discriminating mode this row
+/// exists to make loud.
+#[test]
+fn v17s_both_stacked_riders_are_ownership_candidates() {
+    for (label, clause_text) in [
+        (
+            "exile rider (V7s; V17's first)",
+            "if that spell would be put into your graveyard, exile it instead",
+        ),
+        (
+            "library rider (V17's second)",
+            "if that spell would be put into a graveyard, put it on the bottom of its owner's \
+             library instead",
+        ),
+    ] {
+        let ast = parse_clause_ast(clause_text, &mut ParseContext::default());
+        let ClauseAst::Conditional { guard, .. } = &ast else {
+            panic!("{label}: expected a Conditional, got {ast:?}")
+        };
+        // Reach-guard: the guard really carries the EVENT reading. Without this the final
+        // assertion could be satisfied by a future candidacy rule that ignores the reading.
+        assert_eq!(
+            *guard,
+            ConditionalGuard::Unlowered(GuardReading::Event),
+            "{label} reach-guard: the clause must reach the seam with the EVENT reading"
+        );
+
+        let clause = lower_clause_ast(ast, &mut ParseContext::default());
+        // The claim: DEFERRED, not decided here.
+        assert_eq!(
+            clause.unlowered_guard.as_ref().map(|mark| mark.reading),
+            Some(GuardReading::Event),
+            "{label}: the seam must defer this clause, not gap it — got effect {:?}, mark {:?}",
+            clause.effect,
+            clause.unlowered_guard
+        );
+        // Stated so the row is not purely white-box: a deferred clause keeps its body, where
+        // a seam gap would have replaced it. This is the half venue P cannot distinguish.
+        assert!(
+            !matches!(clause.effect, Effect::Unimplemented { .. }),
+            "{label}: a deferred clause keeps its body intact, got {:?}",
+            clause.effect
+        );
+    }
+}
+
+/// Every definition on a chain, following both the `sub_ability` continuation link and
+/// the `else_ability` branch that `parse_effect_chain` can produce.
+fn guard_chain_nodes(def: &AbilityDefinition) -> Vec<&AbilityDefinition> {
+    let mut out = Vec::new();
+    let mut stack = vec![def];
+    while let Some(node) = stack.pop() {
+        out.push(node);
+        if let Some(sub) = node.sub_ability.as_deref() {
+            stack.push(sub);
+        }
+        if let Some(branch) = node.else_ability.as_deref() {
+            stack.push(branch);
+        }
+    }
+    out
+}
+
+fn guard_chain_gaps(def: &AbilityDefinition) -> Vec<(String, Option<String>)> {
+    guard_chain_nodes(def)
+        .into_iter()
+        .filter_map(|node| match &*node.effect {
+            Effect::Unimplemented { name, description } => {
+                Some((name.clone(), description.clone()))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 #[test]
@@ -45171,6 +45681,7 @@ fn name_hate_draw_rider_targets_searched_player() {
         );
         let expected_axis = match axis {
             ControllerRef::ParentTargetController => TargetFilter::ParentTargetController,
+            ControllerRef::EventTargetController => TargetFilter::EventTargetController,
             ControllerRef::ParentTargetOwner => TargetFilter::ParentTargetOwner,
             _ => unreachable!(),
         };
@@ -47784,10 +48295,19 @@ fn target_opponent_chooses_in_your_graveyard_keeps_honest_fall_through() {
         "target opponent chooses a card in your graveyard.",
         AbilityKind::Spell,
     );
+    // Multi-authority: `"choose"` here is a CATEGORY key minted by this honesty gate,
+    // not a clause-gap verdict the imperative fallback derived from a first word. It is
+    // untouched by the clause-gap naming change, and `from_unimplemented_name` must not
+    // decode it — otherwise a later consumer would read the gate's key as a verdict.
     assert!(
         matches!(*def.effect, Effect::Unimplemented { ref name, .. } if name == "choose"),
         "the targeted chooser form must stay on the honesty gate, got {:?}",
         def.effect
+    );
+    assert_eq!(
+        ClauseGapKind::from_unimplemented_name("choose"),
+        None,
+        "the honesty gate's category key is not a clause-gap verdict"
     );
 }
 
@@ -52153,19 +52673,24 @@ fn alt_cost_rider_folds_onto_prior_cast_from_zone() {
         ),
         "expected PayLife {{ SelfManaValue }}, got {alt:?}",
     );
-    // Verify the rider didn't leak a sibling Unimplemented{name:"pay"} effect.
-    fn has_pay_unimpl(d: &AbilityDefinition) -> bool {
-        if matches!(
-            &*d.effect,
-            Effect::Unimplemented { name, .. } if name == "pay"
-        ) {
+    // Verify the rider didn't leak a sibling gap node. Rename-proof: key on the recorded
+    // CLAUSE, not on the gap's name — a name compare against the old first word can never
+    // be true once gaps are named by verdict. The paired positive reach-guard is the
+    // `PayLife { SelfManaValue }` assertion immediately above: it proves the rider was
+    // absorbed into the alternative cost rather than the sentence failing earlier.
+    const PAY_PHRASE: &str = "pay life equal to its mana value";
+    fn has_pay_gap(d: &AbilityDefinition) -> bool {
+        if d.effect
+            .unimplemented_description()
+            .is_some_and(|desc| desc.to_lowercase().contains(PAY_PHRASE))
+        {
             return true;
         }
-        d.sub_ability.as_ref().is_some_and(|s| has_pay_unimpl(s))
+        d.sub_ability.as_ref().is_some_and(|s| has_pay_gap(s))
     }
     assert!(
-        !has_pay_unimpl(&def),
-        "rider must NOT leak as Unimplemented{{name:'pay'}} sibling"
+        !has_pay_gap(&def),
+        "the life-payment rider must NOT leak as a sibling gap node"
     );
 }
 
@@ -59795,21 +60320,41 @@ fn borg_queen_assimilate_lowers_to_reanimate_then_retype_chain() {
 /// Parser fail-closed: an `assimilate` phrasing whose target is NOT a
 /// graveyard card is a shape this production does not model, so it must keep
 /// producing `Effect::Unimplemented` and coverage must stay honestly RED rather
-/// than be silently lowered into a reanimation. `name` is `"assimilate"` because
-/// the imperative fallback derives it from the clause's first word.
+/// than be silently lowered into a reanimation. The gap's name is the parser's
+/// VERDICT on which sub-grammar refused the clause — `unparsed_verb_arguments`,
+/// because `assimilate` is a clause head the imperative dispatcher knows and what
+/// failed is its argument grammar. (It was `"assimilate"` while the fallback named
+/// gaps by the clause's first word, which reported only where the leftover text
+/// started.)
 ///
 /// Paired positive: the real card's phrasing in the same test produces a
 /// `ChangeZone`, so the negative is about the graveyard guard and not about a
 /// production that never fires.
 #[test]
 fn assimilate_without_a_graveyard_target_stays_unimplemented() {
-    let non_graveyard = parse_effect("assimilate target creature you control");
+    const CLAUSE: &str = "assimilate target creature you control";
+    let non_graveyard = parse_effect(CLAUSE);
+    let Effect::Unimplemented {
+        name,
+        description: Some(fragment),
+    } = &non_graveyard
+    else {
+        panic!("a non-graveyard assimilate phrasing must stay honestly unsupported, got {non_graveyard:?}");
+    };
+    assert_eq!(
+        ClauseGapKind::from_unimplemented_name(name),
+        Some(ClauseGapKind::VerbArguments),
+        "the recorded name must decode to the verdict this clause earns, got {name}"
+    );
+    assert_eq!(fragment, CLAUSE, "the recorded fragment is byte-stable");
     assert!(
         matches!(
-            &non_graveyard,
-            Effect::Unimplemented { name, .. } if name == "assimilate"
+            diagnose_clause_gap(fragment),
+            ClauseGap::VerbArguments { ref verb, .. } if verb == "assimilate"
         ),
-        "a non-graveyard assimilate phrasing must stay honestly unsupported, got {non_graveyard:?}"
+        "the refused clause head is still `assimilate` — the fact the old literal carried \
+         that same spelling is a coincidence of this clause's first word, not what this \
+         assertion checks: the verdict must name the VERB the dispatcher recognised"
     );
 
     let real = parse_effect("assimilate target creature card from an opponent's graveyard");
@@ -60265,6 +60810,7 @@ fn filter_has_chosen_color(f: &TargetFilter) -> bool {
         | TargetFilter::TriggeringSource
         | TargetFilter::EventTarget
         | TargetFilter::TriggeringSourceController
+        | TargetFilter::EventTargetController
         | TargetFilter::ParentTarget
         | TargetFilter::ParentTargetSlot { .. }
         | TargetFilter::ParentTargetController
@@ -63346,5 +63892,59 @@ fn a_cast_this_way_gate_defers_a_consequence_but_never_a_casting_property() {
         !wraps_a_spell_cast_delayed_trigger(&property),
         "\"you cast it without paying its mana cost\" describes HOW the cast happens \
          (CR 601.2) and must not be deferred past it"
+    );
+}
+
+/// V7 — the imperative last-resort fallback names the gap by the sub-grammar that
+/// REJECTED the clause, and leaves the recorded fragment byte-identical.
+///
+/// This is the fallback's own production entry: `parse_effect_chain` over a clause whose
+/// quantity operand ("the excess", Toralf's shape) every quantity authority refuses. The
+/// name is the verdict (`unparsed_quantity`), never the clause's first word — `deal`
+/// reported only where the leftover text started.
+///
+/// The byte-identical fragment is the load-bearing half: five production consumers and
+/// two name-blind post-passes (`strip_mana_spend_trigger_node`,
+/// `strip_orphaned_copy_retarget_node`) re-parse it. Their standing coverage is
+/// `oracle_tests.rs::lapis_orb_mana_spend_trigger_folds_into_grant` /
+/// `::jade_orb_spell_referencing_mana_spend_trigger_stays_a_gap` for the first, and the
+/// `orphaned == 0` assertions in this file's Pyromancer's-Goggles-class tests for the
+/// second.
+#[test]
+fn the_imperative_fallback_names_the_gap_by_verdict_and_keeps_the_fragment() {
+    const SENTENCE: &str = "Deal damage equal to the excess to any target.";
+    // The clause splitter hands the fallback the sentence WITHOUT its terminator, so the
+    // recorded fragment is the clause, measured — not the input sentence.
+    const CLAUSE: &str = "Deal damage equal to the excess to any target";
+    let def = super::parse_effect_chain(SENTENCE, AbilityKind::Spell);
+
+    // Reach-guard: the clause really did reach the fallback. Without this a routing
+    // change could satisfy the name assertion vacuously.
+    let Effect::Unimplemented { name, .. } = def.effect.as_ref() else {
+        panic!("the clause must still reach the last-resort fallback, got {def:?}");
+    };
+
+    assert_eq!(
+        name, "unparsed_quantity",
+        "the wire name is the verdict kind's, produced through ClauseGapKind"
+    );
+    assert_eq!(
+        ClauseGapKind::from_unimplemented_name(name),
+        Some(ClauseGapKind::Quantity)
+    );
+    let recorded = def.effect.unimplemented_description();
+    assert_eq!(
+        recorded,
+        Some(CLAUSE),
+        "the recorded fragment must be byte-identical to the clause the parser refused"
+    );
+    // The contract that makes the name decodable downstream: re-running the diagnoser
+    // over the RECORDED fragment reproduces the verdict, phrase and all.
+    assert!(
+        matches!(
+            diagnose_clause_gap(recorded.expect("recorded above")),
+            ClauseGap::Quantity { ref operand } if operand == "the excess"
+        ),
+        "and the phrase re-derives from that same fragment"
     );
 }
