@@ -242,16 +242,20 @@ fn importance(event: &GameEvent) -> LogImportance {
 
 /// Presentation tier for each `PlayerPerformedAction` kind.
 ///
-/// Most kinds are internal ledger signals whose player-visible consequence is
-/// narrated by another event (a `Draw` action accompanies `CardsDrawn`, a
-/// `Forage` accompanies the exiles it pays for), so they stay `Detail`.
-///
-/// CR 701.23a + CR 701.24a: searching and shuffling are the exception. Both are
+/// CR 701.23a + CR 701.24a: searching and shuffling are `Context`. Both are
 /// public actions a player chose, and neither leaves any other trace in the log
 /// — a search that finds nothing raises no `SearchChoice`, and a shuffle changes
 /// only hidden library order. Without a `Context` entry the timeline shows
 /// nothing at all for an accepted "may search", which reads as if the choice did
 /// nothing.
+///
+/// The rest stay `Detail`. Most are ledger signals whose player-visible
+/// consequence is narrated by another event (a `Draw` accompanies `CardsDrawn`,
+/// a `Forage` accompanies the exiles it pays for). `Scry` and `Surveil` are the
+/// deliberate holdouts: they meet the same "no other trace" test, but they fire
+/// often enough (every scry land, every cantrip) that promoting them is a
+/// timeline-density call to make on its own evidence, not a side effect of this
+/// one.
 ///
 /// Exhaustive rather than wildcarded: a new `PlayerActionKind` must state its
 /// presentation policy here, matching the convention in [`importance`].
