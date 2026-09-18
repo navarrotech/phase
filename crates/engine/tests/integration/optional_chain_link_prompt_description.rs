@@ -234,15 +234,24 @@ fn no_prompt_raising_chain_link_resolves_without_a_description() {
                 continue;
             }
 
-            let mut link = resolved.sub_ability.as_deref();
-            let mut depth = 0;
-            while let Some(current) = link {
+            let mut links = Vec::new();
+            if let Some(sub_ability) = resolved.sub_ability.as_deref() {
+                links.push((sub_ability, 0));
+            }
+            if let Some(else_ability) = resolved.else_ability.as_deref() {
+                links.push((else_ability, 0));
+            }
+            while let Some((current, depth)) = links.pop() {
                 if current.optional && current.description.is_none() {
                     offenders.push(format!("{} (link depth {depth})", face.name));
                     break;
                 }
-                depth += 1;
-                link = current.sub_ability.as_deref();
+                if let Some(sub_ability) = current.sub_ability.as_deref() {
+                    links.push((sub_ability, depth + 1));
+                }
+                if let Some(else_ability) = current.else_ability.as_deref() {
+                    links.push((else_ability, depth + 1));
+                }
             }
         }
     }
