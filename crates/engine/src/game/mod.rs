@@ -1,6 +1,7 @@
 pub mod ability_rw;
 pub mod ability_scan;
 pub mod ability_utils;
+pub(crate) mod ante;
 pub mod arithmetic;
 pub mod attractions;
 pub mod augment;
@@ -79,12 +80,14 @@ mod haunt_tests;
 pub mod keywords;
 pub mod layers;
 pub mod ledger;
+pub(crate) mod legend_scope;
 pub mod library;
 pub mod life_costs;
 pub mod life_safety;
 mod lifecycle;
 pub mod log;
 pub mod mana_abilities;
+pub(crate) mod mana_burn;
 pub mod mana_payment;
 pub mod mana_sources;
 pub mod match_flow;
@@ -183,6 +186,7 @@ pub mod triggers;
 pub mod turn_control;
 pub mod turns;
 pub mod visibility;
+pub(crate) mod wish_scope;
 pub mod zone_pipeline;
 // Zone-mutation primitives. Production code outside the engine crate must go
 // through zone_pipeline::move_object — the module is only public to test

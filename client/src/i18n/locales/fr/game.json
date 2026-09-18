@@ -1,4 +1,5 @@
 {
+  "playerLatency": {"host":"Hôte","waiting":"En attente","value":"{{ms}} ms","description":"Latence aller-retour vers l’hôte. Une réponse manquante ne déconnecte pas la partie."},
   "abilityBlock": {
     "badge": "Bloquée",
     "cantBeActivated": "Cette capacité ne peut pas être activée",
@@ -17,10 +18,10 @@
     "declareTitle": "Loop Shortcut",
     "declareSubtitle": "You control a loop with a determined outcome. Take the shortcut to resolve it.",
     "respondTitle": "Loop Shortcut Proposed",
-    "respondSubtitle": "An opponent proposes taking a loop shortcut. Accept it, or break out to keep playing manually.",
+    "respondSubtitle": "An opponent proposes taking a loop shortcut. Accept it, or name the place where the sequence stops.",
     "confirm": "Take the shortcut",
     "accept": "Accept",
-    "shorten": "Break out",
+    "shorten": "Shorten it",
     "decline": "Decline the shortcut",
     "untilLethal": "Repeat until the game ends.",
     "fixedCount_one": "Repeat at most once.",
@@ -104,6 +105,7 @@
   },
   "debugCreate": {
     "copies": "Copies",
+    "asToken": "Créer comme jeton",
     "tokenPower": "Power",
     "tokenToughness": "Toughness",
     "tokenPowerPlaceholder": "Power",
@@ -310,8 +312,10 @@
     "underAttack_one": "Attaqué par {{count}} créature",
     "underAttack_other": "Attaqué par {{count}} créatures",
     "target": "Cible",
+    "token": "Jeton",
+    "tokenTooltip": "Jeton qui est une copie d'une vraie carte",
     "copy": "Copie",
-    "copyTooltip": "Jeton-copie d'une vraie carte",
+    "copyTooltip": "Permanent non-jeton copiant une autre carte",
     "cantBeBlocked": "Ne peut pas être bloquée",
     "ringBearer": "Anneau",
     "ringBearerTooltip": "Porteur de l'Anneau",
@@ -1997,10 +2001,15 @@
     "subtitleCascade": "Cascade a exilé {{name}} (valeur de mana inférieure à {{sourceMv}}). Lancez-le sans payer son coût de mana, ou refusez et mélangez les {{total}} cartes exilées au-dessous de votre bibliothèque.",
     "subtitleDiscover": "Découverte a exilé {{name}}. Lancez-le sans payer son coût de mana, ou mettez-le dans votre main et mélangez les {{missCount}} autres cartes exilées au-dessous de votre bibliothèque.",
     "subtitleRipple": "Ripple a révélé {{name}}. Lancez-le sans payer son coût de mana, ou refusez et placez les {{total}} cartes révélées au-dessous de votre bibliothèque dans un ordre aléatoire.",
-    "subtitleGraveyardPaid": "Lancez {{name}} depuis un cimetière en payant son coût de mana — du mana de n'importe quel type peut être dépensé. Ou refusez et laissez-la dans le cimetière.",
+    "subtitleGraveyardPaid": "Lancez {{name}} depuis un cimetière en payant son coût de mana{{extra}}{{concession}}. Ou refusez et laissez-la dans le cimetière.",
     "castNamed": "Lancer {{name}}",
     "castSuffix": "(sans payer son coût de mana)",
-    "castPaidSuffix": "(payez son coût de mana — du mana de n'importe quel type peut être dépensé)",
+    "castPaidSuffix": "(payez son coût de mana{{extra}}{{concession}})",
+    "paidExtraFragment": " plus {{extra}}",
+    "paidAnyTypeSubtitleFragment": " — du mana de n'importe quel type peut être dépensé",
+    "paidAnyColorSubtitleFragment": " — du mana de n'importe quelle couleur peut être dépensé",
+    "paidAnyTypeSuffixFragment": " — du mana de n'importe quel type peut être dépensé",
+    "paidAnyColorSuffixFragment": " — du mana de n'importe quelle couleur peut être dépensé",
     "putIntoHand": "Mettre en main",
     "decline": "Refuser",
     "discoverDeclineSuffix": "(mettre le reste en dessous)",
@@ -2112,6 +2121,7 @@
     "exportClientSnapshot": "Exporter l’instantané du client",
     "exported": "Exporté",
     "exportFailed": "Échec de l'exportation",
+    "exportRequested": "Export non confirmé",
     "copyDiagnostic": "Copier le diagnostic",
     "copied": "Copié !",
     "reportOnGithub": "Signaler sur GitHub",
@@ -2215,7 +2225,7 @@
     "yes": "Oui",
     "no": "Non",
     "dontAskAgain": "Ne plus demander pendant cette partie",
-    "dontAskAgainForSameCard": "Appliquer à chaque exemplaire de cette carte"
+    "dontAskAgainForSameCard": "Utiliser ce choix pour chaque copie de cette carte dans cette partie"
   },
   "resolutionOptionalPayment": {
     "title": "Choisissez un paiement optionnel",
@@ -2376,10 +2386,12 @@
   "outsideGame": {
     "fromExile": "Depuis l'exil",
     "fromSideboard": "Depuis la réserve",
-    "fromBoosterPack": "D'un booster {{setCode}}"
+    "fromBoosterPack": "D'un booster {{setCode}}",
+    "fromCubeBoosterPack": "D'un booster du cube"
   },
   "boosterPack": {
     "title": "Booster {{setCode}}",
+    "cubeTitle": "Booster du cube",
     "subtitleExact_one": "Choisissez {{count}} carte à garder ; le reste est retiré de la partie",
     "subtitleExact_other": "Choisissez {{count}} cartes à garder ; le reste est retiré de la partie",
     "subtitleUpTo_one": "Choisissez jusqu'à {{count}} carte à garder ; le reste est retiré de la partie",

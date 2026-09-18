@@ -27,7 +27,7 @@ use crate::types::zones::Zone;
 
 use super::ability_utils::{
     build_target_slots, flatten_specified_targets_in_chain, flatten_targets_in_chain,
-    validate_targets_in_chain,
+    illegal_declared_target_slots, validate_targets_in_chain,
 };
 use super::effects;
 use super::targeting;
@@ -63,6 +63,31 @@ pub(super) fn finish_resolving_stack_entry(
     );
     if let Some(firing) = firing {
         super::lifecycle::record_delayed_terminal(firing, disposition);
+    }
+}
+
+/// CR 608.2b: Record on the resolution carrier's declared chain which declared
+/// target slots failed the legality check this resolution made (`validated` is
+/// `None` when no check was made), so the live `ParentTargetSlot` authority
+/// drops those targets. Always overwrites: a spell that copies itself during
+/// its own resolution (CR 707.10) clones this carrier, stamp included.
+///
+/// The carrier holds the chain as it was put on the stack, not the local copy
+/// `resolve_top` validates. Resolution-time re-seeding of a triggered
+/// ability's `ParentTarget` referent (`seed_event_context_parent_targets`)
+/// changes only that local copy, so a lone source-object fallback it replaces
+/// reads here as a pruned slot. No printed card combines that re-seeding with
+/// a `ParentTargetSlot` consumer; writing the seeded copy back into the carrier
+/// would make the two agree.
+fn record_illegal_target_slots(state: &mut GameState, validated: Option<&ResolvedAbility>) {
+    if let Some(root) = state
+        .resolving_stack_entry
+        .as_mut()
+        .and_then(StackEntry::ability_mut)
+    {
+        root.illegal_target_slots = validated.map_or_else(Vec::new, |validated| {
+            illegal_declared_target_slots(root, validated)
+        });
     }
 }
 
@@ -1720,7 +1745,8 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
         // UNVALIDATED chain, not `execute_effect(state, &validated, ..)` at :1793.
         // That branch is UNREACHABLE by this change, not merely harmless: the only
         // writer of an inherited entry pushes `parent_creature_target`, a `find_map`
-        // over the HEAD's own `TargetRef::Object`s (ability_utils.rs:7911-7914), so
+        // over the HEAD's own `TargetRef::Object`s (`ability_utils::assign_targets_recursive`,
+        // mirrored in `assign_selected_slots_recursive`), so
         // an empty head pushes nothing and its sub is empty too. This flatten can
         // only be empty where the old one already was, so the gate is taken on
         // exactly the same chains as at BASE. Symmetry is safe by construction —
@@ -1790,8 +1816,10 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
                 state.resolution_source_relatch = None;
                 return;
             }
+            record_illegal_target_slots(state, Some(&validated));
             execute_effect(state, &validated, events);
         } else {
+            record_illegal_target_slots(state, None);
             execute_effect(state, ability, events);
         }
     }
@@ -3679,6 +3707,7 @@ fn self_counter_ability_is_batch_candidate(ability: &ResolvedAbility) -> bool {
         force_block_attacker: _,
         target_incarnations: _, // CR 400.7 referent pins; batch candidacy is shape-only
         selected_target_incarnations: _, // CR 400.7 selected-target pins; batch candidacy is shape-only
+        illegal_target_slots: _, // CR 608.2b resolution legality stamp; batch candidacy is shape-only
         controller: _,
         original_controller,
         scoped_player,
@@ -3909,6 +3938,7 @@ fn fixed_controller_gain_life_ability_is_batch_candidate(ability: &ResolvedAbili
         force_block_attacker: _,
         target_incarnations: _, // CR 400.7 referent pins; batch candidacy is shape-only
         selected_target_incarnations: _, // CR 400.7 selected-target pins; batch candidacy is shape-only
+        illegal_target_slots: _, // CR 608.2b resolution legality stamp; batch candidacy is shape-only
         controller: _,
         original_controller: _,
         scoped_player,
@@ -4119,6 +4149,7 @@ fn fixed_opponent_effect_ability_is_batch_candidate(ability: &ResolvedAbility) -
         force_block_attacker: _,
         target_incarnations: _, // CR 400.7 referent pins; batch candidacy is shape-only
         selected_target_incarnations: _, // CR 400.7 selected-target pins; batch candidacy is shape-only
+        illegal_target_slots: _, // CR 608.2b resolution legality stamp; batch candidacy is shape-only
         controller: _,
         original_controller: _,
         scoped_player,
@@ -4651,6 +4682,7 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         mode_abilities: a_mode_abilities,
         parent_target_missing_reason: a_parent_target_missing_reason,
         selected_target_incarnations: a_selected_target_incarnations,
+        illegal_target_slots: a_illegal_target_slots,
     } = a;
     let ResolvedAbility {
         effect: b_effect,
@@ -4724,6 +4756,7 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         mode_abilities: b_mode_abilities,
         parent_target_missing_reason: b_parent_target_missing_reason,
         selected_target_incarnations: b_selected_target_incarnations,
+        illegal_target_slots: b_illegal_target_slots,
     } = b;
 
     a_effect == b_effect
@@ -4735,6 +4768,9 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         // `PartialEq`; disagreeing with the derive would be the actual defect.
         && a_target_incarnations == b_target_incarnations
         && a_selected_target_incarnations == b_selected_target_incarnations
+        // CR 608.2b: the resolution legality stamp participates for the same
+        // reason — agreement with the derived `PartialEq`.
+        && a_illegal_target_slots == b_illegal_target_slots
         && a_controller == b_controller
         && a_scoped_player == b_scoped_player
         && a_kind == b_kind
@@ -4820,9 +4856,9 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
 ///   differing context must not collapse).
 /// - `description` — IN KEY (distinguishes triggers from the same source).
 /// - `source_name` — RESOLUTION-IRRELEVANT: a display-only pre-resolved name
-///   (game_state.rs:3493-3500) the frontend renders; it derives from
-///   `source_id` (already in key) and is never read during resolution. Not in
-///   key by design.
+///   (the `source_name` field of `StackEntryKind::TriggeredAbility`) the frontend
+///   renders; it derives from `source_id` (already in key) and is never read
+///   during resolution. Not in key by design.
 /// - `subject_match_count` — RESOLUTION-RELEVANT but PROVABLY EQUAL across a
 ///   run: it is the CR 603.2c filtered subject count from the firing event
 ///   batch. `resolve_batched` lifts it into resolution scope from the run's top
@@ -5609,6 +5645,7 @@ mod tests {
         card_types.core_types.push(core_type);
         BackFaceData {
             is_swap_snapshot: false,
+            trigger_printed_origins: Vec::new(),
             name: name.to_string(),
             power: None,
             toughness: None,
@@ -7005,6 +7042,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
         }
 
