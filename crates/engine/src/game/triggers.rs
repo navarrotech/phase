@@ -15861,6 +15861,10 @@ pub(super) fn build_triggered_ability_from_context(
         // Carry the trigger's description if the execute doesn't have its own.
         if resolved.description.is_none() {
             resolved.description = trig_def.description.clone();
+            // CR 608.2c: the head only just acquired its text, so the chain
+            // built above still needs it pushed down to the links that raise
+            // their own prompts.
+            resolved.backfill_chain_description();
         }
         // Propagate cast_from_zone from the source object so sub_ability
         // conditions like "if you cast it from your hand" can evaluate.
@@ -16015,6 +16019,9 @@ pub(super) fn build_triggered_ability(
     let mut resolved = build_resolved_from_def(execute, source_id, controller);
     if resolved.description.is_none() {
         resolved.description = trig_def.description.clone();
+        // CR 608.2c: see the sibling site above — a head that acquires its text
+        // after construction must re-push it down the chain.
+        resolved.backfill_chain_description();
     }
     resolved.unless_pay.clone_from(&trig_def.unless_pay);
     if matches!(trig_def.mode, TriggerMode::Phase) {

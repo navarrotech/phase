@@ -31121,6 +31121,47 @@ impl ResolvedAbility {
         }
     }
 
+    /// CR 608.2c: A parsed ability chain is ONE printed ability — every link is
+    /// a later instruction of the same text, not an ability of its own. The
+    /// parser records the printed text only on the chain head, so any prompt a
+    /// chained link opens has nothing to show the player.
+    ///
+    /// That is not cosmetic. A `WaitingFor::OptionalEffectChoice` raised by a
+    /// chained link ("If you do, you may cast the copy without paying its mana
+    /// cost" — Isochron Scepter) rendered as a bare Yes/No with no question, so
+    /// declining it looked identical to dismissing a stray dialog. The player
+    /// had already paid the activation cost, and the decline silently discarded
+    /// the copy. 152 optional chain links in the 4k-card test fixture alone open
+    /// a prompt this way.
+    ///
+    /// Fill every link that carries no text of its own with the head's printed
+    /// text. A link that DOES carry its own text — a modal branch label such as
+    /// "tap" / "untap" — keeps it, while the head's text still reaches that
+    /// link's own children: one value propagated down the chain, mirroring
+    /// [`Self::set_scoped_player_recursive`]. Idempotent, so a chain built once
+    /// and re-backfilled after a later head assignment is unchanged.
+    pub fn backfill_chain_description(&mut self) {
+        let Some(description) = self.description.clone() else {
+            return;
+        };
+        self.fill_missing_link_descriptions(&description);
+    }
+
+    /// Recursive half of [`Self::backfill_chain_description`], kept separate so
+    /// the public entry always sources the text from the chain head rather than
+    /// from whichever link the recursion currently sits on.
+    fn fill_missing_link_descriptions(&mut self, description: &str) {
+        for link in [self.sub_ability.as_mut(), self.else_ability.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            if link.description.is_none() {
+                link.description = Some(description.to_string());
+            }
+            link.fill_missing_link_descriptions(description);
+        }
+    }
+
     /// CR 608.2c: Stamp `context.optional_effect_performed` across the local
     /// ability chain. Used when an optional effect is accepted after its prompt
     /// suspended the parent chain — the stashed "If you do" continuation was
@@ -36801,6 +36842,160 @@ mod static_condition_traversal_tests {
         assert_eq!(
             serde_json::from_value::<Effect>(terminal_json).expect("terminal mode deserializes"),
             terminal
+        );
+    }
+}
+
+#[cfg(test)]
+mod chain_description_backfill_tests {
+    use super::*;
+
+    /// Build a three-deep chain: a head with printed text, a middle link with
+    /// none (the shape Isochron Scepter's "If you do, you may cast the copy"
+    /// sub-ability has), and a leaf that carries its own modal branch label.
+    fn three_deep_chain() -> ResolvedAbility {
+        let leaf = ResolvedAbility {
+            description: Some("tap".to_string()),
+            ..ResolvedAbility::new(
+                Effect::Surveil {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+                Vec::new(),
+                ObjectId(1),
+                PlayerId(0),
+            )
+        };
+        let middle = ResolvedAbility {
+            sub_ability: Some(Box::new(leaf)),
+            ..ResolvedAbility::new(
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+                Vec::new(),
+                ObjectId(1),
+                PlayerId(0),
+            )
+        };
+        ResolvedAbility {
+            description: Some("printed ability text".to_string()),
+            sub_ability: Some(Box::new(middle)),
+            ..ResolvedAbility::new(
+                Effect::Scry {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+                Vec::new(),
+                ObjectId(1),
+                PlayerId(0),
+            )
+        }
+    }
+
+    #[test]
+    fn backfill_fills_textless_links_and_preserves_their_own_text() {
+        let mut chain = three_deep_chain();
+        chain.backfill_chain_description();
+
+        let middle = chain.sub_ability.as_deref().expect("middle link");
+        assert_eq!(
+            middle.description.as_deref(),
+            Some("printed ability text"),
+            "a link with no text of its own inherits the head's printed text"
+        );
+
+        let leaf = middle.sub_ability.as_deref().expect("leaf link");
+        assert_eq!(
+            leaf.description.as_deref(),
+            Some("tap"),
+            "a link that carries its own label keeps it"
+        );
+    }
+
+    /// The head's text must reach links BELOW one that carries its own label —
+    /// a recursion that sourced the text from the current link would stamp
+    /// "tap" here instead.
+    #[test]
+    fn backfill_reaches_links_below_a_labelled_link() {
+        let mut chain = three_deep_chain();
+        let deepest = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                player: TargetFilter::Controller,
+            },
+            Vec::new(),
+            ObjectId(1),
+            PlayerId(0),
+        );
+        chain
+            .sub_ability
+            .as_mut()
+            .and_then(|middle| middle.sub_ability.as_mut())
+            .expect("leaf link")
+            .sub_ability = Some(Box::new(deepest));
+
+        chain.backfill_chain_description();
+
+        let below_label = chain
+            .sub_ability
+            .as_deref()
+            .and_then(|middle| middle.sub_ability.as_deref())
+            .and_then(|leaf| leaf.sub_ability.as_deref())
+            .expect("link below the labelled one");
+        assert_eq!(
+            below_label.description.as_deref(),
+            Some("printed ability text"),
+            "the head's text propagates past a labelled link, not the label"
+        );
+    }
+
+    /// `else_ability` is the branch sibling of `sub_ability` and raises its own
+    /// prompts, so it takes the same backfill.
+    #[test]
+    fn backfill_covers_the_else_branch() {
+        let mut chain = three_deep_chain();
+        chain.else_ability = Some(Box::new(ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            Vec::new(),
+            ObjectId(1),
+            PlayerId(0),
+        )));
+
+        chain.backfill_chain_description();
+
+        assert_eq!(
+            chain
+                .else_ability
+                .as_deref()
+                .expect("else branch")
+                .description
+                .as_deref(),
+            Some("printed ability text"),
+        );
+    }
+
+    /// A head with no text of its own leaves the chain untouched rather than
+    /// stamping `None` over a link that has one.
+    #[test]
+    fn backfill_with_no_head_text_is_a_no_op() {
+        let mut chain = three_deep_chain();
+        chain.description = None;
+        chain.backfill_chain_description();
+
+        let middle = chain.sub_ability.as_deref().expect("middle link");
+        assert_eq!(middle.description, None);
+        assert_eq!(
+            middle
+                .sub_ability
+                .as_deref()
+                .expect("leaf link")
+                .description
+                .as_deref(),
+            Some("tap"),
         );
     }
 }
