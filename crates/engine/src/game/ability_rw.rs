@@ -1406,9 +1406,16 @@ enum WriteScope {
 }
 
 /// CR 603.4 + CR 608.2c: the write scope of an effect target. `ParentTarget`
-/// resolves to the CHAIN ROOT (`nearest object-referent ancestor`,
-/// filter.rs:3063-3085); a PARENTLESS `ParentTarget` resolves to the EVENT object
-/// on a ZoneChanged trigger (targeting.rs:946-950) — represented as `EventObject`,
+/// resolves to the CHAIN ROOT (the nearest object-referent ancestor). The
+/// coordinate this note used to carry pointed at a function signature in
+/// `game/filter.rs`, not at any chain-root resolution, and the runtime referent
+/// was not determinable: `filter::filter_inner_for_object`'s `ParentTarget` arm
+/// reads `ability.targets` on the immediate ability and walks no chain, and the
+/// `chain_root` parameter below is a statically propagated analysis value rather
+/// than that runtime lookup. The false pointer is removed rather than replaced
+/// with a guess. A PARENTLESS `ParentTarget` resolves to the EVENT object
+/// on a ZoneChanged trigger (the `GameEvent::ZoneChanged` arm of
+/// `targeting::resolve_event_context_target_for_event_or_state`) — represented as `EventObject`,
 /// which `profiles_conflict` drops when the trigger carries no event object.
 /// Exhaustive & wildcard-free: a future `TargetFilter` variant must be classified.
 fn scope_of(target: &TargetFilter, chain_root: Option<WriteScope>) -> WriteScope {
@@ -2273,6 +2280,9 @@ fn legacy_object_scope(s: &ObjectScope) -> bool {
         // CR 120.1: the per-iteration batch source is resolution-local, not one
         // of the retained legacy refs (mirrors EventTarget).
         | ObjectScope::BatchSource
+        // CR 601.2c: the chain-root spell's declared target is resolution-local,
+        // not one of the retained legacy refs (mirrors AmassedArmy).
+        | ObjectScope::ChainRootTarget
         | ObjectScope::EventTarget => false,
     }
 }
@@ -3729,6 +3739,9 @@ fn current_pt_scope(scope: &ObjectScope) -> CurrentPtReads {
         | ObjectScope::AmassedArmy
         | ObjectScope::EventTarget
         | ObjectScope::OtherRevealedCard
+        // CR 601.2c: no P/T read is wired for the chain-root target (fail-closed
+        // `=> 0` in `game/quantity.rs::resolve_object_pt`).
+        | ObjectScope::ChainRootTarget
         | ObjectScope::OwnedLinkedExileCard => CurrentPtReads::default(),
     }
 }
@@ -3995,6 +4008,11 @@ fn read_object_scope(scope: &ObjectScope, kind: StateKind) -> RwProfile {
         // member-bound so same-event ability ordering (`profiles_conflict` via
         // `reads_member_bound`) does not fail open. Mirrors `AmassedArmy`.
         ObjectScope::OwnedLinkedExileCard => member_bound_read(),
+        // CR 601.2c: an ability-carried object identity read across the
+        // resolution chain (`SpellContext::chain_root_targets`). Member-bound so
+        // a same-event sibling write does not make `profiles_conflict` fail
+        // open. Mirrors `AmassedArmy` / `OwnedLinkedExileCard`.
+        ObjectScope::ChainRootTarget => member_bound_read(),
         ObjectScope::EventSource | ObjectScope::EventTarget => reads_event_live(),
         // §L7 precedent (CR 608.2c): a per-resolution local surfaced by THIS
         // ability's own reveal within the same resolution — observed by no
@@ -5661,6 +5679,7 @@ fn rw_effect(
             duration: _,
             driver: _,
             mana_spend_permission: _,
+            additional_cost: _,
         } => {
             let mut p = ext_write(StateKind::HandLibrary);
             p.writes_external.set(StateKind::StackShape);

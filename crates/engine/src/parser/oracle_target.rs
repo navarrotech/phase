@@ -11,9 +11,10 @@ use nom::Parser;
 use crate::types::ability::{
     AggregateFunction, AttachmentKind, CardTypeSetSource, ChoiceType, CombatRelation,
     CombatRelationSubject, Comparator, ControllerRef, CountScope, DamageKindFilter, FilterProp,
-    ObjectProperty, ObjectScope, ParitySource, PlayerFilter, PropertyAggregate, PtStat,
-    PtValueScope, QuantityExpr, QuantityRef, SeatDirection, SharedQuality, SharedQualityRelation,
-    TargetFilter, TargetSelectionMode, ThisWayCause, TypeFilter, TypedFilter,
+    ObjectProperty, ObjectScope, ParitySource, PlayerFilter, PlayerRelation, PropertyAggregate,
+    PtStat, PtValueScope, QuantityExpr, QuantityRef, SeatDirection, SharedQuality,
+    SharedQualityRelation, TargetFilter, TargetSelectionMode, ThisWayCause, TypeFilter,
+    TypedFilter,
 };
 use crate::types::card_type::{noncreature_subtype_set, SubtypeSet, Supertype};
 use crate::types::counter::{CounterMatch, CounterType};
@@ -1334,11 +1335,37 @@ pub fn parse_target_with_syntax<'a>(
             let after_noun = tag::<_, _, OracleError<'_>>(" ")
                 .parse(after_noun_orig)
                 .map_or(after_noun_orig, |(after, _)| after);
+            // CR 102.1 + CR 102.3: the superlative arm of the relative clause
+            // ("with/who has the most <property>") must measure "most" against
+            // the population the HEAD NOUN itself named — "target opponent …"
+            // measures among the caster's opponents, "target player …" measures
+            // among every player. The `alt` above binds exactly these two head
+            // nouns (`TargetFilter::Player` bare, or `Typed` with an `Opponent`
+            // controller), so the mapping is exhaustive over what can reach here.
+            // Both reachable head nouns are matched explicitly rather than one
+            // of them falling out of a wildcard, so a third one added to that
+            // `alt` cannot silently inherit the opponent population. The arm
+            // stays total (the relation is consumed only by the superlative
+            // arm; declining here would also disable the pre-existing
+            // "who controls more X than Y" anchor arm), and the debug assert
+            // makes the unreachable case loud under test.
+            let head_relation = match &player_filter {
+                TargetFilter::Player => PlayerRelation::All,
+                TargetFilter::Typed(_) => PlayerRelation::Opponent,
+                other => {
+                    debug_assert!(
+                        false,
+                        "unexpected player head noun for the superlative arm: {other:?}"
+                    );
+                    PlayerRelation::Opponent
+                }
+            };
             let mut tentative_ctx = ctx.clone();
             if let Ok((clause_rest, predicates)) =
                 super::oracle_effect::parse_target_player_relative_clause(
                     after_noun,
                     &mut tentative_ctx,
+                    head_relation,
                 )
             {
                 let clause_rest_lower = clause_rest.to_lowercase();
@@ -2272,7 +2299,7 @@ pub(super) enum AnaphorZoneClass {
 /// CR 400.1: the zone class a declared target slot filter itself denotes. A slot
 /// with no zone property, or one explicitly scoped to the battlefield, is a
 /// permanent; any other zone property makes it a card in that zone.
-fn slot_zone_class(slot: &TargetFilter) -> AnaphorZoneClass {
+pub(super) fn slot_zone_class(slot: &TargetFilter) -> AnaphorZoneClass {
     match slot.extract_in_zone() {
         Some(zone) if zone != Zone::Battlefield => AnaphorZoneClass::CardInNonBattlefieldZone,
         _ => AnaphorZoneClass::BattlefieldPermanent,
@@ -2996,6 +3023,7 @@ pub fn parse_type_phrase_folding_with_ctx<'a>(
                         | TypeFilter::Planeswalker
                         | TypeFilter::Land
                         | TypeFilter::Battle
+                        | TypeFilter::Kindred
                         | TypeFilter::Permanent
                 );
                 if is_concrete_core_type {
@@ -3108,6 +3136,7 @@ pub fn parse_type_phrase_folding_with_ctx<'a>(
                 | TypeFilter::Planeswalker
                 | TypeFilter::Land
                 | TypeFilter::Battle
+                | TypeFilter::Kindred
                 | TypeFilter::Permanent
         )
     ) {
@@ -3131,6 +3160,7 @@ pub fn parse_type_phrase_folding_with_ctx<'a>(
                     | TypeFilter::Planeswalker
                     | TypeFilter::Land
                     | TypeFilter::Battle
+                    | TypeFilter::Kindred
             );
             if !is_concrete_core_type {
                 break;
@@ -3493,9 +3523,9 @@ pub fn parse_type_phrase_folding_with_ctx<'a>(
     }
 
     // CR 700.9 (modified) + CR 109.4 (control): "<typed filter> other than ~"
-    // excludes the ability source from the population. FilterProp::Another
-    // (filter.rs:2206) matches every object except the source, so the count
-    // omits the source permanent (Thundering Raiju: "modified creatures you
+    // excludes the ability source from the population. The `FilterProp::Another`
+    // arm of `filter::matches_filter_prop` matches every object except the
+    // source, so the count omits the source permanent (Thundering Raiju: "modified creatures you
     // control other than this creature" — normalized to "~"). The trailing
     // self-reference is recognized via `nom_target::parse_self_reference`
     // ("~"/"it"/"this creature"/"itself"/…). CR 303.4b + CR 301.5a: the
@@ -4295,9 +4325,11 @@ pub fn parse_type_phrase_folding_with_ctx<'a>(
 
     // CR 201.2a: Compose the typed filter with the chosen-name constraint when
     // the suffix was present. Runtime And-eval requires every inner filter to
-    // match (game/filter.rs line 1464/1782); the HasChosenName arm
-    // (game/filter.rs line 1604) compares the object's name to the source's
-    // ChosenAttribute::CardName.
+    // match (the `TargetFilter::And` arm of `filter::filter_inner_for_object`
+    // for the object path, and of `filter::spell_record_matches_filter` for
+    // the spell-record path); the `TargetFilter::HasChosenName` arm of
+    // `filter::filter_inner_for_object` compares the object's name to the
+    // source's ChosenAttribute::CardName.
     let filter = if has_chosen_name {
         TargetFilter::And {
             filters: vec![filter, TargetFilter::HasChosenName],
@@ -9077,7 +9109,7 @@ fn parse_except_for_type_list_suffix(
         // the legacy `trim_end_matches('s')` produced "Octopuse"/"Elve", which no
         // lookup recognizes, so every genuine subtype exclusion declined. `word` is a
         // whole alphabetic token from this function's own `take_till1`, and
-        // `parse_subtype_entry` (oracle_util.rs:1258) word-bounds every arm —
+        // `parse_subtype_entry` word-bounds every arm —
         // `starts_with_word_ci` on the singular, an equivalent
         // non-alphanumeric-follower guard on the `-s`/`-es`/`-ies` plurals — so a
         // match here always consumes the whole word: "Serpentine" cannot match
@@ -10240,6 +10272,9 @@ fn parse_zone_qual(i: &str) -> super::oracle_nom::error::OracleResult<'_, ZoneQu
                 tag("that player's "),
                 tag("defending player's "),
                 tag("each player's "),
+                // CR 404.1: "a player's graveyard" names a zone without binding an
+                // owner (Lodestone Bauble), so it contributes `InZone` alone.
+                tag("a player's "),
             )),
         ),
         // CR 400.7: Adjective- and quantity-qualified zone references — "all
@@ -20318,6 +20353,26 @@ mod tests {
         // The OtherPoss split must not regress non-"their" possessives:
         // "that player's graveyard" emits InZone with no Owned prop.
         let (f, _) = parse_target("a card from that player's graveyard");
+        let tf = typed_leg(&f).expect("typed filter");
+        assert_eq!(tf.controller, None);
+        assert!(has_prop(
+            tf,
+            FilterProp::InZone {
+                zone: Zone::Graveyard,
+            }
+        ));
+        assert!(!tf
+            .properties
+            .iter()
+            .any(|p| matches!(p, FilterProp::Owned { .. })));
+    }
+
+    #[test]
+    fn parse_target_a_players_graveyard_binds_the_zone() {
+        // "a player's graveyard" must reach the OtherPoss arm, not the bare "a "
+        // article, so the zone is extracted with no owner binding.
+        let (f, rest) = parse_target("basic land cards from a player's graveyard");
+        assert_eq!(rest, "");
         let tf = typed_leg(&f).expect("typed filter");
         assert_eq!(tf.controller, None);
         assert!(has_prop(

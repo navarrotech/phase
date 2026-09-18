@@ -3,11 +3,19 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const EXPECTED_PROTOCOL_VERSION = 71;
+// Upstream's Winston draft frames are v71. This branch's v72 combines the
+// independent policy carrier with upstream's paid graveyard cast offer; v73
+// adds face-qualified variants and preserves a paid addition while a resolution
+// modal-face prompt is paused; v74 carries exact delayed-trigger receipts;
+// v75 carries producer-owned paid-offer cleanup authority.
+// Keep the measured base so a future merge cannot collapse independent wire
+// changes onto one number.
+const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
+const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 4;
 // The LOBBY message-set version, not derived from the full-game number above.
 // The classifier below refuses an expression only on the SOURCE constants; this
 // script never reads itself, so its own EXPECTED_* must stay literals.
-const EXPECTED_LOBBY_PROTOCOL_VERSION = 8;
+const EXPECTED_LOBBY_PROTOCOL_VERSION = 9;
 // The capability FLOOR for correlated tournament settlement — a different kind
 // of number from the other version constants here, and the reason it is pinned
 // separately. Those track a surface's current version; this one is frozen at the
@@ -30,7 +38,8 @@ const EXPECTED_MIN_LOBBY_PROTOCOL_FOR_DEFAULT_SCORING = 6;
 // here, so a full-game bump could ship with an unbumped P2P version and CI
 // stayed green — a v(n-1) host and a v(n) guest would then complete a
 // handshake and only fail when the incompatible payload arrived.
-const EXPECTED_WIRE_PROTOCOL_VERSION = 53;
+const PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION = 54;
+const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 3;
 // The P2P DRAFT wire version. A FIFTH independent surface, and the one this
 // script previously did not read at all: `DRAFT_PROTOCOL_VERSION` is an
 // EXACT-MATCH first-contact gate (p2p-draft-host.ts / p2p-draft-guest.ts refuse
@@ -174,6 +183,12 @@ const AUTHORED_LITERALS = [
     // has no shared Rust constant to mirror, so unlike the ack/scoring floors it
     // is not additionally value-pinned by an EXPECTED_* assertion below.
     "MIN_LOBBY_PROTOCOL_FOR_MATCH_TYPE",
+    // The client-only behavioral floor for recoverable (bounded-overlap)
+    // credential rotation. Same frozen-literal reasoning as the match-type floor
+    // above: it gates proactive rotation on the broker honoring the overlap, has
+    // no shared Rust constant to mirror, and must stay a bare literal so a future
+    // bump cannot re-derive it and start refusing v9 brokers that recover.
+    "MIN_LOBBY_PROTOCOL_FOR_RECOVERABLE_ROTATION",
     "MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL",
     "PROTOCOL_VERSION",
   ]],

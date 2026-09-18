@@ -3506,6 +3506,41 @@ fn sub_has_independent_object_target_slot(sub: &ResolvedAbility) -> bool {
             && !effect_requires_parent_target_object(&sub.effect))
         || (has_resolution_owned_zone_choice(sub)
             && !sub_ability_target_belongs_to_reflexive_context(sub))
+        || choose_one_of_branches_own_object_choice(sub)
+}
+
+/// CR 115.10a + CR 608.2d: whether a `ChooseOneOf` sub owns a fresh object
+/// choice made while the SELECTED BRANCH resolves.
+///
+/// `Effect::ChooseOneOf` is deliberately slot-less (see `Effect::target_filter`),
+/// so `extract_target_filter_from_effect` reports no filter for it and the
+/// caller would force the parent instruction's already-bound object onto the
+/// choice — and `choose_one_of::resolve_branch` then forwards that object to the
+/// selected branch as `parent_targets`. For a branch set that picks its OWN
+/// object at resolution ("Destroy target artifact. … put that many … counters on
+/// an artifact you control"), that inheritance is wrong twice over: it silently
+/// rebinds the recipient to the destroyed target (CR 122.2 — the object the
+/// earlier instruction consumed), and it suppresses the branch's own
+/// resolution-time recipient choice.
+///
+/// Narrow by construction — EVERY branch must be `Resolution`-timed AND name a
+/// described (non-context-ref) recipient. A branch produced by the counter-choice
+/// reader's shared-recipient LIFT carries `ParentTarget`/`ParentTargetSlot`
+/// (`is_context_ref() == true`) and `Stack` timing, so every shipping
+/// `ChooseOneOf`-of-`PutCounter` card fails both conjuncts and keeps today's
+/// inheritance.
+fn choose_one_of_branches_own_object_choice(sub: &ResolvedAbility) -> bool {
+    let Effect::ChooseOneOf { branches, .. } = &sub.effect else {
+        return false;
+    };
+    !branches.is_empty()
+        && branches.iter().all(|branch| {
+            branch.target_choice_timing == TargetChoiceTiming::Resolution
+                && branch
+                    .effect
+                    .target_filter()
+                    .is_some_and(|filter| !filter.is_context_ref())
+        })
 }
 
 /// CR 701.3a + CR 303.4f: `forward_result` ChangeZone nesting Attach→ParentTarget
@@ -6179,8 +6214,11 @@ fn crosses_modal_boundary(node: &ResolvedAbility) -> bool {
 
 /// [`ability_or_branch_references_tracked_set`] applied to a branch that the
 /// caller is about to ENTER, with the mode-boundary stop of
-/// [`crosses_modal_boundary`]. Every descent in this family goes through here,
-/// so the stop cannot be applied at some entry points and forgotten at others.
+/// [`crosses_modal_boundary`]. One other descent in this family applies the same
+/// stop without routing through here: the `enters` closure in
+/// [`node_or_branch_references_tracked_set`], which has to thread a
+/// [`ParentAnaphor`] this signature does not carry. A change to the stop must be
+/// made in both places.
 fn branch_references_tracked_set(node: Option<&ResolvedAbility>) -> bool {
     node.is_some_and(|n| !crosses_modal_boundary(n) && ability_or_branch_references_tracked_set(n))
 }
@@ -6327,7 +6365,47 @@ fn node_or_later_is_publisher_position(node: &ResolvedAbility) -> bool {
             .is_some_and(node_or_later_is_publisher_position)
 }
 
+/// CR 608.2c: what a `ParentTarget` anaphor at a node names, relative to a
+/// publisher above it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ParentAnaphor {
+    /// No nearer antecedent intervenes: the anaphor reads the chain's tracked
+    /// set, so the publisher above must record it (Najeela — "they gain").
+    NamesPublisher,
+    /// The node's parent declared its own object targets (CR 115.1), which are
+    /// the nearer antecedent; the anaphor names them, never the publisher's set.
+    NamesDeclaredTargets,
+}
+
+/// CR 608.2c: a continuous grant whose `affected` object is the
+/// `ParentTarget` anaphor ("that creature can't be blocked this turn").
+///
+/// CR 613: when no nearer antecedent intervenes
+/// ([`ParentAnaphor::NamesPublisher`]), such a grant CONSUMES the chain's
+/// tracked object set ("They gain trample…", Najeela — issue #2898):
+/// `ParentTarget` with no inherited targets resolves against
+/// `chain_tracked_set_id` in `effect.rs`, so the parent instruction (e.g.
+/// `Untap all attacking creatures`) must publish that set for the grant to bind
+/// to the affected permanents. That is the reason this predicate exists: without
+/// it, Najeela's grant binds to nothing.
+fn grant_affects_parent_target(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::GenericEffect { static_abilities, .. }
+            if static_abilities
+                .iter()
+                .any(|static_def| matches!(static_def.affected, Some(TargetFilter::ParentTarget)))
+    )
+}
+
 fn ability_or_branch_references_tracked_set(ability: &ResolvedAbility) -> bool {
+    node_or_branch_references_tracked_set(ability, ParentAnaphor::NamesPublisher)
+}
+
+fn node_or_branch_references_tracked_set(
+    ability: &ResolvedAbility,
+    anaphor: ParentAnaphor,
+) -> bool {
     let consumes = matches!(
         &ability.effect,
         Effect::CreateDelayedTrigger {
@@ -6367,9 +6445,32 @@ fn ability_or_branch_references_tracked_set(ability: &ResolvedAbility) -> bool {
     // at the highest index of its card. That corpus is a generated artifact and
     // its consumer side may be undercounted relative to this branch's parser;
     // regenerate `card-data.json` to close it.
+
+    // CR 608.2c + CR 601.2c: a node that declares its own object targets is the
+    // nearest antecedent of its continuation's "that creature" — even when the
+    // declaration was empty — so a grant below it never reaches an ancestor's
+    // population (Trygon Prime's declined sub target grants nothing). An optional
+    // single target ("up to one target creature") declares one only when it is
+    // chosen on the stack. A resolution-time "up to one" choice declares no
+    // target, so its grant still reads the tracked set.
+    let declares_optional_single_target = ability.optional_targeting
+        && ability.target_choice_timing == TargetChoiceTiming::Stack
+        && crate::game::triggers::extract_target_filter_from_effect(&ability.effect).is_some();
+    let child_anaphor = if ability.multi_target.is_some() || declares_optional_single_target {
+        ParentAnaphor::NamesDeclaredTargets
+    } else {
+        ParentAnaphor::NamesPublisher
+    };
+    let enters = |node: Option<&ResolvedAbility>| {
+        node.is_some_and(|n| {
+            !crosses_modal_boundary(n) && node_or_branch_references_tracked_set(n, child_anaphor)
+        })
+    };
     consumes
-        || branch_references_tracked_set(ability.sub_ability.as_deref())
-        || branch_references_tracked_set(ability.else_ability.as_deref())
+        || (anaphor == ParentAnaphor::NamesPublisher
+            && grant_affects_parent_target(&ability.effect))
+        || enters(ability.sub_ability.as_deref())
+        || enters(ability.else_ability.as_deref())
 }
 
 /// Returns true if the effect references the most recent tracked set through
@@ -6499,18 +6600,16 @@ fn effect_references_tracked_set(effect: &Effect) -> bool {
         static_abilities, ..
     } = effect
     {
-        // CR 608.2c + CR 613: A continuous grant whose `affected` filter either
-        // names the tracked set directly (`TrackedSet`) or is the `ParentTarget`
-        // anaphor ("They gain trample…", Najeela — issue #2898) consumes the
-        // chain's tracked object set. `ParentTarget` with no inherited targets
-        // resolves against `chain_tracked_set_id` in `effect.rs`, so the parent
-        // instruction (e.g. `Untap all attacking creatures`) must publish that
-        // set for the grant to bind to the affected permanents.
+        // CR 608.2c + CR 613: A continuous grant consumes the chain's tracked
+        // object set when its `affected` filter NAMES that set (`TrackedSet`).
+        // The `ParentTarget` anaphor is NOT answered here: it is answered by
+        // `grant_affects_parent_target`, which the caller applies only when no
+        // nearer antecedent intervenes. That function's doc carries why.
         if static_abilities.iter().any(|static_def| {
-            static_def.affected.as_ref().is_some_and(|affected| {
-                filter_references_tracked_set(affected)
-                    || matches!(affected, TargetFilter::ParentTarget)
-            })
+            static_def
+                .affected
+                .as_ref()
+                .is_some_and(filter_references_tracked_set)
         }) {
             return true;
         }
@@ -7628,6 +7727,11 @@ fn first_tracked_set_consumer_mode(
             cause: ThisWayCause::OwnerLibraryShuffleSubject,
         });
     }
+    // CR 608.2c: a `ParentTarget`-affected grant is deliberately NOT treated as
+    // a consumer here — `grant_affects_parent_target` is applied only inside
+    // `node_or_branch_references_tracked_set`, so this search keeps its base
+    // classification. Phase 4 did not establish whether any chain reaches this
+    // site carrying such a grant.
     let consumes_here = matches!(
         &ability.effect,
         Effect::CreateDelayedTrigger {
@@ -12559,6 +12663,48 @@ fn is_bound_attach_remainder_for(pending: &PendingContinuation, ability: &Resolv
 /// `GameScenario`, so neither repair can be measured here either (issue #8750).
 /// Adding a variant to this list without a test that fails when the branch is
 /// reverted is the mistake it was introduced to prevent.
+/// CR 603.7 + CR 608.2g: after a `CastFromZone` head's tail ran inline behind
+/// an open `CastOffer::GraveyardPaidCast`, note on that offer the delayed
+/// triggers the tail installed. The receipt is selected by the producer-issued
+/// owner already stamped by the sole installer, not by a counter range or
+/// equivalent-looking source/card fields; nested and later installations are
+/// ownerless once that marker is consumed.
+fn record_tail_installs_on_paid_offer(
+    state: &mut GameState,
+    offer_id: crate::types::identifiers::ResolutionCastOfferId,
+) {
+    let receipts: Vec<_> = state
+        .delayed_triggers
+        .iter()
+        .filter_map(|trigger| trigger.provenance.origin())
+        .filter(|origin| origin.offer_id == Some(offer_id))
+        .map(
+            |origin| crate::types::ability::ResolutionCastDelayedTriggerReceipt {
+                offer_id,
+                token: origin.token,
+                instance: origin.instance,
+                source_id: origin.source_id,
+            },
+        )
+        .collect();
+    if receipts.is_empty() {
+        return;
+    }
+    if let WaitingFor::CastOffer {
+        kind: CastOfferKind::GraveyardPaidCast { cleanup, .. },
+        ..
+    } = &mut state.waiting_for
+    {
+        if cleanup.offer_id == Some(offer_id) {
+            for receipt in receipts {
+                if !cleanup.delayed_trigger_receipts.contains(&receipt) {
+                    cleanup.delayed_trigger_receipts.push(receipt);
+                }
+            }
+        }
+    }
+}
+
 fn tail_family_has_runtime_evidence(effect: &Effect) -> bool {
     matches!(
         effect,
@@ -14023,7 +14169,17 @@ fn resolve_chain_body(
     // fallback in `counters.rs`; routing them through an interactive prompt
     // here would be wrong (and untested against that resolver's semantics).
     let needs_resolution_object_choice = match &ability.effect {
-        Effect::PutCounter { .. } => ability.targets.is_empty(),
+        // CR 115.10a: "no recipient chosen yet" means "no OBJECT target", not
+        // "no targets at all". A `PutCounter` reached as a `ChooseOneOf` branch
+        // carries the `TargetRef::Player` that `choose_one_of::resolve_branch`
+        // injects for the branch chooser, which is not a recipient. This is a
+        // strict superset of the former `targets.is_empty()` test (an empty
+        // target list contains no `TargetRef::Object` either), so every
+        // pre-existing `PutCounter` caller is unaffected.
+        Effect::PutCounter { .. } => !ability
+            .targets
+            .iter()
+            .any(|target| matches!(target, TargetRef::Object(_))),
         Effect::ChooseCounterKind { target, .. } => {
             !matches!(target, TargetFilter::SpecificObject { .. })
         }
@@ -15027,36 +15183,39 @@ fn resolve_chain_body(
             // has not answered yet would read a state that does not exist, so
             // park it behind that head instead.
             //
-            // NARROWER than the states a `CastFromZone` head can leave, and named
-            // rather than hidden: `cast_from_zone::resolve` can also leave a
-            // `CastOfferKind::GraveyardPaidCast`, an in-resolution cast from
-            // `initiate_cast_during_resolution`, or a
-            // `LingeringPermissionGrantResult::NeedsChoice`.
+            // The other window a `CastFromZone` head leaves here is the PAID
+            // during-resolution offer, `CastOfferKind::GraveyardPaidCast`
+            // (Helmut Zemo, Ogre Battlecaster — issue #8775; their
+            // `without_paying_mana_cost: false` head carries the
+            // `DuringResolution` driver the paid branch of
+            // `cast_from_zone::resolve` reads). For that window the tail is
+            // resolved INLINE, before the offer is answered, and that order is
+            // load-bearing: the tail is the `CreateDelayedTrigger` for "when you
+            // cast that spell" / "if you cast a spell this way", keyed to the
+            // chosen card (CR 603.7), and the cast the offer performs is the
+            // event it waits for — installed after the cast it would never fire.
+            // It reads nothing the unanswered offer decides: its referent is the
+            // chosen target, bound when the trigger went on the stack. The
+            // trigger is keyed to the CARD, not to the offer, so a declined
+            // offer WITHDRAWS it again
+            // (`engine_resolution_choices::withdraw_declined_offer_cast_triggers`);
+            // otherwise it would fire on a cast of that card by another route
+            // this turn (Zemo declined, the Bolt then cast under Kess). Pinned by
+            // `cast_this_way_gate_8721::zemo_pays_out_the_counter_once_the_granted_spell_is_actually_cast`
+            // and `ogre_battlecaster_8775`.
             //
-            // CORRECTED after review: an earlier version credited the driver for
-            // this ("all six carriers drive `LingeringPermission`"), which is not
-            // what gates those paths — `immediate_graveyard_free_cast` never
-            // consults the driver, and Finale of Promise satisfies its conditions.
-            // The load-bearing facts are per card, and only three heads reach this
-            // decision at all (the other three tails are stopped one step earlier
-            // by the two scope rules): Sins of the Past carries
-            // `duration: UntilEndOfTurn`, so the free-cast-during-resolution gate
-            // is false; Helmut Zemo and Ogre Battlecaster carry
-            // `without_paying_mana_cost: false`, so both free-cast gates are
-            // false; and all three target a card already in a graveyard, which
-            // `grant_lingering_permissions` routes in place, so `NeedsChoice`
-            // cannot fire.
+            // The remaining states are named rather than hidden:
+            // `cast_from_zone::resolve` can also leave an in-resolution cast
+            // from `initiate_cast_during_resolution`, or a
+            // `LingeringPermissionGrantResult::NeedsChoice`. Of the tail
+            // carriers only Sins of the Past reaches this decision through
+            // them: it carries `duration: UntilEndOfTurn`, so both
+            // during-resolution gates are false, and its target is already in
+            // a graveyard, which `grant_lingering_permissions` routes in place,
+            // so `NeedsChoice` cannot fire. (Finale of Promise satisfies the
+            // free gate's conditions but is stopped by the family allowlist.)
             //
-            // One correction to that correction, because over-correcting is its
-            // own failure: for the PAID offer (`CastOfferKind::GraveyardPaidCast`)
-            // `without_paying_mana_cost: false` is the SATISFIED first conjunct,
-            // not an exclusion. What keeps Zemo and Ogre out of that one is the
-            // driver after all — it also requires `driver.is_during_resolution()`,
-            // and both carry the default `LingeringPermission`. The driver is
-            // simply not what gates the two FREE-cast paths, which is what the
-            // first correction was about.
-            //
-            // Site without a demonstrated consequence, so this stays
+            // Site without a demonstrated consequence for those, so this stays
             // the pre-#8721 condition rather than being widened on speculation;
             // the broader idiom further down this function is
             // `!matches!(state.waiting_for, WaitingFor::Priority { .. })`.
@@ -15070,7 +15229,37 @@ fn resolve_chain_body(
                 ) {
                     prepend_to_pending_continuation(state, tail);
                 } else {
-                    resolve_ability_chain(state, &tail, events, depth + 1)?;
+                    // A paid offer owns only its immediate, direct synchronous
+                    // trigger tail. Snapshot its producer ID before resolving;
+                    // do not infer ownership from whichever prompt may be open
+                    // after the call returns.
+                    let paid_offer_id = match &state.waiting_for {
+                        WaitingFor::CastOffer {
+                            kind: CastOfferKind::GraveyardPaidCast { cleanup, .. },
+                            ..
+                        } => cleanup.offer_id.filter(|offer_id| offer_id.0 != 0),
+                        _ => None,
+                    };
+                    if matches!(tail.effect, Effect::CreateDelayedTrigger { .. }) {
+                        let offer_id = paid_offer_id.ok_or_else(|| {
+                            EffectError::InvalidParam(
+                                "paid resolution offer has no producer identity".to_string(),
+                            )
+                        })?;
+                        state.active_paid_resolution_offer_tail = Some(offer_id);
+                        let result = resolve_ability_chain(state, &tail, events, depth + 1);
+                        // Clear before propagating every success/error/paused
+                        // result so no later or nested trigger can inherit it.
+                        state.active_paid_resolution_offer_tail = None;
+                        // If the direct trigger installed before a later chain
+                        // error, retain its receipt before returning that error:
+                        // the state has already acquired an owner-bearing live
+                        // root and its offer must still be able to withdraw it.
+                        record_tail_installs_on_paid_offer(state, offer_id);
+                        result?;
+                    } else {
+                        resolve_ability_chain(state, &tail, events, depth + 1)?;
+                    }
                 }
             }
             return Ok(());
@@ -15522,6 +15711,18 @@ fn resolve_chain_body(
                     {
                         else_resolved.targets =
                             inject_last_revealed_targets(state, ability, else_branch.as_ref());
+                    } else if else_resolved.targets.is_empty()
+                        && !state.last_zone_changed_ids.is_empty()
+                        && matches!(ability.effect, Effect::ExileTop { .. })
+                        && !effect_uses_implicit_tracked_set_targets(&else_resolved.effect)
+                    {
+                        // CR 309.4c + CR 607.1: Forward exiled card IDs to else-ability
+                        // (linked ability pair — second refers to cards exiled by the first).
+                        else_resolved.targets = state
+                            .last_zone_changed_ids
+                            .iter()
+                            .map(|&id| TargetRef::Object(id))
+                            .collect();
                     } else if should_propagate_parent_targets(ability, &else_resolved) {
                         else_resolved.targets = ability.targets.clone();
                     }
@@ -15615,6 +15816,11 @@ fn resolve_chain_body(
             // `effect_references_tracked_set` discriminates the two: it is true
             // exactly for consumer riders (any `TrackedSet` quantity/filter
             // position, incl. `CopyTokenOf { target }`), false for producers.
+            // A `ParentTarget`-affected grant is deliberately NOT counted as a
+            // consumer rider here: `grant_affects_parent_target` is applied only
+            // inside `node_or_branch_references_tracked_set`. Phase 4 did not
+            // establish whether any chain reaches this site carrying such a
+            // grant.
             if matches!(
                 condition,
                 AbilityCondition::EffectOutcome {
@@ -16666,6 +16872,7 @@ pub(crate) fn evaluate_condition(
             | crate::types::ability::ObjectScope::OwnedLinkedExileCard
             | crate::types::ability::ObjectScope::EventTarget
             | crate::types::ability::ObjectScope::AmassedArmy
+            | crate::types::ability::ObjectScope::ChainRootTarget
             | crate::types::ability::ObjectScope::BatchSource => false,
         },
         AbilityCondition::AlternativeManaCostPaid => ability.context.alternative_mana_cost_paid,
@@ -16919,6 +17126,7 @@ pub(crate) fn evaluate_condition(
                 | crate::types::ability::ObjectScope::OwnedLinkedExileCard
                 | crate::types::ability::ObjectScope::EventTarget
                 | crate::types::ability::ObjectScope::AmassedArmy
+                | crate::types::ability::ObjectScope::ChainRootTarget
                 | crate::types::ability::ObjectScope::BatchSource => None,
             };
             object_id
@@ -18296,6 +18504,7 @@ mod tests {
                         bounds: crate::types::ability::ResolutionCastWindow::UNBOUNDED,
                     },
                     mana_spend_permission: None,
+                    additional_cost: None,
                 },
                 vec![],
                 ObjectId(1),
@@ -18939,6 +19148,7 @@ mod tests {
             token: DelayedTriggerToken(7),
             instance: DelayedTriggerInstanceId(11),
             source_id: ObjectId(13),
+            offer_id: None,
         });
         state.resolving_trigger_firing = Some(live);
 
@@ -20304,6 +20514,62 @@ mod tests {
         assert!(
             ability_or_branch_references_tracked_set(&ability),
             "repeat_for: TrackedSetSize must mark the ability as referencing the tracked set"
+        );
+    }
+
+    /// CR 601.2c + CR 608.2c: a node that declares a single optional object target
+    /// ("up to one target creature", lowered with `optional_targeting` and no
+    /// `multi_target`) is the nearest antecedent of its continuation's "that
+    /// creature". When the player declines that target, the grant affects nothing.
+    /// It must not reach an ancestor's tracked set.
+    #[test]
+    fn optional_single_target_node_is_the_antecedent_of_a_parent_target_grant() {
+        let source = ObjectId(1);
+        let grant = ResolvedAbility::new(
+            Effect::GenericEffect {
+                static_abilities: vec![StaticDefinition::continuous()
+                    .affected(TargetFilter::ParentTarget)
+                    .modifications(vec![ContinuousModification::AddKeyword {
+                        keyword: Keyword::Haste,
+                    }])],
+                duration: Some(Duration::UntilEndOfTurn),
+                target: None,
+                end_cost: None,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        let mut pump = ResolvedAbility::new(
+            Effect::Pump {
+                power: PtValue::Fixed(1),
+                toughness: PtValue::Fixed(1),
+                target: TargetFilter::Typed(TypedFilter::creature()),
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        )
+        .sub_ability(grant);
+        // Control: with no declared target on the pump, the grant names the
+        // chain's tracked set, so the instrument fires.
+        assert!(
+            chain_references_tracked_set(&pump),
+            "a ParentTarget grant with no nearer antecedent consumes the tracked set"
+        );
+        pump.optional_targeting = true;
+        assert!(
+            !chain_references_tracked_set(&pump),
+            "an optional single declared target is the grant's antecedent, so the \
+             grant must not consume an ancestor's tracked set"
+        );
+        // A resolution-time "up to one" choice declares no target, so the grant
+        // still names the chain's tracked set.
+        pump.target_choice_timing = TargetChoiceTiming::Resolution;
+        assert!(
+            chain_references_tracked_set(&pump),
+            "a resolution-time optional choice declares no target, so the grant \
+             must still consume the tracked set"
         );
     }
 
@@ -36484,6 +36750,7 @@ mod tests {
                 duration: None,
                 driver: CastFromZoneDriver::LingeringPermission,
                 mana_spend_permission: None,
+                additional_cost: None,
             },
         );
         let ability = build_resolved_from_def(&pure_peek_definition(cast, 1), source, PlayerId(0));
@@ -36551,6 +36818,7 @@ mod tests {
                     duration: None,
                     driver: CastFromZoneDriver::DuringResolution,
                     mana_spend_permission: None,
+                    additional_cost: None,
                 },
             )
             .optional();
@@ -36673,6 +36941,7 @@ mod tests {
                         duration: Some(Duration::UntilEndOfTurn),
                         driver,
                         mana_spend_permission: None,
+                        additional_cost: None,
                     },
                     vec![],
                     ObjectId(900),
@@ -36707,6 +36976,7 @@ mod tests {
                 duration: None,
                 driver: CastFromZoneDriver::LingeringPermission,
                 mana_spend_permission: None,
+                additional_cost: None,
             },
             vec![],
             ObjectId(900),
@@ -36874,6 +37144,7 @@ mod tests {
                 duration: None,
                 driver: CastFromZoneDriver::DuringResolution,
                 mana_spend_permission: None,
+                additional_cost: None,
             },
             vec![TargetRef::Object(spell)],
             source,
@@ -36912,6 +37183,7 @@ mod tests {
                     duration: None,
                     driver: CastFromZoneDriver::DuringResolution,
                     mana_spend_permission: None,
+                    additional_cost: None,
                 },
                 vec![],
                 ObjectId(900),
@@ -37036,6 +37308,7 @@ mod tests {
                 duration: None,
                 driver: CastFromZoneDriver::LingeringPermission,
                 mana_spend_permission: None,
+                additional_cost: None,
             },
         )
         .optional();
@@ -37157,6 +37430,7 @@ mod tests {
                 duration: None,
                 driver: CastFromZoneDriver::LingeringPermission,
                 mana_spend_permission: None,
+                additional_cost: None,
             },
         );
         let dig_def = AbilityDefinition::new(

@@ -23,6 +23,7 @@ use crate::parser::oracle_ir::effect_chain::{
 };
 use crate::parser::oracle_nom::bridge::nom_on_lower;
 use crate::parser::oracle_nom::error::OracleError;
+use crate::parser::oracle_nom::target::chain_text_mentions_chosen_object;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction,
     CastFromZoneDriver, CastingPermission, ChoiceType, Comparator, ControllerRef, DamageChannel,
@@ -41,8 +42,9 @@ use super::lower::{
     attach_graveyard_redirect_rider_to_prior_cast_from_zone,
     attach_graveyard_redirect_rider_to_prior_free_cast_from_zones,
     attach_land_enters_tapped_to_previous_play_from_exile, cast_cost_raise_rider,
-    clone_would_transplant_gated_referent, consolidate_die_and_coin_defs,
-    definition_targets_self_source, effect_publishes_revealed_subject,
+    chain_references_chosen_card, clone_would_transplant_gated_referent,
+    consolidate_die_and_coin_defs, definition_targets_self_source,
+    effect_publishes_revealed_subject, ensure_remember_card_after_object_choice,
     extract_bounded_target_multi_target, extract_exact_target_multi_target,
     extract_optional_target_multi_target, extract_verb_up_to_multi_target,
     fold_copy_spell_gains_haste_and_quoted_grant,
@@ -3681,6 +3683,11 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
     // CR 601.2c + CR 608.2c: suppress a reflexive-target rider when the optional
     // "up to one" antecedent target is declined (no object target chosen).
     gate_reflexive_rider_on_declined_optional_target(&mut result);
+    // CR 607.2d + CR 608.2c: a standalone battlefield-object choice whose chain
+    // reads the pick persists it (`RememberCard`) — or, when the reader text
+    // belongs to a non-object axis (Gideon's Sacrifice), is restored to its
+    // pre-phase-2 `TargetOnly` shape. See `reconcile_object_choice_durability`.
+    reconcile_object_choice_durability(&mut result, ir);
     // CR 608.2c + CR 613.1f: persist a standalone "choose a [type] card exiled
     // with ~" pick as the host's last chosen card (Koh, the Face Stealer).
     append_remember_card_to_standalone_exiled_choice(&mut result);
@@ -3814,6 +3821,71 @@ fn same_revealed_card_type_condition(
     positive_types == negated_types
         && positive_filter == negated_filter
         && positive_subtype == negated_subtype
+}
+
+/// CR 607.2d + CR 608.2c: The durability transaction for a standalone,
+/// non-target battlefield-object choice head.
+///
+/// Gate A (in `imperative.rs`) only fires when the choose chunk leads the chain,
+/// so a Gate-A-produced head is always `result.effect` — but assembly must be
+/// able to recognize that provenance from the IR alone (the frozen scope rule
+/// forbids adding a marker field to `ParsedEffectClause`). It reconstructs the
+/// Gate-A consideration set from two facts:
+///
+/// * the HEAD-shape fact — the head clause fragment passes the same shared core
+///   Gate A used (`is_standalone_object_choice_clause`, chain context absent);
+/// * the READER-TEXT fact — some clause fragment mentions a "the chosen
+///   ‹battlefield object›" reader (`chain_text_mentions_chosen_object`).
+///
+/// The reader-text conjunct is MANDATORY, not belt-and-braces: the base corpus
+/// has nine root `ChooseObjectsIntoTrackedSet` cards, and without it the
+/// choose-up-to family (Duneblast, Mount Doom, The Day of the Doctor — all
+/// `supported: true`) would be downgraded by the restore arm below even though
+/// their chains contain no ChosenCard reader. Measured: with the conjunct the
+/// only candidates are Zenos yae Galvus and Gideon's Sacrifice.
+///
+/// The SEMANTIC authority is the explicit tree walk
+/// (`chain_references_chosen_card`), never the text scan: a present reader
+/// splices the `RememberCard` writer; a text-only reader (Gideon's
+/// "the chosen permanent" belongs to a damage-redirect axis, not the
+/// remembered-object reader) restores the pre-phase-2 `TargetOnly` shape so the
+/// card's parse is byte-identical to base.
+fn reconcile_object_choice_durability(result: &mut AbilityDefinition, ir: &EffectChainIr) {
+    if !matches!(&*result.effect, Effect::ChooseObjectsIntoTrackedSet { .. }) {
+        return;
+    }
+    let Some(head_fragment) = ir
+        .clauses
+        .first()
+        .and_then(|clause| clause.source.fragment())
+    else {
+        return;
+    };
+    if !super::imperative::is_standalone_object_choice_clause(head_fragment) {
+        return;
+    }
+    let chain_has_reader_text = ir
+        .clauses
+        .iter()
+        .filter_map(|clause| clause.source.fragment())
+        .any(|fragment| chain_text_mentions_chosen_object(&fragment.to_lowercase()));
+    if !chain_has_reader_text {
+        return;
+    }
+    if chain_references_chosen_card(result) {
+        // CR 607.2d + CR 608.2c: the chain reads the pick — make it durable.
+        ensure_remember_card_after_object_choice(result);
+    } else {
+        // CR 115.1 + CR 608.2d: reader TEXT but no remembered-object reader in
+        // the tree (Gideon's Sacrifice: "the chosen permanent" is a redirect
+        // axis). Restore the pre-phase-2 standalone non-targeting shape.
+        let Effect::ChooseObjectsIntoTrackedSet { filter, .. } = &*result.effect else {
+            return;
+        };
+        *result.effect = Effect::TargetOnly {
+            target: filter.clone(),
+        };
+    }
 }
 
 /// R2 — CR 608.2c + CR 401.4: linked-exile-cast bottom cleanup.
