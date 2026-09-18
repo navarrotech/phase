@@ -386,6 +386,21 @@ describe("normalizeEvents", () => {
     expect(expectLifeChanged(steps[0].effects[1].event).data.new_total).toBeUndefined();
   });
 
+  it("uses the final consumed event's absent total for a collapsed run", () => {
+    const sources = Array.from({ length: GROUPED_COMBAT_DAMAGE_THRESHOLD }, (_, i) => i + 1);
+    const events = [
+      ...sources.flatMap((sourceId, hit) => [
+        combatPlayerDamage(sourceId),
+        hit === sources.length - 1 ? lifeChanged() : lifeChanged(0, -1, 20 - hit - 1),
+      ]),
+      combatAggregate(sources),
+    ];
+
+    const steps = normalizeEvents(events);
+
+    expect(expectLifeChanged(steps[0].effects[1].event).data.new_total).toBeUndefined();
+  });
+
   it("groups aggregate combat damage when replacement effects change life-loss amount", () => {
     const sources = Array.from({ length: GROUPED_COMBAT_DAMAGE_THRESHOLD }, (_, i) => i + 1);
     const events = [

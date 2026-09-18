@@ -314,14 +314,14 @@ function buildGroupedStep(
   return { effects, duration: stepDuration(effects) };
 }
 
-/** One collapsed run's net life change for a player, plus the engine-reported
- *  life total the run ends on. A collapsed run replaces N `LifeChanged` events
- *  with one synthesized event, so it lands on the LAST total the engine reported
- *  for that player — never a sum of amounts, which replacement effects can make
- *  diverge from the real sequence. */
+/** One collapsed run's net life change for a player, plus the total carried by
+ *  its final consumed `LifeChanged` event. A collapsed run replaces N events
+ *  with one synthesized event, so it uses that final event's report — never a
+ *  sum of amounts, which replacement effects can make diverge from the real
+ *  sequence, or an earlier total when the final event came from a pre-field peer. */
 interface AggregatedLifeChange {
   amount: number;
-  /** `undefined` when no consumed event carried a total (pre-field peer). */
+  /** `undefined` when the final consumed event came from a pre-field peer. */
   newTotal: number | undefined;
 }
 
@@ -334,7 +334,7 @@ function addLifeChange(
   const previous = changes.get(playerId);
   changes.set(playerId, {
     amount: (previous?.amount ?? 0) + amount,
-    newTotal: newTotal ?? previous?.newTotal,
+    newTotal,
   });
 }
 
