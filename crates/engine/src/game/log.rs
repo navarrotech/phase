@@ -2391,7 +2391,7 @@ mod tests {
             &GameEvent::LifeChanged {
                 player_id: PlayerId(0),
                 amount: 3,
-                new_total: None,
+                new_total: crate::types::events::LifeTotalReading::default(),
             },
             &state,
         );
@@ -2407,7 +2407,7 @@ mod tests {
             &GameEvent::LifeChanged {
                 player_id: PlayerId(0),
                 amount: -3,
-                new_total: None,
+                new_total: crate::types::events::LifeTotalReading::default(),
             },
             &state,
         );
@@ -2551,12 +2551,12 @@ mod tests {
                 GameEvent::LifeChanged {
                     player_id: PlayerId(0),
                     amount: 3,
-                    new_total: None,
+                    new_total: crate::types::events::LifeTotalReading::default(),
                 },
                 GameEvent::LifeChanged {
                     player_id: PlayerId(1),
                     amount: -3,
-                    new_total: None,
+                    new_total: crate::types::events::LifeTotalReading::default(),
                 },
                 GameEvent::TappedForMana {
                     source_id: ObjectId(1),
@@ -2594,7 +2594,7 @@ mod tests {
                 GameEvent::LifeChanged {
                     player_id: PlayerId(0),
                     amount: 1,
-                    new_total: None,
+                    new_total: crate::types::events::LifeTotalReading::default(),
                 },
                 LogImportance::Essential,
                 LogTone::Positive,

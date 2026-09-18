@@ -5,7 +5,7 @@ use crate::game::replacement::{self, ReplacementResult};
 use crate::types::ability::{
     Effect, EffectError, EffectKind, ResolvedAbility, TargetFilter, TargetRef,
 };
-use crate::types::events::GameEvent;
+use crate::types::events::{GameEvent, LifeTotalReading};
 use crate::types::game_state::{
     GameState, PendingEffectResolutionEvent, PendingEffectResolved, PendingLifeTotalAssignment,
     WaitingFor,
@@ -259,11 +259,13 @@ pub fn apply_life_gain_after_replacement(
         amount: gain_amount as i32,
         // CR 119.1: read back after the edit, so a run of life changes carries
         // each intermediate total rather than only the final snapshot's.
-        new_total: state
-            .players
-            .iter()
-            .find(|player| player.id == pid)
-            .map(|player| player.life),
+        new_total: LifeTotalReading(
+            state
+                .players
+                .iter()
+                .find(|player| player.id == pid)
+                .map(|player| player.life),
+        ),
     });
     gain_amount
 }
@@ -388,11 +390,13 @@ pub fn apply_life_loss_after_replacement(
         amount: -(loss_amount as i32),
         // CR 119.3: read back after the edit, so a run of combat-damage life
         // losses carries each intermediate total rather than only the final one.
-        new_total: state
-            .players
-            .iter()
-            .find(|player| player.id == pid)
-            .map(|player| player.life),
+        new_total: LifeTotalReading(
+            state
+                .players
+                .iter()
+                .find(|player| player.id == pid)
+                .map(|player| player.life),
+        ),
     });
     loss_amount
 }
@@ -1067,7 +1071,7 @@ mod tests {
                     player_id,
                     amount,
                     new_total,
-                } if *player_id == PlayerId(0) => Some((*amount, *new_total)),
+                } if *player_id == PlayerId(0) => Some((*amount, new_total.0)),
                 _ => None,
             })
             .collect();

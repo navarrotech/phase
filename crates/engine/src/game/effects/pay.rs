@@ -1641,7 +1641,7 @@ mod tests {
         state.current_trigger_event = Some(GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: 3,
-            new_total: None,
+            new_total: crate::types::events::LifeTotalReading::default(),
         });
 
         let draw = ResolvedAbility::new(
@@ -2157,7 +2157,7 @@ mod tests {
         state.current_trigger_event = Some(GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: 3,
-            new_total: None,
+            new_total: crate::types::events::LifeTotalReading::default(),
         });
 
         // CR 608.2c: Build the IfYouDo SequentialSibling Draw rider — exact
@@ -2327,7 +2327,7 @@ mod tests {
         state.current_trigger_event = Some(GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: 3,
-            new_total: None,
+            new_total: crate::types::events::LifeTotalReading::default(),
         });
 
         let mut draw = ResolvedAbility::new(
@@ -2729,7 +2729,7 @@ mod tests {
         let event_b = GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: 3,
-            new_total: None,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         state.current_trigger_event = Some(event_b.clone());
         let context_b = ResolvingTriggerContext::capture(&state)
@@ -2812,7 +2812,7 @@ mod tests {
         state.current_trigger_event = Some(GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: 3,
-            new_total: None,
+            new_total: crate::types::events::LifeTotalReading::default(),
         });
 
         let mut draw = ResolvedAbility::new(
@@ -2943,7 +2943,7 @@ mod tests {
         state.current_trigger_event = Some(GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: 2,
-            new_total: None,
+            new_total: crate::types::events::LifeTotalReading::default(),
         });
 
         let mut draw = ResolvedAbility::new(

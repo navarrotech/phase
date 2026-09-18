@@ -7374,12 +7374,12 @@ mod tests {
             GameEvent::LifeChanged {
                 player_id: PlayerId(0),
                 amount: 1,
-                new_total: None,
+                new_total: crate::types::events::LifeTotalReading::default(),
             },
             GameEvent::LifeChanged {
                 player_id: PlayerId(1),
                 amount: 1,
-                new_total: None,
+                new_total: crate::types::events::LifeTotalReading::default(),
             },
         ]
         .into_iter()
@@ -8695,7 +8695,7 @@ mod tests {
             GameEvent::LifeChanged {
                 player_id,
                 amount,
-                new_total: None,
+                new_total: crate::types::events::LifeTotalReading::default(),
             }
         }
 
