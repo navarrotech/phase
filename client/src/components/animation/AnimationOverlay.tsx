@@ -433,11 +433,12 @@ export function AnimationOverlay({ containerRef }: AnimationOverlayProps) {
           // derived here; an event from a peer that predates the field has none,
           // and those readouts keep their snapshot value as before.
           if (new_total !== undefined) {
+            const impactEpoch = useGameStore.getState().engineCommitEpoch;
             scheduleStepTimeout(
               () => useAnimationStore.getState().recordDisplayedLife(
                 player_id,
                 new_total,
-                useGameStore.getState().engineCommitEpoch,
+                impactEpoch,
               ),
               lifeChangeImpactDelayMs(effect, stepEffects, player_id) * speedMultiplier,
             );

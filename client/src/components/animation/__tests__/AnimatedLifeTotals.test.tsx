@@ -128,6 +128,31 @@ describe("life totals during a damage animation", () => {
     expect(screen.getByText("18")).toBeInTheDocument();
   });
 
+  it("does not let a delayed hit overwrite a newer committed snapshot", () => {
+    const steps = normalizeEvents(combatHit(11, 1, 2, 18));
+
+    render(
+      <>
+        <AnimationOverlay containerRef={containerRef} />
+        <LifeTotal playerId={1} hideLabel />
+      </>,
+    );
+
+    playSteps(steps);
+
+    // The hit has not landed yet, but a newer engine snapshot has. The delayed
+    // impact still describes epoch 1 and must not be promoted into epoch 2.
+    act(() => {
+      setLife(1, 17);
+      useGameStore.setState((state) => ({ engineCommitEpoch: state.engineCommitEpoch + 1 }));
+      vi.advanceTimersByTime(CARD_SLAM_FLIGHT_MS);
+    });
+
+    expect(screen.getByText("17")).toBeInTheDocument();
+    expect(screen.queryByText("18")).not.toBeInTheDocument();
+    expect(useAnimationStore.getState().displayedLife?.epoch).toBe(1);
+  });
+
   it("keeps the snapshot value for an event carrying no engine total", () => {
     const steps = normalizeEvents([
       {

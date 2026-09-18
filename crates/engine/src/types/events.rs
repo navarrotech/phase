@@ -752,17 +752,14 @@ impl EventObjectSnapshot {
     }
 }
 
-/// CR 119.1: a life total reported alongside the change that produced it, for display.
+/// A life total reported alongside the change that produced it, for display.
 ///
 /// Its `PartialEq` is deliberately always true, which is what makes it safe to carry
-/// inside a [`GameEvent`]. An event is not only a message to the client: a trigger that
-/// fires on it pins it as resolution context (CR 603.7c), so the event becomes part of the
-/// compared content of a stack entry. A life total moves every iteration of a drain loop,
-/// so a derived `PartialEq` would make two cycle points of that loop differ by this
-/// reading alone — the loop would never be certified as recurring (CR 732.2a) and the
-/// mandatory-repetition draw (CR 104.4b) would never confirm. Being equality-transparent,
-/// the reading cannot perturb any comparison of game state, present or future, while the
-/// change itself (`amount`) stays fully compared.
+/// inside a [`GameEvent`]. The event can be retained as resolution context, and a life
+/// total moves every iteration of a drain loop. A derived `PartialEq` would therefore make
+/// two otherwise-equivalent cycle points differ by this display reading alone. Being
+/// equality-transparent, the reading cannot perturb any comparison of game state, present
+/// or future, while the change itself (`amount`) stays fully compared.
 ///
 /// `None` means no total was reported: an event from a peer or a recording older than this
 /// field, where a consumer falls back to the accompanying state snapshot.
