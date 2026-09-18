@@ -2044,3 +2044,190 @@ fn ai_taxed_attack_round_trip_terminates() {
         "the attacker must have committed to combat rather than looping on the tax"
     );
 }
+
+/// CR 508.1d: the attack round trip must also terminate for a control seat,
+/// whose archetype multiplier damps the attack-tax bias.
+///
+/// The prompt answer is the engine's affordability check, not a re-run of the
+/// deck-weighted judgement, so the answer cannot drift from the posture that
+/// opened the prompt however the seat's features weigh the tax.
+#[test]
+fn ai_taxed_attack_round_trip_terminates_for_a_control_seat() {
+    let (mut runner, attackers) = build_propaganda_attack_scenario(1, 4);
+
+    let mut session = phase_ai::AiSession::from_game(runner.state());
+    let mut control = phase_ai::features::DeckFeatures::default();
+    control.control.commitment = 0.9;
+    session.features.insert(P1, control);
+    let session = std::sync::Arc::new(session);
+
+    let ai_players = HashSet::from([P1]);
+    let ai_configs = HashMap::from([(P1, create_config(AiDifficulty::VeryHard, Platform::Native))]);
+    let mut rng = SmallRng::seed_from_u64(7);
+    run_ai_actions_bounded(
+        runner.state_mut(),
+        &ai_players,
+        &ai_configs,
+        &mut rng,
+        &session,
+        32,
+    );
+
+    assert!(
+        !matches!(
+            runner.state().waiting_for,
+            WaitingFor::DeclareAttackers { .. } | WaitingFor::CombatTaxPayment { .. }
+        ),
+        "the declare/pay cycle must not still be pending, got {:?}",
+        runner.state().waiting_for
+    );
+    assert!(
+        runner.state().combat.as_ref().is_some_and(|combat| combat
+            .attackers
+            .iter()
+            .any(|attacker| attacker.object_id == attackers[0])),
+        "a 3/3 into an empty board is worth {{2}} even to a control seat"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CR 509.1c + CR 509.1d: the block-side twin. A block tax used to strip every
+// taxed blocker from the AI's declaration the same way the attack tax stripped
+// every attacker.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Archangel of Tithes' verified block-tax static.
+///
+/// Source: client/public/card-data.json (2026-05-10), matching the engine-side
+/// `add_archangel_of_tithes` helper in `crates/engine/tests/integration/rules/combat.rs`.
+/// Attached here to a ground attacker so the test isolates the tax building
+/// block from the Archangel's flying.
+const BLOCK_TAX_ORACLE: &str = "As long as this creature is attacking, creatures can't block \
+     unless their controller pays {1} for each of those creatures.";
+
+/// P0 attacks P1 (the AI) with a 3/3 carrying a {1} block tax. P1 has one 4/4
+/// that blocks the 3/3 profitably, plus `untapped_lands` Forests. The runner is
+/// left at P1's `DeclareBlockers` prompt.
+fn build_block_tax_scenario(untapped_lands: usize) -> (GameRunner, ObjectId, ObjectId) {
+    use engine::parser::oracle_static::parse_static_line;
+    use engine::types::mana::ManaColor;
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let block_tax = parse_static_line(BLOCK_TAX_ORACLE).expect("block-tax static should parse");
+    let attacker = {
+        let mut builder = scenario.add_creature(P0, "Taxing Raider", 3, 3);
+        builder.with_static_definition(block_tax);
+        builder.id()
+    };
+    let blocker = scenario.add_creature(P1, "Stout Wall", 4, 4).id();
+    for _ in 0..untapped_lands {
+        scenario.add_basic_land(P1, ManaColor::Green);
+    }
+
+    let mut runner = scenario.build();
+    runner.pass_both_players();
+    runner
+        .act(GameAction::DeclareAttackers {
+            attacks: vec![(attacker, AttackTarget::Player(P1))],
+            bands: vec![],
+        })
+        .expect("an untaxed attack declares directly");
+    // Priority passes after the declaration until the defender is asked to block.
+    let mut guard = 0;
+    while !matches!(
+        runner.state().waiting_for,
+        WaitingFor::DeclareBlockers { .. }
+    ) {
+        runner.pass_both_players();
+        guard += 1;
+        assert!(
+            guard < 4,
+            "never reached DeclareBlockers: {:?}",
+            runner.state().waiting_for
+        );
+    }
+    (runner, attacker, blocker)
+}
+
+/// CR 509.1c + CR 509.1d: with {1} open, the AI keeps its profitable block and
+/// pays for it rather than letting the engine's tax-free witness drop it.
+#[test]
+fn ai_pays_a_block_tax_to_keep_a_profitable_block() {
+    let (mut runner, attacker, blocker) = build_block_tax_scenario(3);
+
+    let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+    let mut rng = SmallRng::seed_from_u64(7);
+    let action = choose_action(runner.state(), P1, &config, &mut rng)
+        .expect("AI must choose a blocker declaration");
+    let GameAction::DeclareBlockers { assignments } = &action else {
+        panic!("expected DeclareBlockers, got {action:?}");
+    };
+    assert_eq!(
+        assignments,
+        &vec![(blocker, attacker)],
+        "the 4/4 must keep its block on the 3/3 despite the {{1}} tax"
+    );
+
+    runner
+        .act(action)
+        .expect("the taxed block must be reducer-legal");
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::CombatTaxPayment { .. }
+        ),
+        "a taxed block must open the tax prompt, got {:?}",
+        runner.state().waiting_for
+    );
+
+    let answer = choose_action(runner.state(), P1, &config, &mut rng)
+        .expect("AI must answer the block-tax prompt");
+    assert_eq!(
+        answer,
+        GameAction::PayCombatTax { accept: true },
+        "the AI chose this taxed block, so it must pay for it"
+    );
+    runner
+        .act(answer)
+        .expect("paying the block tax must succeed");
+    assert!(
+        runner
+            .state()
+            .combat
+            .as_ref()
+            .is_some_and(|combat| combat.blocker_to_attacker.contains_key(&blocker)),
+        "the paid-for blocker must actually be blocking"
+    );
+}
+
+/// CR 509.1d: with no mana open the block tax is unaffordable, so the AI must
+/// fall back to the tax-free declaration without opening a prompt it cannot pay.
+#[test]
+fn ai_drops_a_block_it_cannot_pay_the_tax_for() {
+    let (mut runner, _attacker, _blocker) = build_block_tax_scenario(0);
+
+    let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+    let mut rng = SmallRng::seed_from_u64(7);
+    let action = choose_action(runner.state(), P1, &config, &mut rng)
+        .expect("AI must choose a blocker declaration");
+    let GameAction::DeclareBlockers { assignments } = &action else {
+        panic!("expected DeclareBlockers, got {action:?}");
+    };
+    assert!(
+        assignments.is_empty(),
+        "an unaffordable block tax leaves only the tax-free empty declaration, got {assignments:?}"
+    );
+
+    runner
+        .act(action)
+        .expect("the empty block declaration is legal");
+    assert!(
+        !matches!(
+            runner.state().waiting_for,
+            WaitingFor::CombatTaxPayment { .. }
+        ),
+        "an unaffordable block must never open a tax prompt, got {:?}",
+        runner.state().waiting_for
+    );
+}

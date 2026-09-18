@@ -5032,18 +5032,14 @@ const _: fn(&crate::types::ability::UnlessPayScaling) = |scaling| {
     }
 };
 
-/// CR 508.1d: whether attacking `target` with `creature` alone would incur an
-/// "unless pay" tax. Thin per-pairing wrapper over `compute_attack_tax`; see the
-/// affected-ness-independence tripwire above for why the isolated verdict is exact.
 /// CR 508.1d + CR 509.1c: how a proposal's author treats a combat-tax quote.
 ///
 /// Declaring a combat tax is the paying player's choice, so a proposal cannot be
-/// completed without knowing whether its author intends to pay. `Refuse` keeps
-/// the historical behaviour — any taxed proposal collapses to the deterministic
-/// tax-free witness, so no `CombatTaxPayment` prompt is ever opened. `Accept`
-/// keeps a taxed proposal intact, but only while the paying player can actually
-/// cover the quote, so a completed declaration never opens a prompt whose price
-/// its author cannot meet.
+/// completed without knowing whether its author intends to pay. Under `Refuse`
+/// any taxed proposal collapses to the deterministic tax-free witness, so no
+/// `CombatTaxPayment` prompt is ever opened. `Accept` keeps a taxed proposal
+/// intact, but only while the paying player can actually cover the quote, so a
+/// completed declaration never opens a prompt whose price its author cannot meet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CombatTaxPosture {
     /// Drop taxed creatures rather than open a tax prompt.
@@ -5084,6 +5080,27 @@ pub fn block_tax_is_affordable(
     super::casting::can_pay_effect_mana_cost_after_auto_tap(state, player, ObjectId(0), &total_cost)
 }
 
+/// CR 508.1i + CR 509.1e: can the seat answering a live `CombatTaxPayment`
+/// prompt cover its locked-in quote?
+///
+/// A completion only opens that prompt for a proposal made under
+/// `CombatTaxPosture::Accept`, which already required this same affordability,
+/// so this is the whole answer an AI seat needs at the prompt: paying what it
+/// chose to incur is exactly what keeps the round trip from looping (declining
+/// rebuilds the identical declare prompt). Returns `false` outside that prompt.
+pub fn pending_combat_tax_is_affordable(state: &GameState) -> bool {
+    let crate::types::game_state::WaitingFor::CombatTaxPayment {
+        player, total_cost, ..
+    } = &state.waiting_for
+    else {
+        return false;
+    };
+    super::casting::can_pay_effect_mana_cost_after_auto_tap(state, *player, ObjectId(0), total_cost)
+}
+
+/// CR 508.1d: whether attacking `target` with `creature` alone would incur an
+/// "unless pay" tax. Thin per-pairing wrapper over `compute_attack_tax`; see the
+/// affected-ness-independence tripwire above for why the isolated verdict is exact.
 fn attack_incurs_tax(state: &GameState, creature: ObjectId, target: AttackTarget) -> bool {
     compute_attack_tax(state, &[(creature, target)]).is_some()
 }

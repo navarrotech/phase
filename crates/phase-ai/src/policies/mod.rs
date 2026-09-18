@@ -8,7 +8,6 @@ mod board_development;
 mod board_wipe_telegraph;
 mod card_advantage;
 mod chalice_avoidance;
-pub(crate) mod combat_tax;
 mod combat_withdrawal;
 pub(crate) mod combo_line;
 mod condition_gated_activation;

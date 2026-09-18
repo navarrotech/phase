@@ -1645,15 +1645,13 @@ pub fn fallback_action(
             choice: engine::types::actions::UnlessCostBranch::Decline,
         }),
 
-        // CR 508.1d + CR 509.1d: combat tax. Answer with the same judgement that
-        // authorized the declaration — a flat decline here would discard an attack
-        // the AI deliberately chose to pay for and re-open the identical prompt.
-        // No session reaches this seam, so the judgement runs on default deck
-        // features. That is sound: the deterministic combat seam answers every
-        // live tax prompt before the fallback is consulted, and the fallback's
-        // job is only to keep a contract-starved decision from deadlocking.
-        WaitingFor::CombatTaxPayment { player, .. } => Some(GameAction::PayCombatTax {
-            accept: pending_combat_tax_accepted(state, *player, None),
+        // CR 508.1i + CR 509.1e: combat tax. The prompt only opens for a
+        // declaration completed under `CombatTaxPosture::Accept`, so paying
+        // whenever the quote is affordable is the answer that declaration was
+        // made for. A flat decline would discard it and re-open the identical
+        // declare prompt.
+        WaitingFor::CombatTaxPayment { .. } => Some(GameAction::PayCombatTax {
+            accept: engine::game::combat::pending_combat_tax_is_affordable(state),
         }),
 
         // Equip/Populate/CopyTarget with no valid targets: CancelCast for
@@ -3229,7 +3227,7 @@ fn score_candidates_core(
         state.waiting_for,
         WaitingFor::DeclareAttackers { .. }
             | WaitingFor::DeclareBlockers { .. }
-            // CR 508.1d + CR 509.1d: the combat-tax answer is bound to the
+            // CR 508.1i + CR 509.1e: the combat-tax answer is bound to the
             // declaration that incurred it, so it bypasses candidate scoring for
             // the same reason the declarations themselves do.
             | WaitingFor::CombatTaxPayment { .. }
@@ -4201,20 +4199,20 @@ pub(crate) fn deterministic_choice(
                 &config.profile,
                 Some(valid_block_targets),
             );
-            // CR 509.1d: the block tax is the same offer as the attack tax —
-            // accept it when the shared judgement says paying beats losing the
-            // blockers, so the engine keeps them instead of substituting the
-            // tax-free witness (which drops every taxed blocker).
+            // CR 509.1c + CR 509.1d: a block tax is an offer the defender may
+            // take. Accepting keeps the taxed blockers; refusing lets the engine
+            // substitute its tax-free witness, which drops every one of them.
+            let default_features = crate::features::DeckFeatures::default();
+            let features = context
+                .and_then(|context| context.session.features.get(&ai_player))
+                .unwrap_or(&default_features);
+            let posture =
+                crate::combat_tax::plan_block_tax(state, ai_player, features, &assignments);
             return Some(engine::game::combat::complete_blocker_proposal(
                 state,
                 ai_player,
                 &assignments,
-                block_tax_posture(
-                    state,
-                    ai_player,
-                    context.map(|c| c.session.as_ref()),
-                    &assignments,
-                ),
+                posture,
             ));
         }
         return Some(GameAction::DeclareBlockers {
@@ -4236,13 +4234,15 @@ fn deterministic_combat_choice(
     opponent_threat: Option<&ThreatProfile>,
     comparison_deadline: Option<engine::util::Deadline>,
 ) -> Option<GameAction> {
-    // CR 508.1d + CR 509.1d: the tax prompt belongs to the declaration that
-    // opened it, so it is answered here rather than scored against unrelated
-    // policies — a decline the declaration did not plan for re-opens the same
-    // declare prompt and the AI would re-propose into it indefinitely.
-    if let WaitingFor::CombatTaxPayment { player, .. } = &state.waiting_for {
+    // CR 508.1i + CR 509.1e: the tax prompt belongs to the declaration that
+    // opened it, and that declaration was only completed under
+    // `CombatTaxPosture::Accept` because the AI chose to pay. Answering from the
+    // engine's affordability check, rather than re-scoring the tax against
+    // unrelated policies, means a planned payment is never declined; a decline
+    // would re-open the same declare prompt and the AI would re-propose into it.
+    if matches!(state.waiting_for, WaitingFor::CombatTaxPayment { .. }) {
         return Some(GameAction::PayCombatTax {
-            accept: pending_combat_tax_accepted(state, *player, session),
+            accept: engine::game::combat::pending_combat_tax_is_affordable(state),
         });
     }
 
@@ -4292,15 +4292,20 @@ fn deterministic_combat_choice(
                 profile,
                 Some(valid_block_targets),
             );
-            // CR 509.1d: the block tax is the same offer as the attack tax —
-            // accept it when the shared judgement says paying beats losing the
-            // blockers, so the engine keeps them instead of substituting the
-            // tax-free witness (which drops every taxed blocker).
+            // CR 509.1c + CR 509.1d: a block tax is an offer the defender may
+            // take. Accepting keeps the taxed blockers; refusing lets the engine
+            // substitute its tax-free witness, which drops every one of them.
+            let default_features = crate::features::DeckFeatures::default();
+            let features = session
+                .and_then(|session| session.features.get(&ai_player))
+                .unwrap_or(&default_features);
+            let posture =
+                crate::combat_tax::plan_block_tax(state, ai_player, features, &assignments);
             return Some(engine::game::combat::complete_blocker_proposal(
                 state,
                 ai_player,
                 &assignments,
-                block_tax_posture(state, ai_player, session, &assignments),
+                posture,
             ));
         }
         return Some(GameAction::DeclareBlockers {
@@ -4311,82 +4316,17 @@ fn deterministic_combat_choice(
     None
 }
 
-/// CR 508.1 (issue #1523): Guard the combat AI's attacker declaration so the
-/// engine never rejects it. The combat AI draws attackers from the
-/// engine-provided `valid_attacker_ids`, but the chosen *subset* + *target
-/// assignment* can still be illegal as a whole — e.g. a "can't attack alone"
-/// creature swinging solo, a split must-attack-together pair, or a target an
-/// attacker may not legally be assigned. The action driver re-requests the AI's
-/// (deterministic) decision after a rejection, so an illegal declaration loops
-/// forever and softlocks the game ("repeated attempts to attack").
+/// CR 508.1d + CR 508.1h: turn the combat AI's heuristic assignment into the
+/// declaration the AI actually submits.
 ///
-/// Dry-run the declaration on a cloned state; if the engine would reject it,
-/// fall back to an engine-validated legal `DeclareAttackers` (the first such
-/// candidate from `legal_actions`, which prefers declining combat but still
-/// satisfies any mandatory must-attack requirement, since illegal candidates
-/// are filtered out by the simulation pipeline). This costs one state clone per
-/// attacker declaration — infrequent and far cheaper than the combat AI's own
-/// lookahead — and the fallback path only runs on the rare illegal choice.
-/// CR 508.1d + CR 509.1d: does this seat pay the combat tax it is being quoted?
-///
-/// The single answer both the deterministic combat seam and the deadlock-safe
-/// fallback use. It re-reads the locked-in quote off `WaitingFor::CombatTaxPayment`
-/// and applies the same judgement that chose the declaration, which is what makes
-/// a taxed AI declaration terminate: declining rebuilds the identical declare
-/// prompt, so an answer that disagreed with the proposal would loop forever.
-fn pending_combat_tax_accepted(
-    state: &GameState,
-    player: PlayerId,
-    session: Option<&AiSession>,
-) -> bool {
-    let default_features = crate::features::DeckFeatures::default();
-    let features = session
-        .and_then(|session| session.features.get(&player))
-        .unwrap_or(&default_features);
-    crate::policies::combat_tax::should_pay_pending_tax(state, player, features)
-}
-
-/// CR 509.1d: the posture to complete a blocker proposal under.
-///
-/// `Accept` only when the defending seat can cover the quote and the shared
-/// judgement prefers paying it, so the completion never opens a payment prompt
-/// this seat would then decline (declining rebuilds the same block prompt).
-fn block_tax_posture(
-    state: &GameState,
-    ai_player: PlayerId,
-    session: Option<&AiSession>,
-    assignments: &[(
-        engine::types::identifiers::ObjectId,
-        engine::types::identifiers::ObjectId,
-    )],
-) -> engine::game::combat::CombatTaxPosture {
-    let Some((total_cost, per_creature)) =
-        engine::game::combat::compute_block_tax(state, assignments)
-    else {
-        return engine::game::combat::CombatTaxPosture::Refuse;
-    };
-    if !engine::game::combat::block_tax_is_affordable(state, ai_player, assignments) {
-        return engine::game::combat::CombatTaxPosture::Refuse;
-    }
-
-    let default_features = crate::features::DeckFeatures::default();
-    let features = session
-        .and_then(|session| session.features.get(&ai_player))
-        .unwrap_or(&default_features);
-    let quote = crate::policies::combat_tax::TaxQuote {
-        context: engine::types::game_state::CombatTaxContext::Blocking,
-        total_mana_value: total_cost.mana_value(),
-        per_creature: &per_creature,
-        total_declared: assignments.len(),
-    };
-    if crate::policies::combat_tax::tax_deltas(state, ai_player, features, &quote).prefers_paying()
-    {
-        engine::game::combat::CombatTaxPosture::Accept
-    } else {
-        engine::game::combat::CombatTaxPosture::Refuse
-    }
-}
-
+/// The assignment is a PROPOSAL. A combat tax on it is an offer the AI must first
+/// decide to take, and `plan_attack_tax` makes that call (trimming the strike to
+/// one worth paying for and affordable). The engine-owned completion then
+/// enforces it: the proposal survives only when it is hard-legal, meets the
+/// maximum requirement score, and carries no tax the posture rejects; otherwise
+/// the deterministic tax-free maximum-legal witness stands. That keeps the engine
+/// the single legality authority, so an illegal declaration can never be
+/// resubmitted in a loop (issue #1523).
 fn validated_declare_attackers(
     state: &GameState,
     ai_player: PlayerId,
@@ -4396,22 +4336,12 @@ fn validated_declare_attackers(
         engine::game::combat::AttackTarget,
     )>,
 ) -> GameAction {
-    // CR 508.1d + CR 508.1h: the AI's heuristic assignment is a PROPOSAL, and a
-    // combat tax on it is an offer the AI must first decide to take. `plan_attack_tax`
-    // makes that call (trimming the strike down to an affordable, worthwhile one),
-    // and the engine-owned completion enforces it: the proposal survives only when
-    // it is hard-legal, meets the maximum requirement score, and carries no tax the
-    // posture rejects; otherwise the deterministic tax-free maximum-legal witness
-    // stands. This is the single engine legality authority — no second combat
-    // validator. `should_pay_pending_tax` re-reads the same judgement at the
-    // resulting payment prompt, so an accepted proposal is never declined there
-    // (declining rebuilds this same prompt, which would loop).
     let default_features = crate::features::DeckFeatures::default();
     let features = session
         .and_then(|session| session.features.get(&ai_player))
         .unwrap_or(&default_features);
     let (planned, posture) =
-        crate::policies::combat_tax::plan_attack_tax(state, ai_player, features, &attacks);
+        crate::combat_tax::plan_attack_tax(state, ai_player, features, &attacks);
     engine::game::combat::complete_attacker_proposal(state, &planned, &[], posture)
 }
 
