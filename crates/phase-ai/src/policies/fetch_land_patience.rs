@@ -217,7 +217,7 @@ struct LandFetch<'a> {
 /// real fetch from them:
 ///
 /// - the search is the ability's root effect, not a rider on something else;
-/// - CR 701.23a: it searches the activator's own library (`target_player` is
+/// - it searches the activator's own library (`target_player` is
 ///   unset or the controller), so the replacement is the activator's land;
 /// - its immediate continuation moves the found card from the library onto the
 ///   battlefield — the put that makes it a *replacement* rather than a tutor.
@@ -538,7 +538,7 @@ mod tests {
 
     /// A self-sacrificing search of another player's library is not a
     /// replacement for the sacrificed land, even with the search at the root:
-    /// CR 701.23a, the card found is that player's, not the activator's.
+    /// the card found is that player's, not the activator's.
     #[test]
     fn search_of_another_players_library_is_not_a_fetch() {
         let mut state = GameState::new_two_player(42);
