@@ -4624,9 +4624,12 @@ export interface LlmOpponentCapability {
 }
 
 export function supportsLlmOpponent(
-  adapter: EngineAdapter | null,
+  adapter: EngineAdapter | null | undefined,
 ): adapter is EngineAdapter & LlmOpponentCapability {
-  return adapter !== null
+  // `undefined` as well as `null`: the game store's `adapter` slot is typed
+  // nullable but is genuinely absent before an adapter is installed, and this
+  // guard is called from `start()` on that path.
+  return Boolean(adapter)
     && (adapter as Partial<LlmOpponentCapability>).supportsLlmOpponent === true
     && typeof (adapter as Partial<LlmOpponentCapability>).setLlmOpponentEnabled === "function";
 }

@@ -28,3 +28,25 @@ export const LLM_OPPONENT_HEALTH_TIMEOUT_MS = 3_000;
  * foregone conclusions.
  */
 export const LLM_OPPONENT_MIN_ACTIONS = 2;
+
+/**
+ * Decision states the sidecar is NOT consulted for. Everything else routes.
+ *
+ * A denylist, not an allowlist, because `WaitingFor` has forty-odd variants and
+ * grows with every mechanic — an allowlist would silently stop routing each new
+ * kind of decision, which is the opposite of what this feature is for. What is
+ * excluded here is a closed class: bookkeeping the engine already resolves
+ * optimally, and protocol consent that is not a play decision at all.
+ *
+ * `ManaPayment` / `ManaSourceSelection` are the ones that matter. Choosing which
+ * lands to tap carries almost no strategic content, and the pair fires several
+ * times per spell — routing them would turn casting a five-drop into a minute of
+ * model round-trips for a result the engine's own shortcut already gets right.
+ */
+export const LLM_OPPONENT_UNROUTED_WAITING_FOR: ReadonlySet<string> = new Set([
+  "ManaPayment",
+  "ManaSourceSelection",
+  "ResolveAllConsent",
+  "ResolveAllReady",
+  "GameOver",
+]);

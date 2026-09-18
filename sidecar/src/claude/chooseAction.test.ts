@@ -93,6 +93,46 @@ describe('chooseAction', () => {
     expect(queryMock.mock.calls[1]?.[0].options.resume).toBeUndefined()
   })
 
+  // Sharing one transcript across seats would let seat 2 read seat 1's
+  // redacted-but-visible hand out of the conversation history.
+  it<Context>('keeps seats at one table in separate sessions', async (context) => {
+    stubQuery([resultMessage({ session_id: 'seat-1' })], [resultMessage({ session_id: 'seat-2' })])
+
+    await context.chooseAction(buildRequest({ playerId: 1 }))
+    await context.chooseAction(buildRequest({ playerId: 2 }))
+
+    expect(queryMock.mock.calls[1]?.[0].options.resume).toBeUndefined()
+  })
+
+  it<Context>('forgetGame drops every seat at that table', async (context) => {
+    stubQuery(
+      [resultMessage({ session_id: 'seat-1' })],
+      [resultMessage({ session_id: 'seat-2' })],
+      [resultMessage()],
+      [resultMessage()],
+    )
+
+    await context.chooseAction(buildRequest({ playerId: 1 }))
+    await context.chooseAction(buildRequest({ playerId: 2 }))
+    context.forgetGame('game-1')
+    await context.chooseAction(buildRequest({ playerId: 1 }))
+    await context.chooseAction(buildRequest({ playerId: 2 }))
+
+    expect(queryMock.mock.calls[2]?.[0].options.resume).toBeUndefined()
+    expect(queryMock.mock.calls[3]?.[0].options.resume).toBeUndefined()
+  })
+
+  // `allowedTools` only governs auto-approval; `tools` is what removes the
+  // built-in set. Without it Claude can still call Bash/Read and burn turns.
+  it<Context>('hands the CLI an empty built-in toolset by default', async (context) => {
+    stubQuery([resultMessage()])
+
+    await context.chooseAction(buildRequest())
+
+    expect(queryMock.mock.calls[0]?.[0].options.tools).toEqual([])
+    expect(queryMock.mock.calls[0]?.[0].options.settingSources).toEqual([])
+  })
+
   it<Context>('forgetGame drops the session so the next decision starts over', async (context) => {
     stubQuery([resultMessage()], [resultMessage()])
 
@@ -152,6 +192,34 @@ describe('chooseAction', () => {
 
     // Interleaving would read start,start,end,end — the lock forces full turns.
     expect(inFlight).toEqual(['start', 'end', 'start', 'end'])
+  })
+
+  // A query that never yields a result must not hold the seat's lock forever:
+  // every later decision would queue behind it and the opponent would go
+  // silently dead for the rest of the game.
+  it<Context>('aborts a hung query and frees the lock for the next decision', async (context) => {
+    vi.useFakeTimers()
+
+    queryMock.mockImplementationOnce(({ options }) => ({
+      async *[Symbol.asyncIterator]() {
+        await new Promise<void>((resolve) => {
+          options.abortController.signal.addEventListener('abort', () => resolve())
+        })
+      },
+    }))
+    stubQuery([resultMessage()])
+
+    // Attach the rejection handler BEFORE advancing the clock. Advancing
+    // settles the promise, and a rejection observed only afterwards is flagged
+    // unhandled in the interim.
+    const hung = expect(context.chooseAction(buildRequest())).rejects.toBeInstanceOf(
+      context.DecisionRejectedError,
+    )
+    await vi.advanceTimersByTimeAsync(110_000)
+    await hung
+
+    vi.useRealTimers()
+    await expect(context.chooseAction(buildRequest())).resolves.toMatchObject({ actionIndex: 1 })
   })
 
   it<Context>('keeps the queue alive after a failed decision', async (context) => {

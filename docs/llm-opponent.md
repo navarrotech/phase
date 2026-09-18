@@ -57,6 +57,21 @@ Every failure — sidecar down, timeout, malformed answer, out-of-range index,
 stale contract — falls through to the built-in AI for that one decision. The game
 never blocks on the sidecar.
 
+## Which decisions route
+
+Claude answers every kind of engine decision except a small, closed set of
+mechanical ones, listed in `LLM_OPPONENT_UNROUTED_WAITING_FOR`:
+
+| Excluded | Why |
+|---|---|
+| `ManaPayment`, `ManaSourceSelection` | Choosing which lands to tap carries almost no strategic content, and the pair fires several times per spell. Routing them would turn casting a five-drop into a minute of round-trips for a result the engine already gets right. |
+| `ResolveAllConsent`, `ResolveAllReady` | Protocol consent, not a play decision. |
+| `GameOver` | Nothing to decide. |
+
+A denylist rather than an allowlist on purpose: `WaitingFor` has forty-odd
+variants and grows with every mechanic, and an allowlist would silently stop
+routing each new kind of decision — the opposite of what this feature is for.
+
 ## Cost gate
 
 Most priority windows in Magic offer nothing but a pass. The adapter consults the
@@ -65,18 +80,28 @@ least `LLM_OPPONENT_MIN_ACTIONS` actions are offered. Without this gate a turn
 would take minutes and spend a subscription on foregone conclusions.
 
 The sidecar declines a window offering more than `MAX_OFFERED_ACTIONS` actions;
-past that point the list is a mana-payment permutation explosion the engine's own
-shortcut handles better than prose can.
+past that point the list is a permutation explosion the engine's own shortcut
+handles better than prose can.
 
 ## Sessions
 
-One Claude session per game, keyed by a game id the adapter mints on every
-`resetGameState()`. Decisions within a game resume that session, so Claude
-remembers the plan it committed to two turns ago. Decisions for one game are
-serialized: a resumable session has a single linear transcript, and two decisions
-resuming the same id concurrently would race to append to it.
+One Claude session per **seat**, keyed by `<gameId>:<playerId>`. The game id is
+minted on every `resetGameState()`. Decisions for a seat resume its session, so
+Claude remembers the plan it committed to two turns ago.
 
-The session is released when the game resets or the toggle is turned off.
+Per seat rather than per game because a multiplayer table runs several AI seats
+at once, and one shared transcript would leave seat 2 reading seat 1's
+redacted-but-visible hand out of the conversation history — the engine's
+per-viewer redaction, undone by the memory sitting above it.
+
+Decisions for one seat are serialized: a resumable session has a single linear
+transcript, and two decisions resuming the same id concurrently would race to
+append to it. The sidecar aborts a decision at `DECISION_TIMEOUT_MS` (110s, just
+under the client's budget), because a query that never returns would otherwise
+hold that seat's lock forever and every later decision would queue behind it.
+
+Every seat's session is released when the game resets or the toggle is turned
+off.
 
 ## Authentication
 
@@ -106,6 +131,13 @@ Two variables are stripped from the child process on purpose:
 - `CLAUDECODE` — set inside a Claude Code session; a CLI that sees it refuses to
   nest, which would make the sidecar work from a plain terminal and fail from the
   one place a developer is most likely to start it.
+
+`tools: []` removes the built-in toolset. This is the option that matters:
+`allowedTools` only governs auto-approval, so setting that alone would leave
+Read/Bash/Write visible and callable, and every headless denial would burn one of
+the few `maxTurns` — failing with `error_max_turns` on exactly the complex boards
+worth thinking about. With `LLM_OPPONENT_ALLOW_WEB_SEARCH` on, both options carry
+`WebSearch` and `WebFetch` and nothing else.
 
 `settingSources: []` keeps the subprocess from loading your personal
 `CLAUDE.md`, settings, and skills. Those are written for whatever repo they sit
@@ -164,3 +196,5 @@ because this one covers a model that may think and search.
 - The full viewer state is sent each decision. The CLI compacts as a session
   grows, but a long Commander game will accumulate context.
 - The sidecar has no authentication. Loopback only.
+- Untested end-to-end against a live subscription. The unit tests stub the CLI;
+  see the smoke check in `sidecar/README.md`.

@@ -15,3 +15,15 @@ export const JSON_BODY_LIMIT = '32mb'
  * explosion, which the engine's own shortcut handles better than prose can.
  */
 export const MAX_OFFERED_ACTIONS = 150
+
+/**
+ * Server-side ceiling on one decision, below the client's own 120s budget.
+ *
+ * Without it a `query()` that never yields a result (a stalled network, a hung
+ * CLI) leaves its promise unsettled forever. The client would give up and fall
+ * back, but the per-game lock would stay held, so every later decision in that
+ * game would queue behind the dead one and wait out the full client budget
+ * before falling back too — the LLM opponent silently dead for the rest of the
+ * game. The abort is what lets the lock advance.
+ */
+export const DECISION_TIMEOUT_MS = 110_000

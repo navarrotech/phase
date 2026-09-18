@@ -43,7 +43,10 @@ import {
   DEFAULT_AI_CARD_DATA_MODE,
   resolveAiPoolCardDbPlan,
 } from "./card-db-subset";
-import { LLM_OPPONENT_MIN_ACTIONS } from "../constants/llmOpponent";
+import {
+  LLM_OPPONENT_MIN_ACTIONS,
+  LLM_OPPONENT_UNROUTED_WAITING_FOR,
+} from "../constants/llmOpponent";
 import {
   releaseLlmOpponentGame,
   requestLlmOpponentDecision,
@@ -723,11 +726,20 @@ implements EngineAdapter, AiDecisionDiagnosticsCapability, LlmOpponentCapability
   ): Promise<AiActionProposal | null> {
     try {
       const snapshot = await engine.getViewerSnapshot(playerId);
+      // `getViewerSnapshot` on the adapter unwraps before returning; this is the
+      // raw worker call, so unwrap once here and read everything off the result.
+      const state = unwrapClientGameState(snapshot.state);
+      const waitingFor = state.waiting_for.type;
 
-      // The engine's own auto-pass recommendation is the cost gate. Most
-      // priority windows in Magic offer nothing but a pass; paying a model
-      // round-trip for each would make a turn take minutes for no decision.
-      if (snapshot.autoPassRecommended || snapshot.actions.length < LLM_OPPONENT_MIN_ACTIONS) {
+      // Three gates, cheapest first. The engine's own auto-pass recommendation
+      // is the main one: most priority windows in Magic offer nothing but a
+      // pass, and paying a model round-trip for each would make a turn take
+      // minutes for no decision.
+      if (
+        snapshot.autoPassRecommended
+        || snapshot.actions.length < LLM_OPPONENT_MIN_ACTIONS
+        || LLM_OPPONENT_UNROUTED_WAITING_FOR.has(waitingFor)
+      ) {
         return null;
       }
 
@@ -735,8 +747,8 @@ implements EngineAdapter, AiDecisionDiagnosticsCapability, LlmOpponentCapability
         gameId: this.llmOpponentGameId,
         playerId,
         difficulty,
-        waitingFor: snapshot.state.waiting_for.type,
-        state: unwrapClientGameState(snapshot.state),
+        waitingFor,
+        state,
         actions: snapshot.actions,
       });
 
@@ -1030,7 +1042,9 @@ implements EngineAdapter, AiDecisionDiagnosticsCapability, LlmOpponentCapability
     // Retire the finished game's Claude conversation before minting the next
     // id. Without this the new game inherits the last one's board reads and
     // committed plans, which is worse than no memory at all.
-    void releaseLlmOpponentGame(this.llmOpponentGameId);
+    // Gated: an ordinary AI game on this branch must not POST to loopback (and
+    // log the refusal) on every reset just because the feature exists.
+    if (this.llmOpponentEnabled) void releaseLlmOpponentGame(this.llmOpponentGameId);
     this.llmOpponentGameId = crypto.randomUUID();
     this.aiPoolGeneration += 1;
     this.aiPoolPromise = null;

@@ -32,7 +32,7 @@ here, so the browser only ever sees a same-origin relative path.
 
 ```json
 { "status": "ok", "credential": "setup-token", "model": "claude-opus-5",
-  "webSearch": false, "activeGames": 1 }
+  "webSearch": false, "activeSeats": 1 }
 ```
 
 `credential` reports which form is configured, never the credential itself. The
@@ -68,9 +68,24 @@ this time" and the client falls back to the built-in AI:
 { "gameId": "…" }
 ```
 
-Releases the game's Claude session. Idempotent — ending an unknown game
+Releases every seat's Claude session at that table. Idempotent — ending an unknown game
 succeeds, because the client sends this on teardown paths that may fire before
 any decision was ever requested.
+
+## Smoke check
+
+The unit tests stub the CLI, so they prove the wiring and none of the auth. To
+confirm a real subscription works end to end:
+
+```bash
+pnpm start                                    # in one shell
+curl -s localhost:8788/api/v1/health | jq     # expect "credential":"setup-token"
+```
+
+Then start the client (`pnpm dev` in `client/`), open AI opponent setup, and flip
+the **Claude opponent** toggle — it is disabled with a reason until that health
+probe succeeds. The sidecar logs one line per decision with the chosen index and
+how long it took.
 
 ## Security
 

@@ -1,7 +1,7 @@
 import type { Request, Response } from 'express'
 
 // Misc
-import { activeGameCount } from '../../claude/chooseAction'
+import { activeSeatCount } from '../../claude/chooseAction'
 import { environment } from '../../env'
 
 /**
@@ -24,6 +24,6 @@ export function getHealth(_request: Request, response: Response): void {
     credential,
     model: environment.LLM_OPPONENT_MODEL,
     webSearch: environment.LLM_OPPONENT_ALLOW_WEB_SEARCH,
-    activeGames: activeGameCount(),
+    activeSeats: activeSeatCount(),
   })
 }

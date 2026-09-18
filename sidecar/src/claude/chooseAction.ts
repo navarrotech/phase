@@ -5,6 +5,7 @@ import type { DecisionRequest, DecisionResponse } from './decisionContract'
 import { query } from '@anthropic-ai/claude-agent-sdk'
 
 // Misc
+import { DECISION_TIMEOUT_MS } from '../constants'
 import { buildChildEnvironment, environment } from '../env'
 import { buildDecisionPrompt, SYSTEM_PROMPT } from './buildPrompt'
 import { DECISION_JSON_SCHEMA, decisionSchema } from './decisionContract'
@@ -13,33 +14,48 @@ import { DECISION_JSON_SCHEMA, decisionSchema } from './decisionContract'
 export class DecisionRejectedError extends Error {}
 
 /**
- * One Claude session per game, and one decision at a time within it.
+ * One Claude session per SEAT, and one decision at a time within it.
  *
  * Both halves matter. The session id is what makes this a conversation rather
  * than a sequence of strangers — Claude remembers the plan it committed to two
  * turns ago. The lock is what keeps that conversation coherent: a resumable
  * session has a single linear transcript, so two decisions resumed from the
  * same id concurrently race to append to it.
+ *
+ * Keyed per seat rather than per game because a multiplayer table runs several
+ * AI seats at once. Sharing one transcript across them would leave seat 2
+ * reading seat 1's redacted-but-visible hand out of the conversation history —
+ * the engine's per-viewer redaction, undone by the memory that sits above it.
  */
-type GameSession = {
+type SeatSession = {
   sessionId: string | null
   queue: Promise<unknown>
 }
 
-const sessionsByGameId = new Map<string, GameSession>()
+const sessionsBySeatKey = new Map<string, SeatSession>()
 
-/** Drops a game's session so the next decision starts a fresh conversation. */
-export function forgetGame(gameId: string): void {
-  sessionsByGameId.delete(gameId)
+function seatKey(gameId: string, playerId: number): string {
+  return `${gameId}:${playerId}`
 }
 
-export function activeGameCount(): number {
-  return sessionsByGameId.size
+/** Drops every seat's session for a game, so the next one starts fresh. */
+export function forgetGame(gameId: string): void {
+  const prefix = `${gameId}:`
+  for (const key of sessionsBySeatKey.keys()) {
+    if (key.startsWith(prefix)) {
+      sessionsBySeatKey.delete(key)
+    }
+  }
+}
+
+export function activeSeatCount(): number {
+  return sessionsBySeatKey.size
 }
 
 export async function chooseAction(request: DecisionRequest): Promise<DecisionResponse> {
-  const session = sessionsByGameId.get(request.gameId) ?? { sessionId: null, queue: Promise.resolve() }
-  sessionsByGameId.set(request.gameId, session)
+  const key = seatKey(request.gameId, request.playerId)
+  const session = sessionsBySeatKey.get(key) ?? { sessionId: null, queue: Promise.resolve() }
+  sessionsBySeatKey.set(key, session)
 
   // Chain onto the queue before awaiting it, so concurrent callers line up
   // behind each other rather than all observing the same settled promise.
@@ -52,8 +68,10 @@ export async function chooseAction(request: DecisionRequest): Promise<DecisionRe
   return decision
 }
 
-async function runDecision(request: DecisionRequest, session: GameSession): Promise<DecisionResponse> {
+async function runDecision(request: DecisionRequest, session: SeatSession): Promise<DecisionResponse> {
   const startedAt = Date.now()
+  const abortController = new AbortController()
+  const timeoutId = setTimeout(() => abortController.abort(), DECISION_TIMEOUT_MS)
 
   const options: Options = {
     model: environment.LLM_OPPONENT_MODEL,
@@ -61,9 +79,14 @@ async function runDecision(request: DecisionRequest, session: GameSession): Prom
     maxTurns: environment.LLM_OPPONENT_MAX_TURNS,
     outputFormat: { type: 'json_schema', schema: DECISION_JSON_SCHEMA },
     env: buildChildEnvironment(),
-    // The sidecar is not a coding agent. Web search is the only tool that can
-    // improve a play decision (looking up an unfamiliar card or ruling); file
-    // and shell tools can only cost latency and reach outside the game.
+    abortController,
+    // The sidecar is not a coding agent. `tools` is what actually removes the
+    // built-in toolset; `allowedTools` only governs auto-approval, so setting
+    // that alone would leave Read/Bash/Write visible and callable, and every
+    // headless denial would burn one of the few turns below — failing with
+    // `error_max_turns` on exactly the complex boards worth thinking about.
+    // Web search is the only tool that can improve a play decision.
+    tools: environment.LLM_OPPONENT_ALLOW_WEB_SEARCH ? ['WebSearch', 'WebFetch'] : [],
     allowedTools: environment.LLM_OPPONENT_ALLOW_WEB_SEARCH ? ['WebSearch', 'WebFetch'] : [],
     // Without this the subprocess inherits the operator's own CLAUDE.md,
     // settings and skills. Those are written for whatever repo they sit in and
@@ -74,10 +97,19 @@ async function runDecision(request: DecisionRequest, session: GameSession): Prom
 
   let result: Extract<SDKMessage, { type: 'result' }> | null = null
 
-  for await (const message of query({ prompt: buildDecisionPrompt(request), options })) {
-    if (message.type === 'result') {
-      result = message
+  try {
+    for await (const message of query({ prompt: buildDecisionPrompt(request), options })) {
+      if (message.type === 'result') {
+        result = message
+      }
     }
+  }
+  finally {
+    clearTimeout(timeoutId)
+  }
+
+  if (abortController.signal.aborted) {
+    throw new DecisionRejectedError(`Claude did not answer within ${DECISION_TIMEOUT_MS}ms`)
   }
 
   if (!result) {

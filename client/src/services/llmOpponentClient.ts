@@ -30,7 +30,7 @@ export interface LlmOpponentHealth {
   credential: "setup-token" | "config-dir" | "ambient";
   model: string;
   webSearch: boolean;
-  activeGames: number;
+  activeSeats: number;
 }
 
 export interface LlmOpponentDecisionRequest {

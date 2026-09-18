@@ -131,7 +131,7 @@ describe("probeLlmOpponent", () => {
         credential: "setup-token",
         model: "claude-opus-5",
         webSearch: false,
-        activeGames: 0,
+        activeSeats: 0,
       }),
     );
 
