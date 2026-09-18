@@ -5468,6 +5468,14 @@ mod tests {
         let forest = scenario.add_real_card(P0, "Forest", Zone::Library, &db);
         let island = scenario.add_real_card(P0, "Island", Zone::Library, &db);
         let phantom = scenario.add_real_card(P0, "Phantom Monster", Zone::Hand, &db);
+        // Give the opponent a library to draw from. Without one,
+        // passing priority is a genuine winning line (they deck out on their
+        // next draw), which the search scores at `WIN_SCORE` and prefers over
+        // every fetch line — making this assertion about the prospective route
+        // depend on the search never looking that far.
+        for _ in 0..10 {
+            scenario.add_real_card(P1, "Mountain", Zone::Library, &db);
+        }
         let mut runner = scenario.build();
         rehydrate_game_from_card_db(runner.state_mut(), &db);
         let config = create_config(AiDifficulty::Medium, Platform::Native);
@@ -15023,6 +15031,66 @@ mod tests {
         assert!(
             contract.contains_action(&state, &action),
             "the answer must be in P1's issued domain"
+        );
+    }
+
+    /// A printed fetchland is useless until cracked: the land itself taps for
+    /// nothing, and its replacement enters untapped, so holding it plays the AI
+    /// a mana source short for no compensating information.
+    ///
+    /// Regression for the reported behaviour where the AI played Misty
+    /// Rainforest and then sat on it for turns before cracking it at an
+    /// arbitrary moment. Two independent defects produced that: `anti_self_harm`
+    /// read the fetch's `ChangeZone { target: Any }` as a beneficial creature
+    /// target and charged the full `wasted_cast_penalty` whenever the AI
+    /// controlled no creature, and with that gone nothing scored the activation
+    /// at all, so it tied with `PassPriority`.
+    ///
+    /// The hand is deliberately empty, so the prospective fetch-then-cast
+    /// certificate cannot supply the preference — this pins the tactical policy
+    /// itself. The assertion is on the scores rather than on a sampled choice:
+    /// selection is a softmax draw, so the ordering is the deterministic fact,
+    /// and it is what the reported symptom inverted.
+    #[test]
+    fn untapped_fetchland_outscores_passing_on_its_own_turn() {
+        let db = integration_card_db();
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let misty = scenario.add_real_card(P0, "Misty Rainforest", Zone::Battlefield, &db);
+        for _ in 0..3 {
+            scenario.add_real_card(P0, "Mountain", Zone::Battlefield, &db);
+        }
+        scenario.add_real_card(P0, "Forest", Zone::Library, &db);
+        scenario.add_real_card(P0, "Island", Zone::Library, &db);
+        // Without a library the opponent decks out on their next draw, making
+        // passing a winning line the search scores at `WIN_SCORE` — that would
+        // swamp the tempo question under test.
+        for _ in 0..10 {
+            scenario.add_real_card(P1, "Mountain", Zone::Library, &db);
+        }
+        let mut runner = scenario.build();
+        rehydrate_game_from_card_db(runner.state_mut(), &db);
+        let config = create_config(AiDifficulty::Medium, Platform::Native);
+        let state = runner.state();
+        let session = AiSession::arc_from_game(state);
+
+        let scored = score_candidates_with_session(state, P0, &config, &session);
+        let crack = scored
+            .iter()
+            .find(|(action, _)| {
+                matches!(action, GameAction::ActivateAbility { source_id, .. } if *source_id == misty)
+            })
+            .map(|(_, score)| *score)
+            .expect("the fetchland activation must be a scored candidate");
+        let pass = scored
+            .iter()
+            .find(|(action, _)| matches!(action, GameAction::PassPriority))
+            .map(|(_, score)| *score)
+            .expect("passing must be a scored candidate");
+
+        assert!(
+            crack > pass,
+            "cracking the fetchland ({crack}) must outscore passing ({pass})"
         );
     }
 }

@@ -17,10 +17,18 @@
 //! This policy rejects cracking a tapped self-sacrifice land-fetch outside the
 //! AI's own end step, and gives a small nudge to crack it *at* the end step (the
 //! source produces no mana on its own, so leaving it uncracked strands a dead
-//! land). It deliberately ignores untapped true fetchlands (Wooded Foothills,
-//! Flooded Strand): those produce mana the turn they are cracked, so early
-//! cracking is correct and must not be gated.
+//! land).
+//!
+//! The untapped class (Misty Rainforest, Marsh Flats, Flooded Strand) is the
+//! mirror image and is scored, not gated. Its replacement enters able to tap for
+//! mana the same turn, while the fetch land itself has no mana ability at all —
+//! so every turn it sits uncracked is a turn the AI plays a mana source short,
+//! for no compensating information. Left unscored it merely ties with
+//! `PassPriority`, and the softmax selector then cracks it at an arbitrary
+//! moment turns later; a preference-band score on the AI's own turn is what
+//! makes it act promptly instead.
 
+use engine::game::filter::{matches_target_filter, FilterContext};
 use engine::types::ability::{AbilityCost, Effect, TargetFilter};
 use engine::types::actions::GameAction;
 use engine::types::game_state::GameState;
@@ -39,6 +47,29 @@ use crate::features::DeckFeatures;
 /// uncracked strands a dead land. Nudge-band: enough to beat `PassPriority`,
 /// never enough to override a genuinely better line.
 const END_STEP_CRACK_NUDGE: f64 = 0.3;
+
+/// Preference-band score for cracking an *untapped* fetch on the AI's own turn.
+/// The fetch land produces no mana itself and its replacement enters untapped,
+/// so cracking converts a dead permanent into a live mana source for this turn —
+/// worth about a land drop's tempo, and deliberately above `NUDGE_MAX` so it
+/// decides the softmax rather than merely tilting it.
+const OWN_TURN_CRACK_PREFERENCE: f64 = 1.0;
+
+/// Which class of self-sacrifice land fetch an ability belongs to.
+///
+/// Both classes pay the source land itself to search out a replacement; they
+/// differ only in whether that replacement can produce mana the same turn, and
+/// that single difference inverts the correct timing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LandFetchKind {
+    /// The replacement enters tapped (Evolving Wilds, Terramorphic Expanse).
+    /// Cracking yields no mana this turn whenever it happens, so the only thing
+    /// early cracking spends is information — hold until the own end step.
+    EntersTapped,
+    /// The replacement enters untapped (Misty Rainforest, Marsh Flats). Cracking
+    /// yields a usable mana source this turn, so holding is a pure loss.
+    EntersUntapped,
+}
 
 pub struct FetchLandPatiencePolicy;
 
@@ -83,30 +114,54 @@ impl TacticalPolicy for FetchLandPatiencePolicy {
             return na();
         };
 
-        // The Evolving Wilds class: a self-sacrifice cost whose effect chain
-        // fetches a land that enters the battlefield tapped.
-        if !cost_sacrifices_self(def.cost.as_ref())
-            || !effects_are_tapped_land_fetch(&ctx.effects())
-        {
+        // Both classes share the self-sacrifice cost; the effect chain's tap
+        // state is what separates them.
+        if !cost_sacrifices_self(def.cost.as_ref()) {
             return na();
         }
+        let effects = ctx.effects();
+        let Some(kind) = classify_land_fetch(&effects) else {
+            return na();
+        };
 
-        // CR 513 / CR 514: the AI's own end step is the patient window. The land
-        // enters tapped, so cracking now vs. at end step is identical for this
-        // turn's mana — but end step preserves information until the last moment.
-        let own_end_step =
-            ctx.state.phase == Phase::End && ctx.state.active_player == ctx.ai_player;
-        if own_end_step {
-            return PolicyVerdict::nudge(
-                END_STEP_CRACK_NUDGE,
-                PolicyReason::new("fetch_patience_end_step"),
-            );
+        let own_turn = ctx.state.active_player == ctx.ai_player;
+
+        match kind {
+            LandFetchKind::EntersTapped => {
+                // CR 513 / CR 514: the AI's own end step is the patient window.
+                // The land enters tapped, so cracking now vs. at end step is
+                // identical for this turn's mana — but end step preserves
+                // information until the last moment.
+                if own_turn && ctx.state.phase == Phase::End {
+                    return PolicyVerdict::nudge(
+                        END_STEP_CRACK_NUDGE,
+                        PolicyReason::new("fetch_patience_end_step"),
+                    );
+                }
+                // Any earlier window: hold the fetch. Hard-`Reject` rather than
+                // penalise — the end-step nudge above guarantees it still cracks
+                // eventually, so the land is never stranded.
+                PolicyVerdict::reject(PolicyReason::new("fetch_patience_hold"))
+            }
+            LandFetchKind::EntersUntapped => {
+                // On an opponent's turn holding is defensible (the fetch can still
+                // be cracked later at no cost), so stay neutral rather than
+                // pushing either way. The own-turn score below means a fetch
+                // rarely survives to see that window at all.
+                if !own_turn {
+                    return na();
+                }
+                // Paying the life to search a library that holds no match would
+                // sacrifice the land for nothing.
+                if !library_holds_search_match(ctx, &effects) {
+                    return PolicyVerdict::neutral(PolicyReason::new("fetch_patience_no_match"));
+                }
+                PolicyVerdict::preference(
+                    OWN_TURN_CRACK_PREFERENCE,
+                    PolicyReason::new("fetch_untapped_own_turn"),
+                )
+            }
         }
-
-        // Any earlier window: hold the fetch. Hard-`Reject` rather than penalise —
-        // the end-step nudge above guarantees it still cracks eventually, so the
-        // land is never stranded.
-        PolicyVerdict::reject(PolicyReason::new("fetch_patience_hold"))
     }
 }
 
@@ -124,32 +179,57 @@ fn cost_sacrifices_self(cost: Option<&AbilityCost>) -> bool {
     cost.is_some_and(check)
 }
 
-/// True if the effect chain searches the library for a land and puts a land
-/// onto the battlefield **tapped** (the Evolving Wilds signature, as opposed to
-/// untapped true fetchlands which produce mana the turn they are cracked).
+/// Classify a self-sacrifice chain that searches the library for a land and puts
+/// a land onto the battlefield, by the tap state the replacement arrives in.
+/// Returns `None` for any chain that is not a land fetch at all.
 ///
-/// The two predicates are checked independently across the chain rather than
-/// proving the *searched* card is the one entering tapped — the fetch-land class
-/// always co-locates them (search land → put that land in tapped → shuffle), and
-/// the self-sacrifice gate in `cost_sacrifices_self` already isolates the class.
-/// If a future composite ability searches a land *and* separately drops some
-/// other tapped permanent, tighten this to the `ChangeZone` whose `target`
-/// references land.
-fn effects_are_tapped_land_fetch(effects: &[&Effect]) -> bool {
-    let searches_land = effects.iter().copied().any(|e| {
-        matches!(e, Effect::SearchLibrary { filter, .. } if target_filter_references_land(filter))
+/// The search and the put are checked independently across the chain rather than
+/// proving the *searched* card is the one being put — the fetch-land class always
+/// co-locates them (search land → put that land in → shuffle), and the
+/// self-sacrifice gate in `cost_sacrifices_self` already isolates the class. If a
+/// future composite ability searches a land *and* separately drops some other
+/// permanent, tighten this to the `ChangeZone` whose `target` references land.
+///
+/// Note that only `EtbTapState::Tapped` means tapped: a printed fetchland parses
+/// to `EtbTapState::Unspecified` (its Oracle text says nothing about tapping),
+/// which is the same "enters untapped" outcome as an explicit `Untapped`.
+fn classify_land_fetch(effects: &[&Effect]) -> Option<LandFetchKind> {
+    let searches_land = effects.iter().copied().any(|effect| {
+        matches!(effect, Effect::SearchLibrary { filter, .. } if target_filter_references_land(filter))
     });
-    let puts_tapped_land = effects.iter().copied().any(|e| {
-        matches!(
-            e,
-            Effect::ChangeZone {
-                destination: Zone::Battlefield,
-                enter_tapped: EtbTapState::Tapped,
-                ..
-            }
-        )
-    });
-    searches_land && puts_tapped_land
+    if !searches_land {
+        return None;
+    }
+    effects.iter().copied().find_map(|effect| match effect {
+        Effect::ChangeZone {
+            destination: Zone::Battlefield,
+            enter_tapped,
+            ..
+        } => Some(match enter_tapped {
+            EtbTapState::Tapped => LandFetchKind::EntersTapped,
+            EtbTapState::Unspecified | EtbTapState::Untapped => LandFetchKind::EntersUntapped,
+        }),
+        _ => None,
+    })
+}
+
+/// True if the AI's library still holds a card the chain's `SearchLibrary`
+/// filter would accept. A fetch whose colours have run dry pays its life and
+/// sacrifices its land for nothing, so it must not be scored up.
+fn library_holds_search_match(ctx: &PolicyContext<'_>, effects: &[&Effect]) -> bool {
+    let GameAction::ActivateAbility { source_id, .. } = &ctx.candidate.action else {
+        return false;
+    };
+    let filter_ctx = FilterContext::from_source(ctx.state, *source_id);
+    effects.iter().copied().any(|effect| {
+        let Effect::SearchLibrary { filter, .. } = effect else {
+            return false;
+        };
+        ctx.state.players[ctx.ai_player.0 as usize]
+            .library
+            .iter()
+            .any(|&card_id| matches_target_filter(ctx.state, card_id, filter, &filter_ctx))
+    })
 }
 
 #[cfg(test)]
@@ -285,20 +365,94 @@ mod tests {
         }
     }
 
-    /// An untapped true fetchland (Wooded Foothills shape) is NOT gated — it
-    /// produces mana the turn it is cracked, so early cracking is correct.
+    /// Put a land into the AI's library so an untapped fetch has something to
+    /// find. Without a match the policy deliberately declines to score.
+    fn ai_library_land(state: &mut GameState) -> ObjectId {
+        let id = create_object(state, CardId(2), AI, "Forest".to_string(), Zone::Library);
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types
+            .core_types
+            .push(engine::types::card_type::CoreType::Land);
+        id
+    }
+
+    /// An untapped true fetchland on the AI's own turn is scored up, not merely
+    /// left alone: the fetch land taps for nothing itself, so holding it plays
+    /// the AI a mana source short. The score must clear the nudge band, since a
+    /// nudge only tilts the softmax instead of deciding it.
     #[test]
-    fn untapped_fetchland_unaffected() {
+    fn untapped_fetchland_own_turn_preferred() {
+        let mut state = GameState::new_two_player(42);
+        state.active_player = AI;
+        state.phase = Phase::PreCombatMain;
+        ai_library_land(&mut state);
+        let id = ai_land_with_ability(&mut state, fetch_land_ability(EtbTapState::Untapped));
+        match verdict_for(&state, id) {
+            PolicyVerdict::Score { delta, reason } => {
+                assert_eq!(reason.kind, "fetch_untapped_own_turn");
+                assert!(
+                    delta > super::super::registry::NUDGE_MAX,
+                    "a nudge-band delta ({delta}) would leave the crack up to softmax chance"
+                );
+            }
+            PolicyVerdict::Reject { .. } => panic!("untapped fetch must not be gated"),
+        }
+    }
+
+    /// A printed fetchland's Oracle text says nothing about tapping, so the
+    /// parser emits `EtbTapState::Unspecified` — the same enters-untapped
+    /// outcome as an explicit `Untapped`, and it must classify identically.
+    /// This is the shape the real card database actually produces.
+    #[test]
+    fn unspecified_tap_state_is_the_untapped_class() {
+        let mut state = GameState::new_two_player(42);
+        state.active_player = AI;
+        state.phase = Phase::PreCombatMain;
+        ai_library_land(&mut state);
+        let id = ai_land_with_ability(&mut state, fetch_land_ability(EtbTapState::Unspecified));
+        match verdict_for(&state, id) {
+            PolicyVerdict::Score { reason, .. } => {
+                assert_eq!(reason.kind, "fetch_untapped_own_turn");
+            }
+            PolicyVerdict::Reject { .. } => panic!("an unspecified tap state enters untapped"),
+        }
+    }
+
+    /// With no matching card left in the library, cracking pays the cost and
+    /// sacrifices the land for nothing — so it is not scored up.
+    #[test]
+    fn untapped_fetchland_without_library_match_is_not_preferred() {
         let mut state = GameState::new_two_player(42);
         state.active_player = AI;
         state.phase = Phase::PreCombatMain;
         let id = ai_land_with_ability(&mut state, fetch_land_ability(EtbTapState::Untapped));
         match verdict_for(&state, id) {
             PolicyVerdict::Score { delta, reason } => {
+                assert_eq!(reason.kind, "fetch_patience_no_match");
+                assert_eq!(delta, 0.0);
+            }
+            PolicyVerdict::Reject { .. } => panic!("an empty library must not be gated"),
+        }
+    }
+
+    /// On an opponent's turn the untapped class is left neutral: holding costs
+    /// nothing there, and the own-turn score means a fetch rarely survives to
+    /// see that window at all.
+    #[test]
+    fn untapped_fetchland_on_opponent_turn_is_neutral() {
+        let mut state = GameState::new_two_player(42);
+        state.active_player = PlayerId(1);
+        state.phase = Phase::Upkeep;
+        ai_library_land(&mut state);
+        let id = ai_land_with_ability(&mut state, fetch_land_ability(EtbTapState::Untapped));
+        match verdict_for(&state, id) {
+            PolicyVerdict::Score { delta, reason } => {
                 assert_eq!(reason.kind, "fetch_patience_na");
                 assert_eq!(delta, 0.0);
             }
-            PolicyVerdict::Reject { .. } => panic!("untapped fetch must not be gated"),
+            PolicyVerdict::Reject { .. } => {
+                panic!("opponent-turn untapped fetch must not be gated")
+            }
         }
     }
 }
