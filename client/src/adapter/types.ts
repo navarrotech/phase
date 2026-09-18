@@ -4612,6 +4612,26 @@ export function supportsMatchConcede(
 }
 
 /**
+ * Optional capability for routing an AI seat's decisions through the local LLM
+ * opponent sidecar. A capability rather than a mode flag on `EngineAdapter`,
+ * because only an adapter that owns a local engine can hand a proposal back to
+ * the authority that issued the decision contract — a transport adapter has no
+ * engine to rebind the sidecar's choice against, so it must not advertise this.
+ */
+export interface LlmOpponentCapability {
+  readonly supportsLlmOpponent: true;
+  setLlmOpponentEnabled(enabled: boolean): void;
+}
+
+export function supportsLlmOpponent(
+  adapter: EngineAdapter | null,
+): adapter is EngineAdapter & LlmOpponentCapability {
+  return adapter !== null
+    && (adapter as Partial<LlmOpponentCapability>).supportsLlmOpponent === true
+    && typeof (adapter as Partial<LlmOpponentCapability>).setLlmOpponentEnabled === "function";
+}
+
+/**
  * One turn boundary the server offers as a rollback target. Snake_case because
  * this is the wire shape verbatim (`server-core`'s `RewindOption`); the client
  * renders it and never derives it.

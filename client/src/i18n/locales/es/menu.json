@@ -127,6 +127,11 @@
       "hint": "Todos los oponentes juegan cEDH. Cada mazo debe ser bracket 5.",
       "badge": "cEDH"
     },
+    "llmToggle": {
+      "label": "Oponente Claude",
+      "hint": "{{model}} elige cada jugada del oponente mediante tu sidecar local.",
+      "offline": "El sidecar no está en marcha. Inícialo en sidecar/ para activarlo."
+    },
     "source": {
       "feed": "Feed",
       "user": "Usuario",

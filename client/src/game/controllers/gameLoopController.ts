@@ -1,4 +1,5 @@
 import { getPlayerId } from "../../hooks/usePlayerId";
+import { supportsLlmOpponent } from "../../adapter/types";
 import { useGameStore } from "../../stores/gameStore";
 import { usePreferencesStore } from "../../stores/preferencesStore";
 import { useUiStore } from "../../stores/uiStore";
@@ -133,6 +134,14 @@ export function createGameLoopController(config: GameLoopConfig): GameLoopContro
           difficulty: config.aiSeats?.[i]?.difficulty ?? fallbackDifficulty,
         };
       });
+      // The LLM opponent is a property of the AI seats, so it is armed here
+      // alongside them and only for adapters that own a local engine — a
+      // transport adapter has nothing to rebind a sidecar decision against.
+      const adapter = useGameStore.getState().adapter;
+      if (supportsLlmOpponent(adapter)) {
+        adapter.setLlmOpponentEnabled(usePreferencesStore.getState().llmOpponentEnabled);
+      }
+
       opponentController = createAIController({ seats });
       opponentController.start();
     }

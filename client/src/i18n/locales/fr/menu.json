@@ -127,6 +127,11 @@
       "hint": "Tous les adversaires jouent en cEDH. Chaque deck doit être de palier 5.",
       "badge": "cEDH"
     },
+    "llmToggle": {
+      "label": "Adversaire Claude",
+      "hint": "{{model}} choisit chaque coup de l'adversaire via votre sidecar local.",
+      "offline": "Le sidecar n'est pas lancé. Démarrez-le dans sidecar/ pour l'activer."
+    },
     "source": {
       "feed": "Flux",
       "user": "Utilisateur",

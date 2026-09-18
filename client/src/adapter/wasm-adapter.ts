@@ -9,6 +9,7 @@ import type {
   GameAction,
   GameState,
   LegalActionsResult,
+  LlmOpponentCapability,
   MatchConfig,
   ObjectId,
   PersistedGameState,
@@ -42,6 +43,11 @@ import {
   DEFAULT_AI_CARD_DATA_MODE,
   resolveAiPoolCardDbPlan,
 } from "./card-db-subset";
+import { LLM_OPPONENT_MIN_ACTIONS } from "../constants/llmOpponent";
+import {
+  releaseLlmOpponentGame,
+  requestLlmOpponentDecision,
+} from "../services/llmOpponentClient";
 
 function isMemoryConstrainedDevice(): boolean {
   if (typeof navigator === "undefined") return false;
@@ -198,9 +204,20 @@ function describeCardDbError(err: unknown): string {
   return `: ${trimmed}`;
 }
 
-export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapability {
+export class WasmAdapter
+implements EngineAdapter, AiDecisionDiagnosticsCapability, LlmOpponentCapability {
   private initialized = false;
   cardDbLoaded = false;
+
+  // ── Local LLM opponent (never shipped upstream; see docs/llm-opponent.md) ──
+  // Off unless a game explicitly turns it on, so an ordinary AI game never
+  // reaches for a sidecar that is almost always absent.
+  readonly supportsLlmOpponent = true as const;
+  private llmOpponentEnabled = false;
+  // One id per game, so the sidecar keeps one Claude conversation per game
+  // rather than one per process. Minted on reset, which is the only point the
+  // engine's game identity actually changes.
+  private llmOpponentGameId = crypto.randomUUID();
 
   // Worker-based engine (primary path)
   private engine: EngineWorkerClient | null = null;
@@ -556,6 +573,14 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
   ): Promise<AiActionProposal | null> {
     this.assertInitialized();
     try {
+      // The LLM opponent runs ahead of every built-in route and falls through
+      // to it on any failure, so a missing, slow, or confused sidecar costs a
+      // decision's latency and never a stuck game.
+      if (this.llmOpponentEnabled && this.engine) {
+        const proposal = await this.getLlmOpponentProposal(this.engine, difficulty, playerId);
+        if (proposal) return proposal;
+      }
+
       const captureEpoch = this.aiDecisionDiagnosticsEpoch;
       const capture = this.aiDecisionDiagnosticsEnabled;
       if (capture) {
@@ -666,6 +691,75 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
       return outcome;
     } catch (err) {
       throw await classifyEngineErrorAsync(err, this.takePanic);
+    }
+  }
+
+  /** Route this adapter's AI seats through the local sidecar (dev-only feature). */
+  setLlmOpponentEnabled(enabled: boolean): void {
+    if (this.llmOpponentEnabled === enabled) return;
+    this.llmOpponentEnabled = enabled;
+    if (!enabled) void releaseLlmOpponentGame(this.llmOpponentGameId);
+  }
+
+  /**
+   * Ask the sidecar which of the engine's legal actions to take, then hand the
+   * answer back to the engine as a one-entry score vector.
+   *
+   * The score vector is the entire integration. `getAiActionProposalFromScores`
+   * issues a fresh `AiDecisionContract` against the state as it stands *now*,
+   * drops every scored action the contract does not admit, and returns null if
+   * nothing survives — so a choice made against a snapshot that has since moved
+   * on is discarded by the authority rather than submitted. A single admissible
+   * entry is selected deterministically (softmax short-circuits at length 1),
+   * which is why the sidecar returns one index and not a ranking.
+   *
+   * Returns null for every "not this time" outcome, which the caller reads as
+   * "use the built-in AI".
+   */
+  private async getLlmOpponentProposal(
+    engine: EngineWorkerClient,
+    difficulty: string,
+    playerId: number,
+  ): Promise<AiActionProposal | null> {
+    try {
+      const snapshot = await engine.getViewerSnapshot(playerId);
+
+      // The engine's own auto-pass recommendation is the cost gate. Most
+      // priority windows in Magic offer nothing but a pass; paying a model
+      // round-trip for each would make a turn take minutes for no decision.
+      if (snapshot.autoPassRecommended || snapshot.actions.length < LLM_OPPONENT_MIN_ACTIONS) {
+        return null;
+      }
+
+      const decision = await requestLlmOpponentDecision({
+        gameId: this.llmOpponentGameId,
+        playerId,
+        difficulty,
+        waitingFor: snapshot.state.waiting_for.type,
+        state: unwrapClientGameState(snapshot.state),
+        actions: snapshot.actions,
+      });
+
+      const chosen = snapshot.actions[decision.actionIndex];
+      if (!chosen) {
+        console.warn(`LLM opponent chose an action index with no action: ${decision.actionIndex}`);
+        return null;
+      }
+
+      console.debug(`LLM opponent (${decision.durationMs}ms): ${decision.reasoning}`);
+
+      return await engine.getAiActionProposalFromScores(
+        JSON.stringify([[chosen, 1]]),
+        difficulty,
+        playerId,
+        Date.now(),
+      );
+    } catch (error) {
+      // A lost engine state is not the sidecar's failure and must not be
+      // swallowed into a silent fallback — the recovery path upstream owns it.
+      if (error instanceof Error && isStateLostMessage(error.message)) throw error;
+      console.warn("LLM opponent unavailable; using the built-in AI for this decision", error);
+      return null;
     }
   }
 
@@ -933,6 +1027,11 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
 
   /** Clear the WASM game state without terminating the worker. */
   async resetGameState(): Promise<void> {
+    // Retire the finished game's Claude conversation before minting the next
+    // id. Without this the new game inherits the last one's board reads and
+    // committed plans, which is worse than no memory at all.
+    void releaseLlmOpponentGame(this.llmOpponentGameId);
+    this.llmOpponentGameId = crypto.randomUUID();
     this.aiPoolGeneration += 1;
     this.aiPoolPromise = null;
     this.aiPoolFailed = false;

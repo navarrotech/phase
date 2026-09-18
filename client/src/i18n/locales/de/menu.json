@@ -127,6 +127,11 @@
       "hint": "Alle Gegner spielen cEDH. Jedes Deck muss Bracket 5 sein.",
       "badge": "cEDH"
     },
+    "llmToggle": {
+      "label": "Claude-Gegner",
+      "hint": "{{model}} wählt jeden gegnerischen Zug über deinen lokalen Sidecar.",
+      "offline": "Sidecar läuft nicht. Starte ihn in sidecar/, um dies zu aktivieren."
+    },
     "source": {
       "feed": "Feed",
       "user": "Benutzer",

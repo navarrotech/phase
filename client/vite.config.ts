@@ -517,6 +517,23 @@ export default defineConfig(({ mode }) => {
         target: process.env.VITE_IMPORT_DECK_PROXY ?? "http://localhost:8787",
         changeOrigin: true,
       },
+      // Local LLM opponent sidecar (`sidecar/`, dev-only — see
+      // docs/llm-opponent.md). Proxied so the browser talks to a same-origin
+      // relative path: the sidecar holds a Claude subscription credential and
+      // has no authentication, so it must stay on loopback and must never be
+      // reachable cross-origin from a page. There is no production counterpart
+      // to this route; a build without the sidecar running just 502s here and
+      // the client falls back to the built-in AI.
+      "/llm-opponent": {
+        target: process.env.VITE_LLM_OPPONENT_PROXY ?? "http://127.0.0.1:8788",
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/llm-opponent/, ""),
+        // A decision can legitimately take a couple of minutes when the model
+        // thinks or searches; the default proxy timeout would cut it short and
+        // look like a sidecar crash.
+        timeout: 180_000,
+        proxyTimeout: 180_000,
+      },
     },
   },
   build: {

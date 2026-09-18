@@ -127,6 +127,11 @@
       "hint": "All opponents play cEDH. Every deck must be bracket 5.",
       "badge": "cEDH"
     },
+    "llmToggle": {
+      "label": "Claude opponent",
+      "hint": "{{model}} chooses every opponent move through your local sidecar.",
+      "offline": "Sidecar not running. Start it in sidecar/ to enable this."
+    },
     "source": {
       "feed": "Feed",
       "user": "User",

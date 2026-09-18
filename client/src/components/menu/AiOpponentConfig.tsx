@@ -7,6 +7,7 @@ import { AI_DIFFICULTIES, type AIDifficulty } from "../../constants/ai";
 import type { AiDeckCandidate } from "../../services/aiDeckCatalog";
 import { filterByBracket, useAiDeckCatalog } from "../../services/aiDeckCatalog";
 import { CEDH_BRACKET } from "../../services/cedhLock";
+import { useLlmOpponentHealth } from "../../hooks/useLlmOpponentHealth";
 import { isCommanderFamilyFormat } from "../../types/bracket";
 import {
   AI_DECK_RANDOM,
@@ -69,6 +70,9 @@ export function AiOpponentConfig({
   const aiSeats = usePreferencesStore((s) => s.aiSeats);
   const cedhMode = usePreferencesStore((s) => s.cedhMode);
   const setCedhMode = usePreferencesStore((s) => s.setCedhMode);
+  const llmOpponentEnabled = usePreferencesStore((s) => s.llmOpponentEnabled);
+  const setLlmOpponentEnabled = usePreferencesStore((s) => s.setLlmOpponentEnabled);
+  const llmOpponent = useLlmOpponentHealth();
   const setAiSeatDifficulty = usePreferencesStore((s) => s.setAiSeatDifficulty);
   const setAiSeatDeckId = usePreferencesStore((s) => s.setAiSeatDeckId);
   const ensureAiSeatCount = usePreferencesStore((s) => s.ensureAiSeatCount);
@@ -183,6 +187,42 @@ export function AiOpponentConfig({
             <span
               className={`inline-block h-5 w-5 transform rounded-full bg-white transition-transform ${
                 cedhMode ? "translate-x-5" : "translate-x-0.5"
+              }`}
+            />
+          </button>
+        </div>
+      )}
+
+      {/* Local LLM opponent. Table-wide like cEDH and orthogonal to it: every
+          seat keeps its configured difficulty and the engine still authors and
+          re-validates every action — the sidecar only picks which of the
+          engine's legal actions to take. Shown even when the sidecar is down,
+          disabled with the reason: a toggle that disappears with its backend
+          is indistinguishable from one that was never built. */}
+      {llmOpponent.probed && (
+        <div className="flex items-center justify-between gap-3 rounded-lg border border-violet-500/25 bg-violet-500/5 px-3 py-2">
+          <div className="flex min-w-0 flex-col">
+            <span className="text-xs font-semibold text-violet-200">{t("aiOpponent.llmToggle.label")}</span>
+            <span className="text-[10px] text-slate-400">{
+              llmOpponent.health
+                ? t("aiOpponent.llmToggle.hint", { model: llmOpponent.health.model })
+                : t("aiOpponent.llmToggle.offline")
+            }</span>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            disabled={!llmOpponent.health}
+            aria-checked={llmOpponentEnabled && Boolean(llmOpponent.health)}
+            aria-label={t("aiOpponent.llmToggle.label")}
+            onClick={() => setLlmOpponentEnabled(!llmOpponentEnabled)}
+            className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-300/60 ${
+              llmOpponentEnabled && llmOpponent.health ? "bg-violet-500" : "bg-white/15"
+            } ${llmOpponent.health ? "" : "cursor-not-allowed opacity-50"}`}
+          >
+            <span
+              className={`inline-block h-5 w-5 transform rounded-full bg-white transition-transform ${
+                llmOpponentEnabled && llmOpponent.health ? "translate-x-5" : "translate-x-0.5"
               }`}
             />
           </button>

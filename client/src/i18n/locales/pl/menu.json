@@ -127,6 +127,11 @@
       "hint": "Wszyscy przeciwnicy grają w cEDH. Każda talia musi być w przedziale 5.",
       "badge": "cEDH"
     },
+    "llmToggle": {
+      "label": "Przeciwnik Claude",
+      "hint": "{{model}} wybiera każdy ruch przeciwnika przez twój lokalny sidecar.",
+      "offline": "Sidecar nie działa. Uruchom go w sidecar/, aby to włączyć."
+    },
     "source": {
       "feed": "Kanał",
       "user": "Użytkownik",

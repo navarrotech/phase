@@ -319,6 +319,7 @@ function buildDefaultPreferences(): PreferencesState {
     multiplayerSplitLayoutNudgeDismissed: true,
     aiSeats: [defaultAiSeat()],
     cedhMode: false,
+    llmOpponentEnabled: false,
     aiArchetypeFilter: "Any",
     aiCoverageFloor: DEFAULT_AI_COVERAGE_FLOOR,
     aiBracketFilter: [] as CommanderBracket[],
@@ -427,6 +428,12 @@ interface PreferencesState {
    *  pools are restricted to bracket-5 decks. cEDH is a table property, not a
    *  per-seat difficulty — see `effectiveAiDifficulty` in `services/cedhLock`. */
   cedhMode: boolean;
+  /** Route AI seats through the local LLM opponent sidecar (`sidecar/`).
+   *  Table-wide, like `cedhMode`, and deliberately NOT an `AIDifficulty`: the
+   *  engine's difficulty contract is untouched by this feature, and each seat
+   *  keeps the difficulty it was configured with. Local development only —
+   *  the sidecar holds a Claude subscription credential and is never deployed. */
+  llmOpponentEnabled: boolean;
   aiArchetypeFilter: AiArchetypeFilter;
   aiCoverageFloor: number;
   aiBracketFilter: CommanderBracket[];
@@ -511,6 +518,7 @@ interface PreferencesActions {
   ensureAiSeatCount: (count: number) => void;
   /** Toggle the table-wide cEDH mode (all AI play cEDH, deck pools → bracket 5). */
   setCedhMode: (enabled: boolean) => void;
+  setLlmOpponentEnabled: (enabled: boolean) => void;
   setAiArchetypeFilter: (filter: AiArchetypeFilter) => void;
   setAiCoverageFloor: (floor: number) => void;
   setAiBracketFilter: (brackets: CommanderBracket[]) => void;
@@ -705,6 +713,7 @@ export const usePreferencesStore = create<PreferencesState & PreferencesActions>
           return { aiSeats: grown };
         }),
       setCedhMode: (enabled) => set({ cedhMode: enabled }),
+      setLlmOpponentEnabled: (enabled) => set({ llmOpponentEnabled: enabled }),
       setAiArchetypeFilter: (filter) => set({ aiArchetypeFilter: filter }),
       setAiCoverageFloor: (floor) => set({ aiCoverageFloor: floor }),
       setAiBracketFilter: (brackets) => set({ aiBracketFilter: brackets }),
