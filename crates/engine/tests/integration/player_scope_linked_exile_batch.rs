@@ -71,6 +71,8 @@ fn cast_window(source: ObjectId) -> ResolvedAbility {
                 bounds: ResolutionCastWindow::UNBOUNDED,
             },
             mana_spend_permission: None,
+            additional_cost: None,
+            cast_cost_modifier: None,
         },
         vec![],
         source,

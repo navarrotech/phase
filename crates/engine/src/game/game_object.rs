@@ -11,7 +11,7 @@ use crate::types::ability::{
     ChosenSubtypeKind, CostPaidObjectSnapshot, ExiledSpellRider, ModalChoice,
     ReplacementDefinition, SeatDirection, SolveCondition, SpellCastingOption, StaticDefinition,
     TriggerBaseSetInstanceRef, TriggerDefinition, TriggerDefinitionOccurrenceRef, TriggerEntry,
-    TriggerOccurrenceState,
+    TriggerOccurrenceState, TriggerPrintedOrigin,
 };
 use crate::types::card::{LayoutKind, PrintedCardRef, PrintedLoyalty, TokenImageRef};
 use crate::types::card_type::{CardType, CoreType};
@@ -168,6 +168,8 @@ pub struct CleaveFormState {
     pub replacements: Definitions<ReplacementDefinition>,
     pub base_abilities: Arc<Vec<AbilityDefinition>>,
     pub base_triggers: Arc<Vec<TriggerDefinition>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub base_trigger_printed_origins: Vec<Option<TriggerPrintedOrigin>>,
     pub trigger_base_set_instance: TriggerBaseSetInstanceRef,
     pub next_trigger_base_set_instance: u64,
     pub base_statics: Arc<Vec<StaticDefinition>>,
@@ -231,6 +233,10 @@ pub struct BackFaceData {
     /// Stored card-face payload. Live object definitions are materialized with
     /// recipient-local occurrence provenance when this face is installed.
     pub trigger_definitions: Definitions<TriggerDefinition>,
+    /// Semantic printed identity for each trigger slot when this face is a
+    /// snapshot of copied values. Empty means derive identity from `printed_ref`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trigger_printed_origins: Vec<Option<TriggerPrintedOrigin>>,
     pub replacement_definitions: Definitions<ReplacementDefinition>,
     pub static_definitions: Definitions<StaticDefinition>,
     pub color: Vec<ManaColor>,
@@ -696,6 +702,11 @@ pub struct GameObject {
     /// than the `Definitions<T>` wrapper that gates live reads.
     /// Wrapped in `Arc` for structural sharing across cloned `GameState`s.
     pub base_trigger_definitions: Arc<Vec<TriggerDefinition>>,
+    /// Semantic printed origin for each materialized base trigger. Empty for an
+    /// ordinary printed face (where `base_printed_ref` + local slot is enough);
+    /// populated for copied values whose slots can come from several cards.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub base_trigger_printed_origins: Vec<Option<TriggerPrintedOrigin>>,
     /// Current ordered printed/base trigger-set generation. This stays stable
     /// across ordinary layer resets and only changes when a caller intentionally
     /// installs a new base/face/cleave trigger set.
@@ -1439,6 +1450,7 @@ fn _gameobject_partition_is_total(o: &GameObject) {
         base_keywords: _,
         base_abilities: _,
         base_trigger_definitions: _,
+        base_trigger_printed_origins: _,
         trigger_base_set_instance: _,
         next_trigger_base_set_instance: _,
         trigger_occurrence_state: _,
@@ -1612,6 +1624,17 @@ impl GameObject {
             base.push(definition.clone());
             index
         };
+        if !self.base_trigger_printed_origins.is_empty() {
+            self.base_trigger_printed_origins
+                .push(
+                    self.base_printed_ref
+                        .clone()
+                        .map(|printed_ref| TriggerPrintedOrigin {
+                            printed_ref,
+                            printed_occurrence: printed_index,
+                        }),
+                );
+        }
         self.trigger_definitions.push(TriggerEntry::new(
             TriggerDefinitionOccurrenceRef::Printed {
                 base_set,
@@ -1746,6 +1769,25 @@ impl GameObject {
     ) -> Result<(), &'static str> {
         self.allocate_trigger_base_set_instance()?;
         self.base_trigger_definitions = definitions;
+        self.base_trigger_printed_origins.clear();
+        self.materialize_base_trigger_definitions();
+        Ok(())
+    }
+
+    /// Installs a base trigger set materialized from CR 707 copiable values,
+    /// preserving each slot's semantic printed-card origin across future layer
+    /// resets. An empty origin vector is the legacy/ordinary printed shape.
+    pub fn install_copiable_trigger_base_definitions(
+        &mut self,
+        definitions: Arc<Vec<TriggerDefinition>>,
+        printed_origins: Arc<Vec<Option<TriggerPrintedOrigin>>>,
+    ) -> Result<(), &'static str> {
+        if !printed_origins.is_empty() && printed_origins.len() != definitions.len() {
+            return Err("copiable trigger origins must align with base definitions");
+        }
+        self.allocate_trigger_base_set_instance()?;
+        self.base_trigger_definitions = definitions;
+        self.base_trigger_printed_origins = printed_origins.as_ref().clone();
         self.materialize_base_trigger_definitions();
         Ok(())
     }
@@ -1764,6 +1806,11 @@ impl GameObject {
 
     /// Validates the object-local portion of trigger occurrence provenance.
     pub fn validate_trigger_definitions(&self) -> Result<(), &'static str> {
+        if !self.base_trigger_printed_origins.is_empty()
+            && self.base_trigger_printed_origins.len() != self.base_trigger_definitions.len()
+        {
+            return Err("copiable trigger origins do not align with the active base set");
+        }
         for entry in self.trigger_definitions.iter_all() {
             match &entry.occurrence {
                 TriggerDefinitionOccurrenceRef::Printed {
@@ -2568,6 +2615,7 @@ impl GameObject {
             base_keywords: Vec::new(),
             base_abilities: Arc::new(Vec::new()),
             base_trigger_definitions: Default::default(),
+            base_trigger_printed_origins: Vec::new(),
             trigger_base_set_instance: TriggerBaseSetInstanceRef::INITIAL,
             next_trigger_base_set_instance: 2,
             trigger_occurrence_state: TriggerOccurrenceState::default(),
@@ -2855,23 +2903,53 @@ impl GameObject {
             RoomDoor::Left => RoomDoor::Right,
             RoomDoor::Right => RoomDoor::Left,
         };
-        let base = Arc::make_mut(&mut self.base_trigger_definitions);
-        for definition in base.iter_mut() {
-            if definition.room_door.is_none() {
-                definition.room_door = Some(live_door);
+        let should_install_other_door = {
+            let base = Arc::make_mut(&mut self.base_trigger_definitions);
+            for definition in base.iter_mut() {
+                if definition.room_door.is_none() {
+                    definition.room_door = Some(live_door);
+                }
             }
-        }
-        if let Some(back) = &self.back_face {
-            if !base
-                .iter()
-                .any(|definition| definition.room_door == Some(other_door))
-            {
-                base.extend(back.trigger_definitions.iter_all().map(|printed| {
+            self.back_face.as_ref().is_some_and(|_| {
+                !base
+                    .iter()
+                    .any(|definition| definition.room_door == Some(other_door))
+            })
+        };
+        if should_install_other_door {
+            let mut origins = crate::game::printed_cards::base_trigger_printed_origins(self)
+                .as_ref()
+                .clone();
+            let back = self
+                .back_face
+                .as_ref()
+                .expect("other Room door requires a stored face");
+            let back_origins =
+                back.trigger_definitions
+                    .iter_all()
+                    .enumerate()
+                    .map(|(printed_occurrence, _)| {
+                        back.trigger_printed_origins
+                            .get(printed_occurrence)
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                back.printed_ref
+                                    .clone()
+                                    .map(|printed_ref| TriggerPrintedOrigin {
+                                        printed_ref,
+                                        printed_occurrence,
+                                    })
+                            })
+                    });
+            origins.extend(back_origins);
+            Arc::make_mut(&mut self.base_trigger_definitions).extend(
+                back.trigger_definitions.iter_all().map(|printed| {
                     let mut definition = printed.clone();
                     definition.room_door = Some(other_door);
                     definition
-                }));
-            }
+                }),
+            );
+            self.base_trigger_printed_origins = origins;
         }
         self.materialize_base_trigger_definitions();
 
@@ -3059,15 +3137,15 @@ impl GameObject {
     ///
     /// # Scope: BATTLEFIELD EXIT ONLY. Deliberately not zone-parameterized.
     ///
-    /// `zones::apply_zone_exit_cleanup` (`zones.rs:137`) restores the stashed face
+    /// `zones::apply_zone_exit_cleanup` restores the stashed face
     /// through **three independent gates**, not one disjunction, and only two of the
     /// three are unconditional:
     ///
     /// | flag | gate in `apply_zone_exit_cleanup` | at `from = Battlefield` |
     /// |---|---|---|
-    /// | `transformed` (`:261`, CR 712.8a + CR 400.7) | no zone gate at all | reverts |
-    /// | `modal_back_face` (`:273`, CR 712.8a + CR 400.7) | `to != Stack && to != Battlefield` | reverts for any non-stack, non-battlefield destination |
-    /// | `face_down` (`:286`, CR 708.9) | `from == Battlefield \|\| (from == Stack && to != Battlefield)` | reverts |
+    /// | `transformed` (CR 712.8a + CR 400.7) | no zone gate at all | reverts |
+    /// | `modal_back_face` (CR 712.8a + CR 400.7) | `to != Stack && to != Battlefield` | reverts for any non-stack, non-battlefield destination |
+    /// | `face_down` (CR 708.9) | `from == Battlefield \|\| (from == Stack && to != Battlefield)` | reverts |
     ///
     /// **Each flag INDEPENDENTLY reverts for `Battlefield -> Graveyard`** (CR
     /// 701.21a's transition), which is what the disjunction below relies on. The
@@ -3084,16 +3162,17 @@ impl GameObject {
     /// A **flipped permanent that is then turned face down** (Ixidron, Cyber
     /// Conversion — CR 712.16 does not cover flip cards, so this is legal) sets
     /// `flipped` AND `face_down` at once, and the two statuses **share the single
-    /// `back_face` slot**. `effects::turn_face_down` (`turn_face_down.rs:66-69`)
+    /// `back_face` slot**. `effects::turn_face_down::turn_permanent_face_down`
     /// keeps the FLIP stash there rather than overwriting it with a base snapshot,
     /// and `zones::apply_zone_exit_cleanup` runs the CR 708.9 face-down restore
-    /// BEFORE the CR 710.4 flip revert (`zones.rs:300-309`) precisely so one slot
+    /// BEFORE the CR 710.4 flip revert (the `flip::revert_flip_on_zone_exit` call
+    /// in that same function) precisely so one slot
     /// serves both.
     ///
     /// So for that object `back_face` holds the flip card's NORMAL half, not the
     /// base face — and reading it is not merely harmless, it is REQUIRED. Turning
     /// the permanent face down set both `mana_cost` and `base_mana_cost` to
-    /// `ManaCost::NoCost` (`morph.rs:47`, CR 708.2a), so the `None =>` arm would
+    /// `ManaCost::NoCost` (`morph::apply_face_down_creature_characteristics`, CR 708.2a), so the `None =>` arm would
     /// return 0 here. The `face_down` disjunct is what routes this object to the
     /// stash instead. CR 710.1c ("A flip card's color and mana cost don't change if
     /// the permanent is flipped") makes that stash mana-cost-identical to the
@@ -3101,24 +3180,25 @@ impl GameObject {
     ///
     /// `flipped` is **not** a fourth conjunct, and this is settled — do not
     /// re-chase it. CR 710.1c again: `flip::apply_flipped_face_to_object`
-    /// (`flip.rs:320`) leaves `mana_cost` and `base_mana_cost` untouched by design
-    /// (`flip.rs:363-365`), so for a flipped-but-face-UP permanent the `None =>`
-    /// arm already returns the right number.
+    /// leaves `mana_cost` and `base_mana_cost` untouched by design (that
+    /// function's doc comment lists them under "Deliberately NOT copied"), so
+    /// for a flipped-but-face-UP permanent the `None =>` arm already returns
+    /// the right number.
     ///
     /// # Why not `self.mana_cost`
     ///
     /// It is the live, layer-mutable characteristic (CR 613.1). `layers::
     /// seed_live_characteristics_from_base` re-seeds it from `base_mana_cost` at the
     /// top of every layer pass, and `printed_cards::apply_copiable_values`
-    /// (`printed_cards.rs:644`) then overwrites **only** the live field — it writes
+    /// then overwrites **only** the live field — it writes
     /// no `base_*` field at all. CR 903.3's own example puts a copied commander in
     /// scope here ("A commander that's copying another card … is still a commander").
     ///
     /// # Why not `self.base_mana_cost` alone
     ///
-    /// `printed_cards::apply_back_face_to_object` (`:287`) writes **both** the live
-    /// (`:295`) and base (`:308`) fields from the installed face, and
-    /// `morph::apply_face_down_creature_characteristics` (`morph.rs:47`) sets both to
+    /// `printed_cards::apply_back_face_to_object` writes **both** the live
+    /// (`obj.mana_cost`) and base (`obj.base_mana_cost`) fields from the installed face, and
+    /// `morph::apply_face_down_creature_characteristics` sets both to
     /// `ManaCost::NoCost` (CR 708.2a). For those objects `base_mana_cost` describes
     /// the face currently shown, not the face the card will show off the battlefield.
     ///
@@ -3126,14 +3206,17 @@ impl GameObject {
     ///
     /// The `back_face` slot is **shared** by the transform, MDFC, face-down and flip
     /// stashes, and its writers do not agree on which snapshot they take:
-    ///   * `transform.rs:85`/`:90` stash `printed_cards::snapshot_object_face`, which
-    ///     captures the **live** `mana_cost` (`printed_cards.rs:717`). A permanent
+    ///   * `transform::transform_permanent`'s two `back_face` stashes call
+    ///     `printed_cards::snapshot_object_face`, which
+    ///     captures the **live** `mana_cost` (the `mana_cost: obj.mana_cost.clone()`
+    ///     field of the `BackFaceData` it builds). A permanent
     ///     transformed while already under a mana-cost-altering copy effect therefore
     ///     parks a polluted value, and this method will read it.
-    ///   * `effects/turn_face_down.rs:68` stashes `snapshot_object_base_face` — the
+    ///   * `effects::turn_face_down::turn_permanent_face_down` stashes
+    ///     `snapshot_object_base_face` — the
     ///     **printed** baseline. That path is clean.
     ///     The divergence is **BIDIRECTIONAL**, not downward-only: `intrinsic_copiable_
-    ///     values` (`printed_cards.rs:486`) sources `obj.base_mana_cost` from the COPY
+    ///     values` sources `obj.base_mana_cost` from the COPY
     ///     SOURCE and `apply_copiable_values` writes it to the RECIPIENT's live field
     ///     with no clamp, so a `{1}{U}` Clone copying a fifteen-drop ends with live 15
     ///     against base 2. Tracked as task #36; the fix is an engine change at the
@@ -3295,6 +3378,30 @@ impl GameObject {
                 _ => None,
             })
             .collect()
+    }
+
+    /// CR 716.2d: This permanent's level — the single authority every class-level
+    /// gate reads. A permanent that doesn't have a level is treated as though its
+    /// level is 1, so an object that carries Class abilities without a stored level
+    /// (a copy effect grants the `Class` subtype and its level bars through the
+    /// layer system, while CR 716.2b keeps the level itself off the copiable
+    /// characteristics) still answers every level question, and answers it with 1
+    /// rather than the original's level.
+    ///
+    /// Contract: this answers "what is this permanent's level", which is the only
+    /// question CR 716.2d normalizes. It deliberately does NOT answer "does this
+    /// object store a level of its own" — read `class_level` directly for that.
+    /// CR 716.4: level counters on leveler cards are a separate designation and are
+    /// never read here.
+    pub fn level(&self) -> u8 {
+        Self::level_from_stored(self.class_level)
+    }
+
+    /// CR 716.2d: [`Self::level`] for callers that hold a latched level snapshot
+    /// instead of a live object (`TriggerSourceRead::Latched`). The default lives
+    /// here alone so no read site restates it.
+    pub fn level_from_stored(class_level: Option<u8>) -> u8 {
+        class_level.unwrap_or(1)
     }
 
     /// CR 614.12c + CR 607.2d: Look up the persisted anchor-word label chosen
@@ -3866,6 +3973,47 @@ mod tests {
         let deserialized: GameObject = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.name, "Test Card");
         assert_eq!(deserialized.id, ObjectId(1));
+    }
+
+    #[test]
+    fn room_door_install_keeps_both_faces_trigger_origins_aligned() {
+        let live_ref = PrintedCardRef {
+            oracle_id: "room-oracle".to_string(),
+            face_name: "Left Door".to_string(),
+        };
+        let back_ref = PrintedCardRef {
+            oracle_id: "room-oracle".to_string(),
+            face_name: "Right Door".to_string(),
+        };
+        let mut object = trigger_test_object();
+        object.base_printed_ref = Some(live_ref.clone());
+        object.base_trigger_definitions =
+            Arc::new(vec![TriggerDefinition::new(TriggerMode::Phase)]);
+        object.back_face = Some(BackFaceData {
+            printed_ref: Some(back_ref.clone()),
+            trigger_definitions: vec![TriggerDefinition::new(TriggerMode::Attacks)].into(),
+            ..Default::default()
+        });
+
+        object.install_room_door_text();
+
+        assert_eq!(object.base_trigger_definitions.len(), 2);
+        assert_eq!(
+            object.base_trigger_printed_origins,
+            vec![
+                Some(TriggerPrintedOrigin {
+                    printed_ref: live_ref,
+                    printed_occurrence: 0,
+                }),
+                Some(TriggerPrintedOrigin {
+                    printed_ref: back_ref,
+                    printed_occurrence: 0,
+                }),
+            ]
+        );
+        object
+            .validate_trigger_definitions()
+            .expect("Room trigger definitions and origins remain aligned");
     }
 
     #[test]

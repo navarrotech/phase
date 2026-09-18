@@ -131,6 +131,14 @@ pub struct PendingCoinFlip {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lose_effect: Option<Box<AbilityDefinition>>,
     pub kind: PendingCoinFlipKind,
+    /// CR 608.2h: the creating ability's chain-root target list, carried
+    /// across the Krark's Thumb keep-choice suspension so a counter-gated
+    /// "that many" nested in `win_effect`/`lose_effect` still resolves
+    /// against the live chain-root target once the flip's branch runs.
+    /// `#[serde(default)]` for in-flight states serialized before this field
+    /// existed.
+    #[serde(default)]
+    pub chain_root_targets: Vec<TargetRef>,
 }
 
 /// CR 706.6 + CR 614.1a: Full resolution context for a die-roll resolver paused
@@ -217,6 +225,14 @@ pub struct PendingDieRoll {
     /// forced remainder so the resume path drops both halves together.
     #[serde(default)]
     pub forced_ignored: Vec<usize>,
+    /// CR 608.2h: the creating ability's chain-root target list, carried
+    /// across the CR 706.6 ignore choice AND any mid-loop results-branch
+    /// suspension so a counter-gated "that many" nested in a results-table
+    /// branch still resolves against the live chain-root target once that
+    /// branch actually runs. `#[serde(default)]` for in-flight states
+    /// serialized before this field existed.
+    #[serde(default)]
+    pub chain_root_targets: Vec<TargetRef>,
 }
 
 /// CR 706.1 + CR 616.1: A die-roll INSTRUCTION parked across a replacement
@@ -263,6 +279,12 @@ pub struct PendingDieRollInstruction {
     /// Which caller owns the completion of this roll (see the type docs).
     #[serde(default)]
     pub continuation: DieRollContinuation,
+    /// CR 608.2h: the creating ability's chain-root target list, carried
+    /// across the CR 616.1 replacement-ordering choice so it survives into
+    /// the `PendingDieRoll` this instruction produces. `#[serde(default)]`
+    /// for in-flight states serialized before this field existed.
+    #[serde(default)]
+    pub chain_root_targets: Vec<TargetRef>,
 }
 
 /// CR 706.1: Which caller finishes a parked die-roll instruction once a CR 616.1
@@ -3670,7 +3692,7 @@ const LEGACY_TYPED_FRAME_RESOLUTION_STATE_WIRE_VERSION: u64 = 2;
 /// that can produce it is an explicit remover.
 ///
 /// The remover is `client_state_wire_value` (`crate::game::derived_views`),
-/// which strips exactly these three plus six `skip_serializing_if` siblings.
+/// which strips exactly these four plus six `skip_serializing_if` siblings.
 /// The six siblings are deliberately NOT listed here: their absence is
 /// value-dependent, so it proves nothing.
 ///
@@ -3699,6 +3721,7 @@ const LEGACY_TYPED_FRAME_RESOLUTION_STATE_WIRE_VERSION: u64 = 2;
 const CLIENT_WIRE_UNCONDITIONAL_FIELDS: &[&str] = &[
     "next_delayed_trigger_token",
     "next_delayed_trigger_instance",
+    "next_resolution_cast_offer_id",
     "resolved_rules_journal",
 ];
 
@@ -3711,9 +3734,10 @@ const CLIENT_WIRE_UNCONDITIONAL_FIELDS: &[&str] = &[
 /// Conjunctive on purpose. Each field individually went in at a different time
 /// — `resolved_rules_journal` in #6331 (2026-07-22), the two allocators in
 /// #6842 (2026-08-01), while `resolution_stack` itself landed in #6269
-/// (2026-07-21) — so a genuine save from a build in the 2026-07-21..22 window
-/// carries `resolution_stack` and lacks all three legitimately. Requiring all
-/// three keeps that window as small as the field history allows. It changes no
+/// (2026-07-21). `next_resolution_cast_offer_id` is newer still, but a genuine
+/// save from the 2026-07-21..22 window carries `resolution_stack` and lacks all
+/// four legitimately. Requiring all four keeps that window as small as the
+/// field history allows. It changes no
 /// outcome regardless: every `resolution_stack`-bearing unversioned payload was
 /// refused outright before the wire inference existed, so a window save fails
 /// either way. Only the wording it receives changes, and the refusal raised by
@@ -3722,8 +3746,8 @@ const CLIENT_WIRE_UNCONDITIONAL_FIELDS: &[&str] = &[
 ///
 /// The conjunction AND each entry of the `const` above are pinned by
 /// `redaction_fingerprint_is_conjunctive_over_every_unconditional_field`
-/// (`types/game_state.rs` `mod tests`), which decodes three payloads each
-/// carrying exactly one of the three keys. A `.any(…)` here, or a dropped
+/// (`types/game_state.rs` `mod tests`), which decodes four payloads each
+/// carrying exactly one of the four keys. A `.any(…)` here, or a dropped
 /// `const` entry, reddens it.
 fn is_redacted_client_wire_projection(object: &Map<String, Value>) -> bool {
     CLIENT_WIRE_UNCONDITIONAL_FIELDS
@@ -3868,7 +3892,7 @@ pub(crate) fn declare_raw_resolution_wire(value: &mut Value) -> Result<(), Strin
         return Err(
             // Written to be TRUE of both populations that reach here, not just
             // the client-wire one. A genuine save from the 2026-07-21..22 build
-            // window lacks all three fingerprint fields legitimately, and is
+            // window lacks all four fingerprint fields legitimately, and is
             // refused by this same statement; telling that player their file is
             // a debug export would be a false statement of fact about their
             // file. So the first clause states only what is observable of the
@@ -4185,6 +4209,7 @@ impl ResolutionStateWire {
                     }
                 }
                 normalize_legacy_completed_resolution_carrier(&mut legacy);
+                crate::types::game_state::normalize_resolution_cast_offer_allocator(&mut legacy)?;
                 let frames = canonicalize_legacy_resolution_state(&legacy)?;
                 frames
                     .validate(&legacy.waiting_for)
@@ -4238,6 +4263,10 @@ impl ResolutionStateWire {
                     .validate(&state.waiting_for)
                     .map_err(|error| error.to_string())?;
                 let projected = project_frames_into_legacy_state(&state, &frames)?;
+                let mut projected = projected;
+                crate::types::game_state::normalize_resolution_cast_offer_allocator(
+                    &mut projected,
+                )?;
                 let canonical = canonicalize_legacy_resolution_state(&projected)?;
                 if canonical != frames {
                     return Err(
@@ -5261,13 +5290,14 @@ mod tests {
     };
     use crate::types::actions::GameAction;
     use crate::types::game_state::{
-        CastingVariant, CopyChosenStage, DrainStatus, DrawSequenceOrigin, GameState,
-        PendingBatchDeliveries, PendingChooseOneOf, PendingCopyTokenResolution,
+        CastingVariant, CopyChosenStage, DrainStatus, DrawSequenceOrigin, ExiledStopInput,
+        GameState, PendingBatchDeliveries, PendingChooseOneOf, PendingCopyTokenResolution,
         PendingCounterAdditionQueue, PendingCounterMoveQueue, PendingCounterRemovalQueue,
         PendingEachPlayerCopyChosen, PendingLifeTotalAssignment, PendingPerCategoryZoneChoice,
         PendingPerPlayerZoneChoice, PendingRepeatIteration, PendingRepeatUntil,
         PendingSpellResolution, PendingVoteBallotIteration, PostReplacementDrain,
-        ResidentDrainPolicy, StackEntry, StackEntryKind, ZoneDeliveryExileTracking,
+        RepeatUntilStopWitness, ResidentDrainPolicy, StackEntry, StackEntryKind,
+        ZoneDeliveryExileTracking,
     };
 
     use crate::types::identifiers::{CardId, LogicalZoneChangeGroupId, ObjectId};
@@ -6158,6 +6188,7 @@ mod tests {
             win_effect: None,
             lose_effect: None,
             kind: PendingCoinFlipKind::Single,
+            chain_root_targets: Vec::new(),
         });
         let mut stack = ResolutionStack::default();
         stack.push_inner(frame);
@@ -6218,6 +6249,7 @@ mod tests {
             win_effect: None,
             lose_effect: None,
             kind: PendingCoinFlipKind::Single,
+            chain_root_targets: Vec::new(),
         }));
         assert_eq!(
             optional_effect.validate(&WaitingFor::CoinFlipKeepChoice {
@@ -6528,6 +6560,7 @@ mod tests {
             win_effect: None,
             lose_effect: None,
             kind: PendingCoinFlipKind::Single,
+            chain_root_targets: Vec::new(),
         };
 
         let mut v1 = serde_json::to_value(&state).expect("legacy state serializes");
@@ -6938,6 +6971,7 @@ mod tests {
                 win_effect: None,
                 lose_effect: None,
                 kind: PendingCoinFlipKind::Single,
+                chain_root_targets: Vec::new(),
             },
         );
         apply_as_current(
@@ -7009,6 +7043,67 @@ mod tests {
         assert_reserializes_current_only(mutate);
     }
 
+    /// CR 104.4b: save-compat for the `stop_progress` progress witness.
+    ///
+    /// A v1 `RepeatUntil` payload predates the field entirely, so it must
+    /// deserialize to `None` — "no baseline recorded", which can never cause a
+    /// stop and costs at most one extra iteration, the safe direction to fail.
+    /// Mirrors the `forwarded_result_context` discipline in `types/ability.rs`.
+    #[test]
+    fn v1_repeat_until_payload_without_stop_progress_restores_as_no_baseline() {
+        let mut repeat_ability = resolved_draw(212);
+        repeat_ability.repeat_until = Some(RepeatContinuation::UntilStopConditions {
+            stop_on_put_to_hand: true,
+            stop_on_duplicate_exiled_names: true,
+        });
+
+        let legacy = serde_json::json!({
+            "ability": serde_json::to_value(&repeat_ability).expect("ability serializes"),
+        });
+        let restored: PendingRepeatUntil =
+            serde_json::from_value(legacy).expect("v1 payload without stop_progress deserializes");
+        assert_eq!(
+            restored.stop_progress, None,
+            "a legacy payload carries no baseline, and `None` can never stop the repeat"
+        );
+        // Positive reach-guard: the payload really parsed — the frame's ability
+        // survived intact, so `stop_progress == None` is not a parse failure.
+        assert_eq!(
+            *restored.ability, repeat_ability,
+            "the legacy fixture must deserialize its ability, proving it parsed at all"
+        );
+
+        // Both ledger vecs carry a row, and DIFFERENT rows, so a round trip
+        // that dropped or conflated either one is visible.
+        let witness = RepeatUntilStopWitness {
+            exiled_this_turn: vec![ExiledStopInput {
+                object_id: ObjectId(212),
+                zone: Zone::Exile,
+                controller: PlayerId(0),
+                name: "Exiled This Way".to_string(),
+            }],
+            linked: vec![ExiledStopInput {
+                object_id: ObjectId(213),
+                zone: Zone::Hand,
+                controller: PlayerId(1),
+                name: "Linked This Way".to_string(),
+            }],
+        };
+        let frame = PendingRepeatUntil {
+            ability: Box::new(repeat_ability),
+            stop_progress: Some(witness.clone()),
+        };
+        let round_tripped: PendingRepeatUntil =
+            serde_json::from_str(&serde_json::to_string(&frame).expect("frame serializes"))
+                .expect("frame round-trips");
+        assert_eq!(
+            round_tripped.stop_progress,
+            Some(witness),
+            "a recorded baseline must survive a save/restore round trip"
+        );
+        assert_eq!(round_tripped, frame);
+    }
+
     #[test]
     fn v1_after_child_fixtures_resume_on_the_real_priority_drain() {
         let continuation = GameState::new_two_player(110);
@@ -7044,6 +7139,7 @@ mod tests {
             repeat_until,
             PendingRepeatUntil {
                 ability: Box::new(repeat_ability),
+                stop_progress: None,
             },
         ));
         assert!(matches!(
@@ -7297,6 +7393,7 @@ mod tests {
                 remaining_voters: Vec::new(),
                 source_id: ObjectId(132),
                 controller: PlayerId(0),
+                chain_root_targets: Vec::new(),
             },
         );
         crate::game::effects::vote::drain_active_vote_ballot(&mut vote, &mut Vec::new());
@@ -8087,6 +8184,7 @@ mod tests {
             search_found_candidates: Vec::new(),
             depth: 0,
             is_optional: false,
+            choice_player: None,
             library_placement: None,
             exile_controller: None,
             exile_duration: None,
@@ -8209,6 +8307,7 @@ mod tests {
             win_effect: None,
             lose_effect: None,
             kind: PendingCoinFlipKind::Single,
+            chain_root_targets: Vec::new(),
         };
         let mut multiple_direct = serde_json::to_value(multiple_direct).expect("v1 serializes");
         multiple_direct["pending_coin_flip"] =
@@ -8379,6 +8478,7 @@ mod tests {
             win_effect: None,
             lose_effect: None,
             kind: PendingCoinFlipKind::Single,
+            chain_root_targets: Vec::new(),
         }));
         assert!(
             serde_json::from_value::<ResolutionStateWire>(v2_fixture_with_frames(

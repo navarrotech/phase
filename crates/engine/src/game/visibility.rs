@@ -36,6 +36,210 @@ fn redact_waiting_for_iteration_members(waiting_for: &mut WaitingFor) {
     }
 }
 
+/// Produce a client-safe projection without changing the authoritative state.
+/// The public paid-cast prompt and permission remain intact; only the cleanup
+/// capability used to validate it is removed.  Both viewer filtering and the
+/// direct client serializer use this one typed boundary.
+pub(crate) fn project_paid_cast_cleanup_authority(state: &GameState) -> GameState {
+    let mut projected = state.clone();
+    redact_paid_cast_cleanup_authority(&mut projected.waiting_for);
+    let object_ids: Vec<_> = projected.objects.keys().copied().collect();
+    for object_id in object_ids {
+        if let Some(object) = projected.objects.get_mut(&object_id) {
+            redact_casting_permission_cleanup_authority(object);
+        }
+    }
+    projected
+}
+
+/// A paid cast offered during resolution carries private ownership of the
+/// temporary cleanup and its delayed-trigger receipts. The offer remains the
+/// public prompt, but neither capability belongs in a viewer projection.
+fn redact_paid_cast_cleanup_authority(waiting_for: &mut WaitingFor) {
+    match waiting_for {
+        WaitingFor::CastOffer { kind, .. } => match kind {
+            CastOfferKind::Adventure { .. }
+            | CastOfferKind::Miracle { .. }
+            | CastOfferKind::Madness { .. }
+            | CastOfferKind::Paradigm { .. }
+            | CastOfferKind::Cascade { .. }
+            | CastOfferKind::Discover { .. }
+            | CastOfferKind::Ripple { .. }
+            | CastOfferKind::FreeCastWindow { .. } => {}
+            CastOfferKind::GraveyardPaidCast { cleanup, .. } => {
+                redact_resolution_cleanup_authority(cleanup);
+            }
+        },
+        // Keep this complete rather than using a catch-all: new pause states
+        // must explicitly decide whether they carry paid-cast authority.
+        WaitingFor::Priority { .. }
+        | WaitingFor::ResolveAllConsent { .. }
+        | WaitingFor::ResolveAllReady { .. }
+        | WaitingFor::MeldPairChoice { .. }
+        | WaitingFor::MeldAttackTargetChoice { .. }
+        | WaitingFor::EntryAttackTargetChoice { .. }
+        | WaitingFor::MulliganDecision { .. }
+        | WaitingFor::OpeningHandBottomCards { .. }
+        | WaitingFor::ManaPayment { .. }
+        | WaitingFor::ManaSourceSelection { .. }
+        | WaitingFor::AssistChoosePlayer { .. }
+        | WaitingFor::AssistPayment { .. }
+        | WaitingFor::ChooseXValue { .. }
+        | WaitingFor::TargetSelection { .. }
+        | WaitingFor::DeclareAttackers { .. }
+        | WaitingFor::DeclareBlockers { .. }
+        | WaitingFor::UntapChoice { .. }
+        | WaitingFor::ChooseUntapSubset { .. }
+        | WaitingFor::ExertChoice { .. }
+        | WaitingFor::EnlistChoice { .. }
+        | WaitingFor::GameOver { .. }
+        | WaitingFor::ReplacementChoice { .. }
+        | WaitingFor::EntryControllerChoice { .. }
+        | WaitingFor::OrderTriggers { .. }
+        | WaitingFor::CopyTargetChoice { .. }
+        | WaitingFor::ExploreChoice { .. }
+        | WaitingFor::ReturnAsAuraTarget { .. }
+        | WaitingFor::EquipTarget { .. }
+        | WaitingFor::CrewVehicle { .. }
+        | WaitingFor::StationTarget { .. }
+        | WaitingFor::SaddleMount { .. }
+        | WaitingFor::ScryChoice { .. }
+        | WaitingFor::RippleRevealChoice { .. }
+        | WaitingFor::RippleBottomOrder { .. }
+        | WaitingFor::ArrangePlanarDeckTopChoice { .. }
+        | WaitingFor::RedistributeLifeTotals { .. }
+        | WaitingFor::CoinFlipKeepChoice { .. }
+        | WaitingFor::DieKeepChoice { .. }
+        | WaitingFor::DigChoice { .. }
+        | WaitingFor::SurveilChoice { .. }
+        | WaitingFor::RevealChoice { .. }
+        | WaitingFor::SearchChoice { .. }
+        | WaitingFor::SearchPartitionChoice { .. }
+        | WaitingFor::OutsideGameChoice { .. }
+        | WaitingFor::ChooseFromZoneChoice { .. }
+        | WaitingFor::BeholdChoice { .. }
+        | WaitingFor::ChooseOneOfBranch { .. }
+        | WaitingFor::ConniveDiscard { .. }
+        | WaitingFor::DiscardChoice { .. }
+        | WaitingFor::EffectZoneChoice { .. }
+        | WaitingFor::DrawnThisTurnTopdeckChoice { .. }
+        | WaitingFor::LearnChoice { .. }
+        | WaitingFor::ManifestDreadChoice { .. }
+        | WaitingFor::TriggerTargetSelection { .. }
+        | WaitingFor::BetweenGamesSideboard { .. }
+        | WaitingFor::BetweenGamesChoosePlayDraw { .. }
+        | WaitingFor::NamedChoice { .. }
+        | WaitingFor::OpponentGuess { .. }
+        | WaitingFor::SpellbookDraft { .. }
+        | WaitingFor::DamageSourceChoice { .. }
+        | WaitingFor::ModeChoice { .. }
+        | WaitingFor::DiscardToHandSize { .. }
+        | WaitingFor::OptionalCostChoice { .. }
+        | WaitingFor::ChooseGiftRecipient { .. }
+        | WaitingFor::SpliceOffer { .. }
+        | WaitingFor::DefilerPayment { .. }
+        | WaitingFor::ModalFaceChoice { .. }
+        | WaitingFor::AlternativeCastChoice { .. }
+        | WaitingFor::MutateMergeChoice { .. }
+        | WaitingFor::CipherEncodeChoice { .. }
+        | WaitingFor::CastingVariantChoice { .. }
+        | WaitingFor::ChoosePermanentTypeSlot { .. }
+        | WaitingFor::MultiTargetSelection { .. }
+        | WaitingFor::AbilityModeChoice { .. }
+        | WaitingFor::OptionalEffectChoice { .. }
+        | WaitingFor::ResolutionOptionalPaymentChoice { .. }
+        | WaitingFor::PairChoice { .. }
+        | WaitingFor::TributeChoice { .. }
+        | WaitingFor::MiracleReveal { .. }
+        | WaitingFor::OpponentMayChoice { .. }
+        | WaitingFor::LoopShortcut { .. }
+        | WaitingFor::RespondToShortcut { .. }
+        | WaitingFor::PrecastCopyShortcutOffer { .. }
+        | WaitingFor::RespondToPrecastCopyShortcut { .. }
+        | WaitingFor::UnlessPayment { .. }
+        | WaitingFor::UnlessPaymentChooseCost { .. }
+        | WaitingFor::WardDiscardChoice { .. }
+        | WaitingFor::WardSacrificeChoice { .. }
+        | WaitingFor::UnlessBounceChoice { .. }
+        | WaitingFor::ChooseRingBearer { .. }
+        | WaitingFor::ChooseRoomDoor { .. }
+        | WaitingFor::ChooseDungeon { .. }
+        | WaitingFor::ChooseDungeonRoom { .. }
+        | WaitingFor::SpecializeColor { .. }
+        | WaitingFor::PayCost { .. }
+        | WaitingFor::ActivationCostOneOfChoice { .. }
+        | WaitingFor::CostTypeChoice { .. }
+        | WaitingFor::BlightChoice { .. }
+        | WaitingFor::PayManaAbilityMana { .. }
+        | WaitingFor::ChooseManaColor { .. }
+        | WaitingFor::CollectEvidenceChoice { .. }
+        | WaitingFor::HarmonizeTapChoice { .. }
+        | WaitingFor::RevealUntilKeptChoice { .. }
+        | WaitingFor::RepeatDecision { .. }
+        | WaitingFor::TopOrBottomChoice { .. }
+        | WaitingFor::PopulateChoice { .. }
+        | WaitingFor::ClashChooseOpponent { .. }
+        | WaitingFor::ChooseFromZoneOpponentChooser { .. }
+        | WaitingFor::ChooseAnnouncingOpponent { .. }
+        | WaitingFor::ClashCardPlacement { .. }
+        | WaitingFor::VoteChoice { .. }
+        | WaitingFor::SeparatePilesChooseOpponent { .. }
+        | WaitingFor::SeparatePilesPartition { .. }
+        | WaitingFor::SeparatePilesChoice { .. }
+        | WaitingFor::CompanionReveal { .. }
+        | WaitingFor::ChooseLegend { .. }
+        | WaitingFor::CommanderZoneChoice { .. }
+        | WaitingFor::BattleProtectorChoice { .. }
+        | WaitingFor::ProliferateChoice { .. }
+        | WaitingFor::TimeTravelChoice { .. }
+        | WaitingFor::ChooseObjectsSelection { .. }
+        | WaitingFor::CategoryChoice { .. }
+        | WaitingFor::EachPlayerCopyChosenSelection { .. }
+        | WaitingFor::KeepWithinTotalPowerChoice { .. }
+        | WaitingFor::KeepExactPermanentsChoice { .. }
+        | WaitingFor::CopyRetarget { .. }
+        | WaitingFor::AssignCombatDamage { .. }
+        | WaitingFor::AssignBlockerDamage { .. }
+        | WaitingFor::DistributeAmong { .. }
+        | WaitingFor::MoveCountersDistribution { .. }
+        | WaitingFor::RemoveCountersChoice { .. }
+        | WaitingFor::PayAmountChoice { .. }
+        | WaitingFor::RetargetChoice { .. }
+        | WaitingFor::CombatTaxPayment { .. }
+        | WaitingFor::PhyrexianPayment { .. } => {}
+    }
+}
+
+/// A resolution-cast cleanup is carried from a paid offer onto the temporary
+/// casting permission while its face choice or mana payment is pending. The
+/// owner and receipts remain server-only capabilities at that later stage too.
+fn redact_resolution_cleanup_authority(cleanup: &mut crate::types::ability::ResolutionCastCleanup) {
+    cleanup.offer_id = None;
+    cleanup.delayed_trigger_receipts.clear();
+}
+
+fn redact_casting_permission_cleanup_authority(object: &mut crate::game::game_object::GameObject) {
+    for permission in &mut object.casting_permissions {
+        match permission {
+            crate::types::ability::CastingPermission::AdventureCreature
+            | crate::types::ability::CastingPermission::PlayFromExile { .. }
+            | crate::types::ability::CastingPermission::ExileWithEnergyCost
+            | crate::types::ability::CastingPermission::ExileWithAltAbilityCost { .. }
+            | crate::types::ability::CastingPermission::WarpExile { .. }
+            | crate::types::ability::CastingPermission::Plotted { .. }
+            | crate::types::ability::CastingPermission::Foretold { .. } => {}
+            crate::types::ability::CastingPermission::ExileWithAltCost {
+                resolution_cleanup,
+                ..
+            } => {
+                if let Some(cleanup) = resolution_cleanup {
+                    redact_resolution_cleanup_authority(cleanup);
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn interaction_object_identity_is_visible(state: &GameState, id: ObjectId) -> bool {
     state
         .objects
@@ -824,6 +1028,9 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
     // protocol ships projections to viewers on purpose. Last-writer-wins:
     // re-projecting a projection for another viewer re-latches to that viewer.
     filtered.viewer_projection = Some(viewer);
+    // The original Cube multiset is authoritative pack-generation input. A viewer
+    // learns the opened pack through `waiting_for`, never every undealt entry.
+    filtered.booster_pack_pool = None;
     // Analysis provenance is meaningful only to the clone executing a preview;
     // never carry it into a viewer projection.
     filtered.life_safety_probe = Box::default();
@@ -840,6 +1047,7 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
         redact_parent_target_iteration_members(&mut pending.ability);
     }
     redact_waiting_for_iteration_members(&mut filtered.waiting_for);
+    filtered = project_paid_cast_cleanup_authority(&filtered);
     // Interaction capability authority is trusted persistence state. Viewer
     // projections expose only the actor-scoped opaque opportunity IDs produced
     // by `game::interaction`, never the session/serial/slot minting ledger.
@@ -934,6 +1142,7 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
     // root carrier here as well as in the dedicated WASM client projection.
     filtered.next_delayed_trigger_token = 0;
     filtered.next_delayed_trigger_instance = 0;
+    filtered.next_resolution_cast_offer_id = 0;
     filtered.pending_trigger_firing = None;
     filtered.stack_trigger_firings.clear();
     filtered.resolving_trigger_firing = None;
@@ -1446,7 +1655,8 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
         ref candidate_objects,
         ref outcome_template,
         visibility,
-        ..
+        ref chain_root_targets,
+        ballots: _,
     } = state.waiting_for
     {
         if visibility == crate::types::ability::VoteVisibility::Secret {
@@ -1466,6 +1676,7 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
                 candidate_objects: candidate_objects.clone(),
                 outcome_template: outcome_template.clone(),
                 visibility,
+                chain_root_targets: chain_root_targets.clone(),
             };
         }
     }
@@ -1735,10 +1946,9 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
                 ref candidates,
                 remaining_casts,
                 remaining_mv_budget,
-                ref filter,
+                ref face_policy,
                 ref zones,
                 ref graveyard_replacement,
-                source,
                 ref member_pool,
             },
     } = state.waiting_for
@@ -1750,10 +1960,9 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
                     candidates: candidates.iter().map(|_| ObjectId(0)).collect(),
                     remaining_casts,
                     remaining_mv_budget,
-                    filter: filter.clone(),
+                    face_policy: face_policy.clone(),
                     zones: zones.clone(),
                     graveyard_replacement: graveyard_replacement.clone(),
-                    source,
                     // CR 400.2: the member pool can reference the same private
                     // candidates (a hand/graveyard window would leak eligible
                     // ids through it); redact it to placeholders exactly like
@@ -2539,6 +2748,25 @@ mod tests {
     use crate::types::resolution::OptionalEffectFrame;
     use crate::types::zones::{ExileCostSourceZone, Zone};
     use rand::RngCore;
+
+    #[test]
+    fn viewer_projection_redacts_private_cube_booster_pool() {
+        let mut state = GameState::new_two_player(42);
+        let expected_pool = vec![
+            "Dealt cube card".to_string(),
+            "Undealt cube sentinel".to_string(),
+            "Undealt cube sentinel".to_string(),
+        ];
+        state.booster_pack_pool = Some(Arc::new(expected_pool.clone()));
+
+        let projected = filter_state_for_viewer(&state, PlayerId(1));
+
+        assert_eq!(state.booster_pack_pool.as_deref(), Some(&expected_pool));
+        assert!(projected.booster_pack_pool.is_none());
+        assert!(!serde_json::to_string(&projected)
+            .expect("viewer projection serializes")
+            .contains("Undealt cube sentinel"));
+    }
 
     /// CR 701.17c + CR 400.2: an effect can find a milled card only when the
     /// zone it moved to from the library is a PUBLIC zone. The action event
@@ -6340,12 +6568,16 @@ mod tests {
                 candidates: vec![hand_candidate],
                 remaining_casts: Some(2),
                 remaining_mv_budget: Some(6),
-                filter: crate::types::ability::TargetFilter::Any,
+                face_policy: crate::types::ability::ResolutionCastFacePolicy::new(
+                    crate::types::ability::TargetFilter::Any,
+                    crate::types::game_state::zero_object_id(),
+                    PlayerId(0),
+                    None,
+                ),
                 zones: vec![Zone::Graveyard, Zone::Hand],
                 graveyard_replacement: Some(
                     crate::types::ability::SpellStackToGraveyardReplacement::Exile,
                 ),
-                source: crate::types::game_state::zero_object_id(),
                 member_pool: vec![hand_candidate],
             },
         };
@@ -7583,9 +7815,9 @@ mod tests {
     /// above it) ⇒ FAILS. Both leave every other row in this module green.
     ///
     /// This row mints through `d5h_offer_decisions` and reads through
-    /// `d5h_projected_declaration`, so it adds NO new `WaitingFor::LoopShortcut {` literal —
-    /// `tests/integration/loop_shortcut_offer_writer_census.rs` pins this file's production
-    /// multiset at 2 and would red on a third.
+    /// `d5h_projected_declaration`, so it adds NO new `WaitingFor::LoopShortcut {` literal.
+    /// `tests/integration/loop_shortcut_offer_writer_census.rs` is the authority for this
+    /// file's production multiset; a new production literal requires its own adjudication.
     #[test]
     fn r1k_a_public_subject_ahead_of_a_hidden_one_in_a_ranking_still_drops_the_declaration() {
         use crate::analysis::decision_template::{
@@ -7734,6 +7966,7 @@ mod tests {
                     key: DecisionGroupKey::from_sources(&[slot.source], DecisionKind::LoopChoice),
                 }),
                 per_cycle: None,
+                shortened_by: None,
             },
         };
         state
@@ -8299,6 +8532,7 @@ mod tests {
             granted_to,
             duration: None,
             source_id: None,
+            cast_cost_modifier: None,
         }];
         (state, card)
     }
@@ -8428,7 +8662,15 @@ mod tests {
                 granted_to: Some(PlayerId(0)),
                 resolution_cleanup: Some(ResolutionCastCleanup {
                     source_id: ObjectId(998),
+                    offer_id: None,
+                    face_policy: crate::types::ability::ResolutionCastFacePolicy::new(
+                        crate::types::ability::TargetFilter::Any,
+                        ObjectId(998),
+                        PlayerId(0),
+                        None,
+                    ),
                     exiled_misses: Vec::new(),
+                    delayed_trigger_receipts: Vec::new(),
                     reject_action: ResolutionMvRejectAction::BottomWithMisses,
                     success_action: Default::default(),
                 }),
@@ -8437,6 +8679,7 @@ mod tests {
                 enters_with_counter: None,
                 enters_with_modifications: Vec::new(),
                 mana_spend_permission: None,
+                cast_cost_modifier: None,
             }];
             (state, id)
         };

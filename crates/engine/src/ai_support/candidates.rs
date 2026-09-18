@@ -2377,7 +2377,7 @@ pub fn candidate_actions_broad_with_probe(
             count,
             ..
         } => bounded_select_card_candidates(*player, choices, [*count]),
-        // CR 118.12a: AI selects a branch of a disjunctive activation cost.
+        // CR 601.2h: AI selects a branch of a disjunctive activation cost.
         WaitingFor::ActivationCostOneOfChoice {
             player,
             costs,
@@ -2386,13 +2386,7 @@ pub fn candidate_actions_broad_with_probe(
             .iter()
             .enumerate()
             .filter(|(_, cost)| {
-                casting::can_pay_ability_cost_now(
-                    state,
-                    *player,
-                    pending_cast.object_id,
-                    cost,
-                    pending_cast.activation_ability_index,
-                )
+                casting::activation_one_of_branch_payable(state, *player, pending_cast, cost)
             })
             .map(|(i, _)| {
                 candidate(
@@ -2477,19 +2471,74 @@ pub fn candidate_actions_broad_with_probe(
                 )
             })
             .collect(),
-        // CR 712.12: Both MDFC land faces are playable — offer front or back
-        WaitingFor::ModalFaceChoice { player, .. } => vec![
-            candidate(
-                GameAction::ChooseModalFace { back_face: false },
-                TacticalClass::Selection,
-                Some(*player),
-            ),
-            candidate(
-                GameAction::ChooseModalFace { back_face: true },
-                TacticalClass::Selection,
-                Some(*player),
-            ),
-        ],
+        // CR 712.11b-c / CR 709.3-3a: a face election exposes only faces whose
+        // own characteristics can be cast. Ordinary MDFC land/spell prompts
+        // retain both actions. A resolution-owned prompt, however, exposes
+        // only faces the exact temporary permission can still cast; the handler
+        // independently enforces the same policy for forged direct submissions.
+        WaitingFor::ModalFaceChoice {
+            player,
+            object_id,
+            card_id,
+            ..
+        } => {
+            let resolution_permission =
+                crate::game::casting::current_resolution_cast_permission_index(
+                    state, *player, *object_id, *card_id,
+                );
+            let legal_faces = resolution_permission.and_then(|index| {
+                state
+                    .objects
+                    .get(object_id)
+                    .and_then(|object| object.casting_permissions.get(index.0))
+                    .and_then(|permission| match permission {
+                        crate::types::ability::CastingPermission::ExileWithAltCost {
+                            resolution_cleanup: Some(cleanup),
+                            ..
+                        } => Some(crate::game::casting::resolution_spell_face_legality_for_current_permission(
+                            state,
+                            *player,
+                            *object_id,
+                            &cleanup.face_policy,
+                            index,
+                        )),
+                        _ => None,
+                    })
+            });
+            let mut actions: Vec<_> = [false, true]
+                .into_iter()
+                .filter(|back_face| {
+                    legal_faces.is_none_or(
+                        |faces| {
+                            if *back_face {
+                                faces.back
+                            } else {
+                                faces.front
+                            }
+                        },
+                    )
+                })
+                .map(|back_face| {
+                    candidate(
+                        GameAction::ChooseModalFace { back_face },
+                        TacticalClass::Selection,
+                        Some(*player),
+                    )
+                })
+                .collect();
+            // A resolution-owned face election is pre-announcement, but it is
+            // still an elected cast transaction.  Surface its exact CancelCast
+            // authority; ordinary modal land/spell prompts intentionally have
+            // no such permission and remain uncancellable here.
+            if resolution_permission.is_some() {
+                actions.push(candidate(
+                    GameAction::CancelCast,
+                    TacticalClass::Pass,
+                    Some(*player),
+                ));
+            }
+            actions
+        }
         // CR 118.9: Alternative-cast prompt — surface both cost paths
         // uniformly across all keywords. The keyword discriminator lives on the
         // waiting state; the action shape is identical.
@@ -3327,9 +3376,12 @@ pub fn candidate_actions_broad_with_probe(
         // the prompt is. Must precede the general arm below.
         //
         // CR 732.2c: `max` is NOT a fixed 1000 — it is the count the table accepted
-        // (`pending_materialization_count`), so it can legitimately be 0 (a shortcut
-        // accepted at `Fixed(0)`). Clamp, or the generator's sole candidate is rejected by
-        // the reducer's `amount > max` guard and the AI has no legal action at this prompt.
+        // (`pending_materialization_count`), and a 0 in it reaches this prompt. No live path
+        // writes one: a shortcut answered at a count of zero performs nothing and stashes
+        // nothing, so it mints no prompt at all. A save written before that swallow decodes
+        // its 0 through the production restore and arrives here. Clamp, or the generator's
+        // sole candidate is rejected by the reducer's `amount > max` guard and the AI has no
+        // legal action at this prompt.
         //
         // AI-reachable since the bounded fast-forward landed, which is what stales the older
         // "the arm below only ever proposes `UntilLethal`" note this replaces: the
@@ -6528,6 +6580,7 @@ mod tests {
         card_types.core_types.push(CoreType::Sorcery);
         crate::game::game_object::BackFaceData {
             is_swap_snapshot: false,
+            trigger_printed_origins: Vec::new(),
             name: "Prepared Spell Face".to_string(),
             power: None,
             toughness: None,

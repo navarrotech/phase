@@ -42,7 +42,7 @@ import {
   type NativeAiSeat,
   type NativeSessionAttachment,
 } from "./ws-adapter";
-import { PEER_CONNECT_OPTIONS, RECONNECT_DIAL_TIMEOUT_MS } from "../network/connection";
+import { dialPeer, RECONNECT_DIAL_TIMEOUT_MS } from "../network/connection";
 import { createPeerSession, type PeerSession } from "../network/peer";
 import type { P2PMessage } from "../network/protocol";
 import { WIRE_PROTOCOL_VERSION, legalActionsFromWire, legalActionsToWire } from "../network/protocol";
@@ -94,6 +94,7 @@ import i18n from "i18next";
  * handlers — the UI never sees wire types.
  */
 export type P2PAdapterEvent =
+  | { type: "playerLatencies"; latencies: Record<number, number | null> }
   | { type: "playerIdentity"; playerId: PlayerId; playerNames?: Record<number, string> }
   | { type: "roomCreated"; roomCode: string }
   | { type: "waitingForGuest" }
@@ -195,6 +196,7 @@ interface DeckListPayload {
    * identically as constructed play (no grant).
    */
   draft_set_codes?: string[] | null;
+  booster_pack_pool?: string[] | null;
 }
 
 /** The desktop host has already ensured this exact local phase-server binary
@@ -236,7 +238,7 @@ class NativeP2PBridge {
   private fullKey: FullSessionKey | null = null;
 
   constructor(
-    private readonly hostDeck: DeckListPayload["player"],
+    private readonly hostDeckData: DeckListPayload,
     private readonly hostDisplayName: string,
     private readonly playerCount: number,
     private readonly formatConfig: FormatConfig | undefined,
@@ -266,7 +268,7 @@ class NativeP2PBridge {
     const host = new WebSocketAdapter(
       "native-engine://phase-server",
       "host",
-      this.hostDeck,
+      this.hostDeckData.player,
       undefined,
       undefined,
       undefined,
@@ -280,6 +282,7 @@ class NativeP2PBridge {
           aiSeats,
           formatConfig: this.formatConfig,
           matchConfig: this.matchConfig,
+          boosterPackPool: this.hostDeckData.booster_pack_pool,
         },
       },
     );
@@ -614,9 +617,8 @@ const RECONNECT_STEADY_STATE_MS = 60_000;
  *
  * Reachability precondition: tab A's PeerJS SIGNALING socket must have dropped
  * (freeing the peer id) while its WebRTC DataConnections stay up. That state is
- * durable — no `peer.on("disconnected")` handler and no `.reconnect()` call
- * exists repo-wide — and is produced by sleep, a network change, or mobile
- * backgrounding. Opening a second tab does NOT reach it on its own: `hostRoom`
+ * possible while signaling recovery retries after sleep, a network change,
+ * or mobile backgrounding. Opening a second tab does NOT reach it on its own: `hostRoom`
  * opens the peer before the adapter is constructed, so tab B fails
  * `unavailable-id` and never reaches `claimP2PHostLease`. The lease flip must
  * land inside the `submitAction` → `broadcastStateUpdateInner` window, so
@@ -880,6 +882,7 @@ export class P2PHostAdapter implements EngineAdapter {
   private readonly engineClaim = Symbol("p2p-host-engine-claim");
 
   private guestSessions = new Map<PlayerId, PeerSession>();
+  private sessionLatencies = new WeakMap<PeerSession, number | null>();
   /**
    * A reconnecting transport has proved its token but is not a game session
    * until its complete reconnect acknowledgement has been written. This is
@@ -1105,7 +1108,7 @@ export class P2PHostAdapter implements EngineAdapter {
     }
     if (native) {
       this.nativeBridge = new NativeP2PBridge(
-        (hostDeckData as DeckListPayload).player,
+        hostDeckData as DeckListPayload,
         this.hostDisplayName ?? "Host",
         playerCount,
         formatConfig,
@@ -1803,6 +1806,18 @@ export class P2PHostAdapter implements EngineAdapter {
     this.initialized = true;
   }
 
+  private publishPlayerLatencies(): void {
+    if (!this.ownsAuthority()) return;
+    const latencies: Record<number, number | null> = { 0: 0 };
+    for (const [pid, session] of this.guestSessions) {
+      latencies[pid] = this.sessionLatencies.get(session) ?? null;
+    }
+    this.emit({ type: "playerLatencies", latencies });
+    for (const session of this.guestSessions.values()) {
+      void this.send(session, { type: "player_latencies", latencies });
+    }
+  }
+
   private handleNewConnection(conn: DataConnection): void {
     if (!this.ownsAuthority()) {
       const session = createPeerSession(conn, {});
@@ -1814,6 +1829,11 @@ export class P2PHostAdapter implements EngineAdapter {
     // join or a reconnect. We attach a one-shot pre-handler to peek at the
     // first message before wrapping in a PeerSession with full handlers.
     const session = createPeerSession(conn, {
+      onLatency: (latencyMs) => {
+        if (![...this.guestSessions.values()].includes(session)) return;
+        this.sessionLatencies.set(session, latencyMs);
+        this.publishPlayerLatencies();
+      },
       onSessionEnd: () => {
         this.closedPregameSessions.add(session);
         // Find which seat this session belonged to (if any) and route to the
@@ -1970,6 +1990,7 @@ export class P2PHostAdapter implements EngineAdapter {
       this.playerTokens.set(pid, token);
       this.guestSessions.set(pid, session);
       this.guestDecks.set(pid, guestDeck);
+      this.publishPlayerLatencies();
       if (displayName) this.guestNames.set(pid, displayName);
       this.pregameSeatState.seats[pid] = { type: "JoinedHuman" };
       this.pregameSeatState.tokens[pid] = token;
@@ -2164,6 +2185,7 @@ export class P2PHostAdapter implements EngineAdapter {
         // discarded before it can reach the engine. Naming it is what carries
         // the Commander Masters partner grant into the game.
         draft_set_codes: hostDeck.draft_set_codes,
+        booster_pack_pool: hostDeck.booster_pack_pool,
       };
       const playerCount = allowPartialStart
         ? orderedOpponents.length + 1
@@ -3295,6 +3317,7 @@ export class P2PHostAdapter implements EngineAdapter {
     if (this.disconnectedSeats.has(pid)) return;
 
     this.guestSessions.delete(pid);
+    this.publishPlayerLatencies();
 
     if (!this.gameStarted) {
       void this.enqueuePregameOp(async () => {
@@ -3489,6 +3512,7 @@ export class P2PHostAdapter implements EngineAdapter {
       this.disconnectedSeats.delete(pid);
       this.guestSessions.set(pid, session);
       session.onMessage((msg) => this.handleGuestMessage(pid, session, msg));
+      this.publishPlayerLatencies();
 
       for (const [otherPid, otherSession] of this.guestSessions) {
         if (otherPid !== pid) void this.send(otherSession, { type: "player_reconnected", playerId: pid });
@@ -3763,6 +3787,7 @@ export class P2PGuestAdapter implements EngineAdapter {
     { resolve: (preview: InteractionPreview) => void; reject: (error: Error) => void }
   >();
   private session: PeerSession | null = null;
+  private hostLatencies: Record<number, number | null> = {};
   /** The current transport becomes authenticated only after its setup ACK. */
   private authenticatedSession: PeerSession | null = null;
   private playerToken: string | null = null;
@@ -3862,6 +3887,11 @@ export class P2PGuestAdapter implements EngineAdapter {
     }
     traceAdapter("Guest", "attach-session", { connOpen: conn.open });
     const session = createPeerSession(conn, {
+      onLatency: (latencyMs) => {
+        if (this.session !== session || latencyMs !== null) return;
+        this.hostLatencies = Object.fromEntries(Object.keys(this.hostLatencies).map((pid) => [pid, null]));
+        this.emit({ type: "playerLatencies", latencies: this.hostLatencies });
+      },
       onSessionEnd: () => {
         this.handleHostDisconnect(session);
       },
@@ -4173,6 +4203,15 @@ export class P2PGuestAdapter implements EngineAdapter {
     }
     if (!this.acceptsHostAuthority(msg)) return;
     switch (msg.type) {
+      case "player_latencies": {
+        if (typeof msg.latencies !== "object" || msg.latencies === null || Array.isArray(msg.latencies)) return;
+        const entries = Object.entries(msg.latencies);
+        if (entries.some(([pid, ms]) => !Number.isSafeInteger(Number(pid)) || Number(pid) < 0
+          || (ms !== null && (typeof ms !== "number" || !Number.isFinite(ms) || ms < 0)))) return;
+        this.hostLatencies = msg.latencies;
+        this.emit({ type: "playerLatencies", latencies: this.hostLatencies });
+        break;
+      }
       case "game_setup": {
         this.authenticatedSession = session;
         this.assignedPlayerId = msg.assignedPlayerId;
@@ -4661,7 +4700,7 @@ export class P2PGuestAdapter implements EngineAdapter {
       // reconnect channel comes up UNORDERED, and every revision guard
       // downstream assumes ordered delivery. The initial `joinRoom` dial has
       // always carried them; this one did not.
-      const conn = this.hostPeer.connect(this.hostPeerId, PEER_CONNECT_OPTIONS);
+      const conn = dialPeer(this.hostPeer, this.hostPeerId, RECONNECT_DIAL_TIMEOUT_MS);
       await new Promise<void>((resolve, reject) => {
         const timeout = setTimeout(
           () => reject(new Error("connect timed out")),

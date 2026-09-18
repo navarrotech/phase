@@ -44,7 +44,7 @@ use lobby_broker::{
     BuildCommitCheck, ConnState, Outbound, RawAnnouncement, ServerAnnouncement, ServerInfoDocument,
     DIRECTORY_VERSION, INFO_PATH, MAX_SERVER_NAME_LEN, NOT_OWNED_RESERVATION,
 };
-use rand::{Rng, TryRngCore};
+use rand::TryRngCore;
 use seat_reducer::types::{DeckChoice, DeckResolver, ReducerCtx};
 use server_core::ai_seats_wire_guard::{guard_create_ai_seats, MAX_FULL_GAME_PLAYER_COUNT};
 use server_core::client_hello_guard::guard_client_hello;
@@ -56,8 +56,8 @@ use server_core::draft_session::{
     draft_seats_needing_auto_pick, DraftMatchPlayer, DraftMatchSpawn, DraftSessionManager,
 };
 use server_core::draft_wire_guard::{
-    guard_create_draft_with_settings, guard_draft_action, guard_join_draft_with_password,
-    guard_reconnect_draft,
+    guard_chaos_layout_for_kind, guard_create_draft_with_settings, guard_draft_action,
+    guard_join_draft_with_password, guard_reconnect_draft,
 };
 use server_core::emote_guard::guard_emote;
 use server_core::game_action_payload_guard::guard_game_action_payload;
@@ -950,24 +950,23 @@ fn dev_fixture_enabled() -> bool {
     matches!(std::env::var("PHASE_DEV_FIXTURE"), Ok(value) if value == "1")
 }
 
-fn select_card_data_source(data_dir: &Path, dev_fixture: bool) -> Result<CardDataSource, String> {
-    let export_path = data_dir.join("card-data.json");
+/// An absent export selects the export anyway: one authority decides whether a
+/// bootstrapped file can be provided, and it is `load_data_file`, which holds
+/// the directory lock across the whole replacement. A file that is absent for
+/// the instant another start holds it aside is not a reason to exit.
+fn select_card_data_source(data_dir: &Path, dev_fixture: bool) -> CardDataSource {
+    let export_path = data_dir.join(data_bootstrap::CARD_DATA_FILE);
     if export_path.is_file() {
-        return Ok(CardDataSource::Export(export_path));
+        return CardDataSource::Export(export_path);
     }
     if dev_fixture {
-        return Ok(CardDataSource::DevFixture(
-            data_dir.join("mtgjson/test_fixture.json"),
-        ));
+        return CardDataSource::DevFixture(data_dir.join("mtgjson/test_fixture.json"));
     }
-    Err(format!(
-        "card-data.json is missing from {}; startup data bootstrap did not provide it",
-        data_dir.display()
-    ))
+    CardDataSource::Export(export_path)
 }
 
 fn bootstrap_required(data_dir: &Path, dev_fixture: bool) -> bool {
-    !dev_fixture || data_dir.join("card-data.json").is_file()
+    !dev_fixture || data_dir.join(data_bootstrap::CARD_DATA_FILE).is_file()
 }
 
 fn fatal_startup(message: impl std::fmt::Display) -> ! {
@@ -1318,13 +1317,20 @@ fn client_forbidden_draft_action_reason(action: &draft_core::types::DraftAction)
         DraftAction::SetSeatConnected { .. } => {
             Some("SetSeatConnected is server-internal; not allowed from client".to_string())
         }
+        // A shared-stack decision is ordinary player intent, exactly as `Pick`
+        // is: the seat is re-scoped to the authenticated one by
+        // `authorize_client_draft_action`, and the pile index is bounded by
+        // `guard_draft_action_payload`. Classifying it server-internal would
+        // refuse EVERY shared-stack decision at the transport, before the
+        // reducer ever saw one.
         DraftAction::StartDraft
         | DraftAction::Pick { .. }
         | DraftAction::PickWithDraftEffect { .. }
         | DraftAction::SubmitDeck { .. }
         | DraftAction::ReportMatchResult { .. }
         | DraftAction::AdvanceRound
-        | DraftAction::ReplaceSeatWithBot { .. } => None,
+        | DraftAction::ReplaceSeatWithBot { .. }
+        | DraftAction::SharedStackDecision { .. } => None,
     }
 }
 
@@ -2034,7 +2040,10 @@ async fn serve() {
     );
     let data_path = cli.data_dir.as_path();
     let dev_fixture = dev_fixture_enabled();
-    if bootstrap_required(data_path, dev_fixture) {
+    // The two load sites need the same inputs the pre-pass used, so the block
+    // yields them: a directory the operator opted out of managing is never
+    // rearranged, and that verdict has one source.
+    let bootstrap = if bootstrap_required(data_path, dev_fixture) {
         let identity = data_bootstrap::ChannelIdentity::embedded()
             .unwrap_or_else(|error| fatal_startup(error));
         let options = data_bootstrap::BootstrapOptions {
@@ -2046,18 +2055,31 @@ async fn serve() {
         {
             fatal_startup(error);
         }
+        Some((options, identity))
     } else {
         warn!(
             path = %data_path.display(),
             "using PHASE_DEV_FIXTURE=1 test fixture; startup data bootstrap is disabled"
         );
-    }
-    let card_data_source = select_card_data_source(data_path, dev_fixture)
-        .unwrap_or_else(|message| fatal_startup(message));
+        None
+    };
+    let (bootstrap_options, identity) = match &bootstrap {
+        Some((options, identity)) => (Some(options), identity.as_ref()),
+        None => (None, None),
+    };
+    let card_data_source = select_card_data_source(data_path, dev_fixture);
     let card_db = match card_data_source {
-        CardDataSource::Export(path) => CardDatabase::from_export(&path).unwrap_or_else(|error| {
-            fatal_startup(format!("failed to load {}: {error}", path.display()))
-        }),
+        // The payload goes unread: the authority builds the path from the data
+        // directory and the file name, exactly as this arm's payload was built.
+        CardDataSource::Export(_) => data_bootstrap::load_data_file(
+            data_path,
+            data_bootstrap::CARD_DATA_FILE,
+            bootstrap_options,
+            identity,
+            CardDatabase::from_export,
+        )
+        .await
+        .unwrap_or_else(|error| fatal_startup(error)),
         CardDataSource::DevFixture(path) => {
             CardDatabase::from_mtgjson(&path).unwrap_or_else(|error| {
                 fatal_startup(format!(
@@ -2116,16 +2138,22 @@ async fn serve() {
     session_manager.game_log = Arc::clone(&game_log);
     let state: SharedState = Arc::new(Mutex::new(session_manager));
     let draft_sessions: SharedDraftState = Arc::new(Mutex::new(DraftSessionManager::new()));
-    let draft_pools_path = data_path.join("draft-pools.json");
-    let draft_pools: SharedDraftPools = match draft_pools::DraftPools::from_path(&draft_pools_path)
+    let draft_pools: SharedDraftPools = match data_bootstrap::load_data_file(
+        data_path,
+        data_bootstrap::DRAFT_POOLS_FILE,
+        bootstrap_options,
+        identity,
+        draft_pools::DraftPools::from_path,
+    )
+    .await
     {
         Ok(pools) => {
             info!(sets = pools.len(), "draft pools loaded");
             Arc::new(pools)
         }
+        // The error opens with the path, so the field would repeat it.
         Err(e) => {
             warn!(
-                path = %draft_pools_path.display(),
                 error = %e,
                 "draft pools unavailable; server-hosted drafts cannot start"
             );
@@ -2986,11 +3014,27 @@ mod lifecycle_tests {
         let temp = tempfile::tempdir().expect("temp dir");
 
         assert!(bootstrap_required(temp.path(), false));
-        assert!(select_card_data_source(temp.path(), false).is_err());
+        assert_eq!(
+            select_card_data_source(temp.path(), false),
+            CardDataSource::Export(temp.path().join("card-data.json"))
+        );
         assert!(!bootstrap_required(temp.path(), true));
         assert_eq!(
-            select_card_data_source(temp.path(), true).expect("explicit fixture source"),
+            select_card_data_source(temp.path(), true),
             CardDataSource::DevFixture(temp.path().join("mtgjson/test_fixture.json"))
+        );
+    }
+
+    /// The state a concurrent start's move-aside leaves for the instant between
+    /// the rename and the refill, both under its lock.
+    #[test]
+    fn an_export_held_aside_by_another_start_selects_the_export() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        std::fs::write(temp.path().join("card-data.json.replacing"), "{}").expect("held copy");
+
+        assert_eq!(
+            select_card_data_source(temp.path(), false),
+            CardDataSource::Export(temp.path().join("card-data.json"))
         );
     }
 
@@ -4525,6 +4569,7 @@ fn to_lobby_client_message(msg: &ClientMessage) -> Option<lobby_broker::LobbyCli
             draft_metadata,
             start_when_full,
             ranked,
+            booster_pack_pool: _,
         } => L::CreateGameWithSettings {
             deck: deck.clone(),
             display_name: display_name.clone(),
@@ -4669,13 +4714,17 @@ fn to_lobby_client_message(msg: &ClientMessage) -> Option<lobby_broker::LobbyCli
             organizer_token: organizer_token.clone(),
             request_id: *request_id,
         },
-        ClientMessage::RenewTournamentCredential { code, role, token } => {
-            L::RenewTournamentCredential {
-                code: code.clone(),
-                role: *role,
-                token: token.clone(),
-            }
-        }
+        ClientMessage::RenewTournamentCredential {
+            code,
+            role,
+            token,
+            rotation_nonce,
+        } => L::RenewTournamentCredential {
+            code: code.clone(),
+            role: *role,
+            token: token.clone(),
+            rotation_nonce: rotation_nonce.clone(),
+        },
         _ => return None,
     })
 }
@@ -4846,6 +4895,7 @@ struct MultiplayerSessionRequest {
     format_config: Option<engine::types::format::FormatConfig>,
     start_when_full: bool,
     ranked: bool,
+    booster_pack_pool: Option<Vec<String>>,
     ai_requests: Vec<server_core::session::AiSeatSetup>,
     public: bool,
     password: Option<String>,
@@ -4953,6 +5003,7 @@ async fn create_and_connect_multiplayer_session(
         format_config,
         start_when_full,
         ranked,
+        booster_pack_pool,
         ai_requests,
         public,
         password,
@@ -4997,6 +5048,7 @@ async fn create_and_connect_multiplayer_session(
         if let Some(session) = mgr.sessions.get_mut(&game_code) {
             session.start_when_full = start_when_full;
             session.ranked = ranked;
+            session.booster_pack_pool = booster_pack_pool;
             for setup in ai_requests {
                 session.seat_ai(setup);
             }
@@ -5677,50 +5729,51 @@ fn spawn_pick_timer(
 
         let pod_size = session.player_tokens.len();
         let seats = draft_seats_needing_auto_pick(&mut session.session, pod_size);
+        // DELEGATES to `DraftSessionManager::pick_random_for_seat` rather than
+        // re-deriving the body. One authority, and the delegation is also what
+        // removes the second `current_pack` guard this body used to carry: that
+        // guard re-imposed the pick-and-pass filter one layer ABOVE the
+        // distribution dispatch `draft_seats_needing_auto_pick` and
+        // `pick_random_for_seat` now perform, which would have made every
+        // shared-stack arm below it dead. The CR 903.13b pick-step derivation
+        // (and the shared-stack forced decision) live there, in the one copy.
         for seat_idx in seats {
-            if let Some(pack) = &session.session.current_pack[seat_idx] {
-                if !pack.0.is_empty() {
-                    // CR 903.13b: the expired pick timer takes the kind's WHOLE
-                    // pick step — one card for the four CR 905.1a kinds, two for
-                    // CommanderDraft, dropping to the remainder on an odd final
-                    // pick. Read from the procedure so this and the reducer's
-                    // `expected` agree by construction. Was a hardcoded single
-                    // id, which stalled a Commander pod at `WrongPickCardCount`.
-                    // Same mechanism as `server-core`'s disconnected-seat
-                    // auto-pick, which carries the full derivation.
-                    let cards_per_pick =
-                        usize::from(session.session.config.kind.procedure().cards_per_pick)
-                            .min(pack.0.len());
-                    let mut rng = rand::rng();
-                    // Distinct ids: drawing twice by index into the pack could
-                    // pick the same card twice, which the reducer rejects.
-                    let mut remaining: Vec<String> =
-                        pack.0.iter().map(|c| c.instance_id.clone()).collect();
-                    let card_instance_ids: Vec<String> = (0..cards_per_pick)
-                        .map(|_| remaining.swap_remove(rng.random_range(0..remaining.len())))
-                        .collect();
-                    let action = draft_core::types::DraftAction::Pick {
-                        seat: seat_idx as u8,
-                        card_instance_ids,
-                    };
-                    if let Err(e) = draft_core::session::apply(&mut session.session, action, None) {
-                        warn!(
-                            draft = %timer_draft_code,
-                            seat = seat_idx,
-                            error = %e,
-                            "auto-pick failed"
-                        );
-                    }
-                }
+            if let Err(e) = mgr.pick_random_for_seat(&timer_draft_code, seat_idx as u8, None) {
+                warn!(
+                    draft = %timer_draft_code,
+                    seat = seat_idx,
+                    error = %e,
+                    "auto-pick failed"
+                );
             }
         }
 
-        session.timer_remaining_ms = None;
+        if let Some(session) = mgr.sessions.get_mut(&timer_draft_code) {
+            session.timer_remaining_ms = None;
+        }
 
         drop(mgr);
         broadcast_draft_views(&timer_draft_code, &timer_connections, &timer_draft_state).await;
 
         // Re-arm for the next pick window if the draft is still in progress.
+        //
+        // UNCONDITIONAL, and that is load-bearing for a shared-stack pod: this
+        // self-re-arm is what keeps one from stalling.
+        // `should_rearm_pick_timer` governs only the POST-ACTION restart and is
+        // keyed on `DraftPickWindow = (status, current_pack_number,
+        // pick_number)` — two counters a shared-stack session never moves — so
+        // the post-action path never re-arms for one and only this loop does.
+        //
+        // The residual defect is therefore FAIRNESS, not a stall: after a
+        // shared-stack decision the clock is not restarted, so the next seat
+        // begins its turn with whatever seconds its opponent left behind. That
+        // is DELIBERATELY DEFERRED. The fix is a `DraftPickWindow`
+        // tuple-to-named-struct retype across eleven sites in this file plus
+        // five existing assertions and a new `DraftSession` method, and the
+        // whole benefit accrues to the server-authoritative draft path, which
+        // no shipped client reaches. Recorded here so the next reader neither
+        // re-derives the wrong severity ("the pod stalls" — it does not) nor
+        // concludes the gap was missed.
         let still_drafting = {
             let mgr = timer_draft_state.lock().await;
             let status = mgr
@@ -7995,6 +8048,7 @@ async fn handle_client_message(
             draft_metadata,
             start_when_full,
             ranked,
+            booster_pack_pool,
         } => {
             info!(
                 display_name = %display_name,
@@ -8166,17 +8220,19 @@ async fn handle_client_message(
                         ));
                         return;
                     }
-                    let (game_code, player_token) = match mgr.create_game_with_ai(
-                        resolved,
-                        DeckChoice::DeckList(Box::new(deck)),
-                        display_name.clone(),
-                        timer_seconds,
-                        match_config,
-                        ai_requests,
-                        db.card_names(),
-                        format_config.clone(),
-                        db,
-                    ) {
+                    let (game_code, player_token) = match mgr
+                        .create_game_with_ai_with_booster_pack_pool(
+                            resolved,
+                            DeckChoice::DeckList(Box::new(deck)),
+                            display_name.clone(),
+                            timer_seconds,
+                            match_config,
+                            ai_requests,
+                            db.card_names(),
+                            format_config.clone(),
+                            booster_pack_pool.clone(),
+                            db,
+                        ) {
                         Ok(created) => created,
                         Err(error) => {
                             let _ = tx.send(ServerMessage::error(error));
@@ -8303,6 +8359,7 @@ async fn handle_client_message(
                             format_config,
                             start_when_full,
                             ranked,
+                            booster_pack_pool,
                             ai_requests,
                             public,
                             password: password.clone(), // original still needed for Phase 3
@@ -10385,8 +10442,15 @@ async fn handle_client_message(
                 // core layout holds the result, so reconnect/start never reroll
                 // a pod and a client never transmits assignments.
                 server_core::protocol::DraftSourceIntent::Chaos { candidate_codes } => {
-                    let seed = rand::rngs::OsRng.try_next_u64().map_err(|error| {
-                        format!("Unable to seed Chaos draft assignments: {error}")
+                    // Asked BEFORE the entropy draw and before this pod is
+                    // registered and broadcast, because the reducer's answer at
+                    // `StartDraft` would otherwise arrive on a full lobby that
+                    // can never start. The engine owns both the verdict and its
+                    // wording; this boundary only asks earlier.
+                    let seed = guard_chaos_layout_for_kind(kind).and_then(|()| {
+                        rand::rngs::OsRng.try_next_u64().map_err(|error| {
+                            format!("Unable to seed Chaos draft assignments: {error}")
+                        })
                     });
                     seed.and_then(|seed| {
                         draft_pools
@@ -13630,6 +13694,7 @@ mod issue_4548_full_create_tests {
                 draft_metadata: None,
                 start_when_full: true,
                 ranked: false,
+                booster_pack_pool: None,
             };
             socket
                 .send(WsMessage::Text(
@@ -13805,6 +13870,7 @@ mod issue_4548_full_create_tests {
                 draft_metadata: None,
                 start_when_full: true,
                 ranked: false,
+                booster_pack_pool: None,
             };
             socket
                 .send(WsMessage::Text(
@@ -13885,6 +13951,7 @@ mod issue_4548_full_create_tests {
                 draft_metadata: None,
                 start_when_full: true,
                 ranked: false,
+                booster_pack_pool: None,
             };
             let create_json = serde_json::to_string(&create).expect("create json");
             assert!(create_json.len() > 8 * 1024);
@@ -13925,7 +13992,7 @@ mod game_submission_tests {
     use super::issue_4548_full_create_tests::{recv_server_message, spawn_full_mode_server};
     use super::*;
     use engine::game::interaction::MAX_INTERACTION_STRING_LEN;
-    use engine::types::actions::DebugAction;
+    use engine::types::actions::{DebugAction, DebugCardCreationKind};
     use engine::types::interaction::{InteractionChoiceId, InteractionId, InteractionResponse};
     use engine::types::zones::Zone;
     use futures_util::SinkExt;
@@ -13946,6 +14013,7 @@ mod game_submission_tests {
                 attach_to: None,
                 run_etb: false,
                 nonlegendary: false,
+                creation_kind: DebugCardCreationKind::Card,
             }))
         };
 
@@ -14012,6 +14080,7 @@ mod game_submission_tests {
             draft_metadata: None,
             start_when_full: true,
             ranked: false,
+            booster_pack_pool: None,
         };
         socket
             .send(WsMessage::Text(
@@ -14035,6 +14104,7 @@ mod game_submission_tests {
 
     async fn create_started_ai_game(
         socket: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+        booster_pack_pool: Option<Vec<String>>,
     ) -> (String, String, server_core::FullSessionKey) {
         let create = ClientMessage::CreateGameWithSettings {
             deck: DeckData::default(),
@@ -14059,6 +14129,7 @@ mod game_submission_tests {
             draft_metadata: None,
             start_when_full: true,
             ranked: false,
+            booster_pack_pool,
         };
         socket
             .send(WsMessage::Text(
@@ -14084,6 +14155,37 @@ mod game_submission_tests {
             }
         }
         created.expect("Full game identity")
+    }
+
+    #[tokio::test]
+    async fn native_shaped_full_create_preserves_cube_pool_through_start_and_ordinary_control() {
+        let (url, server, _temp_dir, app_state) = spawn_full_mode_server().await;
+        let pool = vec![
+            "Cube Card".to_string(),
+            "Cube Card".to_string(),
+            "Undealt sentinel".to_string(),
+        ];
+        let mut native_host = connect_and_hello(url.clone()).await;
+        let (cube_code, _, _) = create_started_ai_game(&mut native_host, Some(pool.clone())).await;
+        let sessions = app_state.sessions.lock().await;
+        let cube = sessions.sessions.get(&cube_code).expect("Cube session");
+        assert_eq!(cube.booster_pack_pool, Some(pool.clone()));
+        assert_eq!(
+            cube.state
+                .booster_pack_pool
+                .as_ref()
+                .map(|pool| pool.as_slice()),
+            Some(pool.as_slice())
+        );
+        drop(sessions);
+
+        let mut ordinary_host = connect_and_hello(url).await;
+        let (ordinary_code, _, _) = create_started_ai_game(&mut ordinary_host, None).await;
+        assert!(app_state.sessions.lock().await.sessions[&ordinary_code]
+            .state
+            .booster_pack_pool
+            .is_none());
+        server.abort();
     }
 
     async fn reconnect_started_game(
@@ -14196,7 +14298,8 @@ mod game_submission_tests {
         let (url, server, _temp_dir, app_state) = spawn_full_mode_server().await;
         let result = tokio::time::timeout(Duration::from_secs(10), async {
             let mut socket_a = connect_and_hello(url.clone()).await;
-            let (game_code, player_token, full_key) = create_started_ai_game(&mut socket_a).await;
+            let (game_code, player_token, full_key) =
+                create_started_ai_game(&mut socket_a, None).await;
 
             let mut socket_b = connect_and_hello(url).await;
             reconnect_started_game(&mut socket_b, &game_code, &player_token, full_key.clone())
@@ -14653,6 +14756,7 @@ mod refused_auto_start_join_tests {
                 draft_metadata: None,
                 start_when_full: true,
                 ranked: false,
+                booster_pack_pool: None,
             },
         )
         .await;
@@ -15082,6 +15186,7 @@ mod mode_gate_tests {
                 code: "TOUR01".into(),
                 role: TournamentRole::Organizer,
                 token: "org-tok".into(),
+                rotation_nonce: "nonce".into(),
             },
         ]
     }
@@ -15798,11 +15903,31 @@ mod handshake_tests {
                 seat: 1,
                 name: None,
             },
+            draft_core::types::DraftAction::SharedStackDecision {
+                seat: 0,
+                pile: 0,
+                decision: draft_core::types::SharedStackPileDecision::Take,
+            },
         ];
         for action in allowed {
             assert!(
                 client_forbidden_draft_action_reason(&action).is_none(),
                 "expected {action:?} to be allowed from client"
+            );
+        }
+        // Paired positive, already in this file's sibling tests and restated
+        // here so the allow-list above cannot degrade into an allow-everything:
+        // the two server-internal variants are still refused.
+        for forbidden in [
+            draft_core::types::DraftAction::GeneratePairings,
+            draft_core::types::DraftAction::SetSeatConnected {
+                seat: 0,
+                connected: true,
+            },
+        ] {
+            assert!(
+                client_forbidden_draft_action_reason(&forbidden).is_some(),
+                "expected {forbidden:?} to stay server-internal"
             );
         }
     }
@@ -16064,6 +16189,7 @@ mod issue_4548_deadlock_tests {
                     format_config: None,
                     start_when_full: false,
                     ranked: false,
+                    booster_pack_pool: None,
                     ai_requests: vec![],
                     public: false,
                     password: None,
@@ -17275,6 +17401,107 @@ mod p2p_backup_delete_tests {
     }
 
     #[tokio::test]
+    async fn public_backup_store_and_get_redact_intergame_launch_pool() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let app_state = test_app_state(&temp_dir);
+        let snapshot = serde_json::json!({
+            "intergameCommands": [{
+                "launchPayload": { "deckPayload": {
+                    "booster_pack_pool": ["Cube", "Cube", "Undealt sentinel"],
+                    "main_deck": ["Public card"]
+                }}
+            }]
+        })
+        .to_string();
+
+        let stored = admin::p2p_backup_store(
+            State(app_state.clone()),
+            Json(admin::P2pBackupRequest {
+                draft_code: DRAFT_CODE.to_string(),
+                host_peer_id: HOST_PEER.to_string(),
+                snapshot_json: snapshot,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(stored.status(), StatusCode::OK);
+
+        let (_, stored_snapshot, _) = app_state
+            .game_db
+            .load_p2p_backup(DRAFT_CODE)
+            .expect("load")
+            .expect("stored backup");
+        let stored: serde_json::Value =
+            serde_json::from_str(&stored_snapshot).expect("snapshot JSON");
+        let stored_deck = &stored["intergameCommands"][0]["launchPayload"]["deckPayload"];
+        assert!(stored_deck.get("booster_pack_pool").is_none());
+        assert_eq!(stored_deck["main_deck"], serde_json::json!(["Public card"]));
+
+        let response = admin::p2p_backup_get(
+            State(app_state),
+            Path(DRAFT_CODE.to_string()),
+            Query(admin::P2pBackupGetQuery {
+                host_peer_id: HOST_PEER.to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let response: serde_json::Value = serde_json::from_slice(&body).expect("response JSON");
+        let public: serde_json::Value =
+            serde_json::from_str(response["snapshot_json"].as_str().expect("snapshot JSON"))
+                .expect("snapshot JSON");
+        assert!(
+            public["intergameCommands"][0]["launchPayload"]["deckPayload"]
+                .get("booster_pack_pool")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn public_backup_get_defensively_redacts_legacy_intergame_launch_pool() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let app_state = test_app_state(&temp_dir);
+        app_state
+            .game_db
+            .save_p2p_backup(
+                DRAFT_CODE,
+                HOST_PEER,
+                &serde_json::json!({
+                    "intergameCommands": [{ "launchPayload": { "deckPayload": {
+                        "booster_pack_pool": ["legacy Cube"], "main_deck": ["Public card"]
+                    }}}]
+                })
+                .to_string(),
+            )
+            .expect("seed raw legacy backup");
+
+        let response = admin::p2p_backup_get(
+            State(app_state),
+            Path(DRAFT_CODE.to_string()),
+            Query(admin::P2pBackupGetQuery {
+                host_peer_id: HOST_PEER.to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let response: serde_json::Value = serde_json::from_slice(&body).expect("response JSON");
+        let public: serde_json::Value =
+            serde_json::from_str(response["snapshot_json"].as_str().expect("snapshot JSON"))
+                .expect("snapshot JSON");
+        let deck = &public["intergameCommands"][0]["launchPayload"]["deckPayload"];
+        assert!(deck.get("booster_pack_pool").is_none());
+        assert_eq!(deck["main_deck"], serde_json::json!(["Public card"]));
+    }
+
+    #[tokio::test]
     async fn delete_rejects_missing_host_peer_id_and_preserves_row() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let app_state = test_app_state(&temp_dir);
@@ -17724,6 +17951,7 @@ mod metrics_tests {
             draft_metadata: None,
             start_when_full: true,
             ranked: false,
+            booster_pack_pool: None,
         }
     }
 

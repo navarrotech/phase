@@ -39,7 +39,7 @@ use engine::game::{
     validate_name_deck_for_format_full, BracketEstimate, DeckCompatibilityRequest, DeckList,
     PlayerDeckList, ReplayPlayer,
 };
-use engine::types::actions::DebugAction;
+use engine::types::actions::{DebugAction, DebugCardCreationKind};
 use engine::types::custom_format::{CustomFormatDef, CustomFormatRules};
 use engine::types::format::{
     validate_starting_life_bounds, DeckCopyLimit, FormatConfig, GameFormat,
@@ -152,6 +152,11 @@ struct PreparedRestoredGameState {
     debug_permitted_was_serialized: bool,
 }
 
+/// Stable machine-recognizable prefix for a paused cast menu created before a
+/// face was part of its selection tuple. Callers can offer recovery without
+/// parsing the human-facing guidance that follows it.
+const LEGACY_CASTING_VARIANT_FACE_RESTORE_ERROR: &str = "RESTORE_INCOMPATIBLE_CASTING_VARIANT_FACE";
+
 #[derive(Debug)]
 struct DecodedRestoredGameState {
     state: GameState,
@@ -165,6 +170,11 @@ fn prepare_restored_game_state(json_str: &str) -> Result<PreparedRestoredGameSta
         .get("state")
         .and_then(serde_json::Value::as_object)
         .or_else(|| serialized.as_object());
+    if state.is_some_and(legacy_casting_variant_choice_lacks_face) {
+        return Err(format!(
+            "{LEGACY_CASTING_VARIANT_FACE_RESTORE_ERROR}: Cannot restore paused CastingVariantChoice without required face; start a new game or undo to a state before this casting choice."
+        ));
+    }
     let debug_permitted_was_serialized =
         state.is_some_and(|state| state.contains_key("debug_permitted"));
     let state = serde_json::from_value::<PersistedGameState>(serialized)
@@ -175,6 +185,35 @@ fn prepare_restored_game_state(json_str: &str) -> Result<PreparedRestoredGameSta
         state,
         debug_permitted_was_serialized,
     })
+}
+
+/// Reject only the pre-face paused cast menu before generic serde reports a
+/// field-path error. A menu index cannot be recovered because Fuse now has two
+/// different Normal choices, so selecting a guessed face would change a cast.
+fn legacy_casting_variant_choice_lacks_face(
+    state: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    let Some(waiting_for) = state
+        .get("waiting_for")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
+    };
+    if waiting_for.get("type").and_then(serde_json::Value::as_str) != Some("CastingVariantChoice") {
+        return false;
+    }
+    waiting_for
+        .get("data")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|data| data.get("options"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|options| {
+            options.iter().any(|option| {
+                option
+                    .as_object()
+                    .is_some_and(|option| !option.contains_key("face"))
+            })
+        })
 }
 
 /// Native-only decode helper for restore-boundary tests that do not need card
@@ -235,6 +274,35 @@ mod external_format_config_tests {
 
     use super::*;
     use engine::types::format::RangeOfInfluenceConfig;
+
+    #[test]
+    fn restore_refuses_only_legacy_paused_casting_variant_menu_without_face() {
+        let mut paused =
+            serde_json::to_value(GameState::new_two_player(42)).expect("state serializes");
+        paused["waiting_for"] = serde_json::json!({
+            "type": "CastingVariantChoice",
+            "data": {
+                "player": 0,
+                "object_id": 1,
+                "card_id": 1,
+                "options": [{ "variant": "Normal", "mana_cost": { "type": "NoCost" } }]
+            }
+        });
+        let error = prepare_restored_game_state(&paused.to_string())
+            .expect_err("legacy paused menu must receive actionable refusal");
+        assert_eq!(
+            error,
+            format!(
+                "{LEGACY_CASTING_VARIANT_FACE_RESTORE_ERROR}: Cannot restore paused CastingVariantChoice without required face; start a new game or undo to a state before this casting choice."
+            )
+        );
+
+        paused["waiting_for"]["data"]["options"][0]["face"] = serde_json::json!("Left");
+        assert!(
+            prepare_restored_game_state(&paused.to_string()).is_ok(),
+            "a paused menu with an explicit face must continue through generic restore handling"
+        );
+    }
 
     #[test]
     fn object_id_records_serialize_with_json_string_keys() {
@@ -309,6 +377,7 @@ mod external_format_config_tests {
                 },
                 legality: LegalityRules {
                     legal_sets: None,
+                    legal_cards: Vec::new(),
                     banned: Vec::new(),
                     restricted: Vec::new(),
                     legacy: LegacyRuleSet::default(),
@@ -1912,6 +1981,7 @@ pub fn submit_action(actor: u8, action: JsValue) -> JsValue {
         attach_to,
         run_etb,
         nonlegendary,
+        creation_kind,
     }) = action
     {
         return handle_debug_create_card(DebugCreateCardRequest {
@@ -1923,6 +1993,7 @@ pub fn submit_action(actor: u8, action: JsValue) -> JsValue {
             attach_to,
             run_etb,
             nonlegendary,
+            creation_kind,
         });
     }
 
@@ -2042,6 +2113,7 @@ struct DebugCreateCardRequest<'a> {
     attach_to: Option<engine::game::game_object::AttachTarget>,
     run_etb: bool,
     nonlegendary: bool,
+    creation_kind: DebugCardCreationKind,
 }
 
 fn handle_debug_create_card(request: DebugCreateCardRequest<'_>) -> JsValue {
@@ -2053,6 +2125,7 @@ fn handle_debug_create_card(request: DebugCreateCardRequest<'_>) -> JsValue {
         attach_to: request.attach_to,
         run_etb: request.run_etb,
         nonlegendary: request.nonlegendary,
+        creation_kind: request.creation_kind,
     };
     match with_state(|state| {
         preflight_debug_action_with_rejection(state, request.actor, &debug_action)
@@ -2084,6 +2157,7 @@ fn handle_debug_create_card_inner(
         attach_to,
         run_etb,
         nonlegendary,
+        creation_kind,
     } = request;
     let debug_action = engine::types::actions::DebugAction::CreateCard {
         card_name: card_name.to_string(),
@@ -2093,6 +2167,7 @@ fn handle_debug_create_card_inner(
         attach_to,
         run_etb,
         nonlegendary,
+        creation_kind,
     };
     let waiting_for = with_state(|state| {
         engine::game::preflight_debug_action(state, actor, &debug_action)
@@ -2129,6 +2204,7 @@ fn handle_debug_create_card_inner(
                 attach_to,
                 run_etb,
                 nonlegendary,
+                creation_kind,
             },
         )
         .map_err(|error| format!("Engine error: {error}"))?;
@@ -5380,6 +5456,39 @@ mod replay_bridge_tests {
     use super::*;
     use engine::types::game_state::WaitingFor;
 
+    #[test]
+    fn copied_trigger_occurrence_wire_shape_preserves_printed_origin() {
+        let occurrence = engine::types::ability::TriggerDefinitionOccurrenceRef::CopiedValue {
+            copy_effect: engine::types::ability::CopyEffectInstanceRef {
+                continuous_effect_id: 17,
+                modification_index: 2,
+            },
+            copied_slot: 3,
+            printed_origin: Some(engine::types::ability::TriggerPrintedOrigin {
+                printed_ref: engine::types::card::PrintedCardRef {
+                    oracle_id: "oracle-id".to_string(),
+                    face_name: "Printed Face".to_string(),
+                },
+                printed_occurrence: 4,
+            }),
+        };
+
+        let serialized = serde_json::to_value(&occurrence).unwrap();
+        assert_eq!(serialized["type"], "CopiedValue");
+        assert_eq!(serialized["data"]["copied_slot"], 3);
+        assert_eq!(
+            serialized["data"]["printed_origin"]["printed_ref"]["face_name"],
+            "Printed Face"
+        );
+        assert_eq!(
+            serde_json::from_value::<engine::types::ability::TriggerDefinitionOccurrenceRef>(
+                serialized
+            )
+            .unwrap(),
+            occurrence
+        );
+    }
+
     /// Exercises the bridge wiring (auto-start in `initialize_game`, append
     /// in `submit_action`, clear in `restore_game_state`) through the
     /// inner helpers rather than the `#[wasm_bindgen]` entry points
@@ -5531,11 +5640,12 @@ mod replay_bridge_tests {
             actor: PlayerId(0),
             card_name: "Test Card",
             owner: PlayerId(0),
-            zone: engine::types::zones::Zone::Hand,
+            zone: engine::types::zones::Zone::Battlefield,
             count: 2,
             attach_to: None,
-            run_etb: true,
+            run_etb: false,
             nonlegendary: true,
+            creation_kind: DebugCardCreationKind::Token,
         })
         .expect("debug create-card should succeed in this fixture");
         assert_eq!(
@@ -5563,13 +5673,14 @@ mod replay_bridge_tests {
                     .filter(|object| object.name == "Test Card")
                     .count(),
                 2,
-                "a non-battlefield debug CreateCard batch materializes each card"
+                "a raw battlefield debug CreateCard batch materializes each token"
             );
             let card = state
                 .objects
                 .values()
                 .find(|object| object.name == "Test Card")
                 .expect("debug-created card should exist");
+            assert!(card.is_token, "the WASM boundary must preserve Token");
             assert!(!card
                 .card_types
                 .supertypes
@@ -5633,6 +5744,7 @@ mod replay_bridge_tests {
             attach_to: None,
             run_etb: true,
             nonlegendary: false,
+            creation_kind: DebugCardCreationKind::Card,
         })
         .expect("a real battlefield debug batch should succeed");
 
@@ -5699,6 +5811,7 @@ mod replay_bridge_tests {
             attach_to: None,
             run_etb: true,
             nonlegendary: false,
+            creation_kind: DebugCardCreationKind::Card,
         })
         .expect("an authorized zero request is a no-op without a card database");
         assert!(result.events.is_empty());
@@ -5742,6 +5855,7 @@ mod replay_bridge_tests {
             attach_to: None,
             run_etb: true,
             nonlegendary: false,
+            creation_kind: DebugCardCreationKind::Card,
         })
         .expect_err("an invalid owner must fail before database access");
         assert!(owner_error.contains("invalid owner player id"));
@@ -5756,6 +5870,7 @@ mod replay_bridge_tests {
             attach_to: None,
             run_etb: true,
             nonlegendary: false,
+            creation_kind: DebugCardCreationKind::Card,
         })
         .expect_err("a real entry off Priority must fail before database access");
         assert!(priority_error.contains("Priority window"));
@@ -5770,6 +5885,7 @@ mod replay_bridge_tests {
             attach_to: None,
             run_etb: true,
             nonlegendary: false,
+            creation_kind: DebugCardCreationKind::Card,
         })
         .expect_err("a missing database must reject a valid nonzero request");
         assert!(lookup_error.contains("card database not loaded"));

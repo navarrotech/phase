@@ -4,7 +4,7 @@ use nom::bytes::complete::{tag, take_till, take_until};
 use nom::character::complete::multispace0;
 use nom::combinator::{all_consuming, map, opt, peek, rest, value, verify};
 use nom::multi::separated_list1;
-use nom::sequence::{delimited, preceded, terminated};
+use nom::sequence::{delimited, pair, preceded, terminated};
 use nom::Parser;
 
 use super::animation::{
@@ -18,8 +18,8 @@ use crate::parser::oracle_ir::ast::*;
 use crate::types::ability::{
     AbilityDefinition, AbilityKind, ChosenSubtypeKind, ColorChangeMode, ContinuousModification,
     ControllerRef, CopyRecipient, Duration, EachDamageRecipient, Effect, EffectScope, FilterProp,
-    MultiTargetSpec, ObjectScope, PlayerFilter, PlayerScope, PtValue, QuantityExpr, QuantityRef,
-    StaticCondition, StaticDefinition, TargetFilter, TypedFilter,
+    MultiTargetSpec, ObjectScope, PlayerFilter, PlayerRelation, PlayerScope, PtValue, QuantityExpr,
+    QuantityRef, StaticCondition, StaticDefinition, TargetFilter, TypedFilter,
 };
 use crate::types::game_state::DayNight;
 use crate::types::keywords::Keyword;
@@ -32,7 +32,9 @@ use super::super::oracle_nom::duration::parse_duration;
 use super::super::oracle_nom::error::OracleResult;
 use super::super::oracle_nom::primitives as nom_primitives;
 use super::super::oracle_nom::quantity as nom_quantity;
-use super::super::oracle_nom::target::{parse_event_context_ref, parse_supertype_word};
+use super::super::oracle_nom::target::{
+    parse_event_context_ref, parse_object_exclusion_list, parse_supertype_word, ObjectExclusion,
+};
 use super::super::oracle_quantity;
 use super::super::oracle_static::{
     classify_block_exception, parse_additive_type_clause_modifications,
@@ -343,8 +345,9 @@ where
     // `affected`. So `None` is inert on this path rather than a new gap; the
     // point of carrying it is that a future predicate kind which DOES read the
     // filter cannot silently inherit a permissive default.
-    let application = extract_subject_text(text)
-        .and_then(|subject_text| parse_subject_application(&subject_text, ctx));
+    let application = extract_subject_text(text).and_then(|subject_text| {
+        parse_subject_application_for(&subject_text, ctx, AnaphorConsumer::AffectedObject)
+    });
 
     ClauseAst::SubjectPredicate {
         subject: Box::new(subject_phrase_ast(application)),
@@ -620,7 +623,7 @@ fn try_parse_subject_continuous_clause(
     if let Some(clause) = try_parse_additive_type_continuous_clause(subject, predicate, ctx) {
         return Some(clause);
     }
-    let application = parse_subject_application(subject, ctx)?;
+    let application = parse_subject_application_for(subject, ctx, AnaphorConsumer::AffectedObject)?;
     build_continuous_clause(application, predicate, ctx)
 }
 
@@ -645,7 +648,7 @@ pub(super) fn try_parse_conditional_protection_grant_clause(
     if subject.eq_ignore_ascii_case("you") {
         return None;
     }
-    let application = parse_subject_application(subject, ctx)?;
+    let application = parse_subject_application_for(subject, ctx, AnaphorConsumer::AffectedObject)?;
     build_conditional_protection_grant_clause(&application, predicate, leading_duration)
 }
 
@@ -680,6 +683,7 @@ fn build_conditional_protection_grant_clause(
         })
         .collect();
     Some(ParsedEffectClause {
+        unlowered_guard: None,
         effect: Effect::GenericEffect {
             static_abilities,
             duration: duration.clone(),
@@ -710,7 +714,7 @@ fn additive_type_subject_application(
         return subject_filter_application(parsed_subject, false);
     }
 
-    parse_subject_application(subject, ctx)
+    parse_subject_application_for(subject, ctx, AnaphorConsumer::AffectedObject)
 }
 
 fn try_parse_additive_type_continuous_clause(
@@ -741,6 +745,7 @@ fn build_additive_type_continuous_clause(
     let affected = static_affected_for_application(application);
 
     Some(ParsedEffectClause {
+        unlowered_guard: None,
         effect: Effect::GenericEffect {
             static_abilities: vec![StaticDefinition::continuous()
                 .affected(affected)
@@ -822,6 +827,7 @@ fn try_parse_compound_all_subjects_become_clause(
     }
 
     Some(ParsedEffectClause {
+        unlowered_guard: None,
         effect: Effect::GenericEffect {
             static_abilities,
             duration: merged_duration.clone(),
@@ -858,9 +864,9 @@ fn try_parse_subject_become_clause(
     // anaphor the explicit "it becomes …" form uses (parent target / triggering
     // source), so the second animation binds to the same object as the first.
     let application = if subject.is_empty() {
-        parse_subject_application("it", ctx)?
+        parse_subject_application_for("it", ctx, AnaphorConsumer::AffectedObject)?
     } else {
-        parse_subject_application(subject, ctx)?
+        parse_subject_application_for(subject, ctx, AnaphorConsumer::AffectedObject)?
     };
     build_become_clause(application, &predicate, ctx)
 }
@@ -934,7 +940,7 @@ fn try_parse_subject_supertype_removal_clause(
     // Only a genuinely targeted subject reaches the shared AddSupertype runtime
     // as `ParentTarget`; decline anaphoric / self-referential subjects (no
     // target) so an out-of-context "it isn't legendary" cannot animate here.
-    let application = parse_subject_application(subject, ctx)?;
+    let application = parse_subject_application_for(subject, ctx, AnaphorConsumer::AffectedObject)?;
     application.target.as_ref()?;
     let affected = static_affected_for_application(&application);
     let duration = duration.or(Some(Duration::Permanent));
@@ -1380,7 +1386,8 @@ fn try_parse_subject_base_pt_set_clause_ast(
     // Parse the optional trailing keyword-grant conjunct ("and they gain trample").
     let keywords = parse_base_pt_set_trailing_keywords(after_pt);
 
-    let application = target_application.or_else(|| parse_subject_application(subject, ctx))?;
+    let application = target_application
+        .or_else(|| parse_subject_application_for(subject, ctx, AnaphorConsumer::AffectedObject))?;
     let affected = static_affected_for_application(&application);
 
     // CR 208.4a + CR 613.4b: emit per-axis layer-7b set modifications. Fixed
@@ -1557,6 +1564,7 @@ fn try_parse_combat_tax_effect_clause(text: &str) -> Option<ParsedEffectClause> 
         return None;
     }
     Some(ParsedEffectClause {
+        unlowered_guard: None,
         effect: Effect::GenericEffect {
             static_abilities: vec![StaticDefinition::continuous().modifications(vec![
                 ContinuousModification::GrantStaticAbility {
@@ -1627,8 +1635,16 @@ fn try_parse_source_and_other_restriction_clause(
     let subject_lower = subject.to_lowercase();
     let subject_pair = TextPair::new(subject, &subject_lower);
     let (primary_tp, secondary_tp) = subject_pair.split_around(" and ")?;
-    let primary_application = parse_subject_application(primary_tp.original.trim(), ctx)?;
-    let secondary_application = parse_subject_application(secondary_tp.original.trim(), ctx)?;
+    let primary_application = parse_subject_application_for(
+        primary_tp.original.trim(),
+        ctx,
+        AnaphorConsumer::AffectedObject,
+    )?;
+    let secondary_application = parse_subject_application_for(
+        secondary_tp.original.trim(),
+        ctx,
+        AnaphorConsumer::AffectedObject,
+    )?;
     // The secondary conjunct must carry its own target slot ("up to one other
     // target creature"); a bare conjunction with no second target is not this
     // class and is left to the generic subject split. The primary conjunct, by
@@ -1702,7 +1718,11 @@ fn try_parse_target_and_same_name_pump_clause(
 
     // Primary conjunct must announce a target ("target creature") — this is what
     // carries the CR 115.1 target slot the mass sub-ability inherits.
-    let primary = parse_subject_application(primary_tp.original.trim(), ctx)?;
+    let primary = parse_subject_application_for(
+        primary_tp.original.trim(),
+        ctx,
+        AnaphorConsumer::AffectedObject,
+    )?;
     primary.target.as_ref()?;
 
     // Secondary conjunct must be the same-name mass ("all other creatures with
@@ -1728,6 +1748,7 @@ fn try_parse_target_and_same_name_pump_clause(
         ],
     };
     let mass_clause = ParsedEffectClause {
+        unlowered_guard: None,
         effect: Effect::PumpAll {
             power,
             toughness,
@@ -1851,9 +1872,11 @@ fn try_parse_subject_restriction_clause(
 
     if let Some((before, _)) = tp.split_around(" must be blocked") {
         let subject = before.original.trim();
-        let application = parse_subject_application(subject, ctx)?;
+        let application =
+            parse_subject_application_for(subject, ctx, AnaphorConsumer::AffectedObject)?;
         let affected = static_affected_for_application(&application);
         return Some(ParsedEffectClause {
+            unlowered_guard: None,
             effect: Effect::GenericEffect {
                 static_abilities: vec![StaticDefinition::new(StaticMode::MustBeBlocked {
                     by: None,
@@ -1899,13 +1922,15 @@ fn try_parse_subject_restriction_clause(
         if let Some(ImperativeFamilyAst::GainKeyword(Effect::GenericEffect { duration, .. })) =
             imperative::try_parse_attack_or_block_if_able(&predicate)
         {
-            let application = parse_subject_application(subject, ctx)?;
+            let application =
+                parse_subject_application_for(subject, ctx, AnaphorConsumer::AffectedObject)?;
             let affected = static_affected_for_application(&application);
             let static_abilities = imperative::must_attack_or_block_static_definitions()
                 .into_iter()
                 .map(|def| def.affected(affected.clone()))
                 .collect();
             return Some(ParsedEffectClause {
+                unlowered_guard: None,
                 effect: Effect::GenericEffect {
                     static_abilities,
                     duration: duration.clone(),
@@ -1934,9 +1959,11 @@ fn try_parse_subject_restriction_clause(
         // next turn,") arrives on `ability.duration` and wins in
         // `effects/effect.rs::resolve`.
         if imperative::try_parse_attack_away_requirement(&predicate) {
-            let application = parse_subject_application(subject, ctx)?;
+            let application =
+                parse_subject_application_for(subject, ctx, AnaphorConsumer::AffectedObject)?;
             let affected = static_affected_for_application(&application);
             return Some(ParsedEffectClause {
+                unlowered_guard: None,
                 effect: Effect::GenericEffect {
                     static_abilities: vec![
                         imperative::must_attack_away_static_definition().affected(affected)
@@ -1988,15 +2015,18 @@ fn try_parse_subject_restriction_clause(
             // `is_broadcast_population_filter` is the single authority for that
             // distinction; re-deriving it as "did a target get declared" would
             // misclassify every `SelfRef` subject.
-            let broadcast = parse_subject_application(subject, ctx).filter(|application| {
-                application.target.is_none()
-                    && !application.inherits_parent
-                    && super::is_broadcast_population_filter(&static_affected_for_application(
-                        application,
-                    ))
-            });
+            let broadcast =
+                parse_subject_application_for(subject, ctx, AnaphorConsumer::AffectedObject)
+                    .filter(|application| {
+                        application.target.is_none()
+                            && !application.inherits_parent
+                            && super::is_broadcast_population_filter(
+                                &static_affected_for_application(application),
+                            )
+                    });
             if let Some(application) = broadcast {
                 return Some(ParsedEffectClause {
+                    unlowered_guard: None,
                     effect: Effect::ForceAttack {
                         target: static_affected_for_application(&application),
                         required_defender,
@@ -2024,9 +2054,11 @@ fn try_parse_subject_restriction_clause(
             // `?` here makes a bare/source-granted "attacks this turn if able"
             // (empty subject, granted ability) fall through to None, preserving
             // the existing target:None behavior for that class.
-            let application = parse_subject_application(subject, ctx)?;
+            let application =
+                parse_subject_application_for(subject, ctx, AnaphorConsumer::AffectedObject)?;
             let affected = static_affected_for_application(&application);
             return Some(ParsedEffectClause {
+                unlowered_guard: None,
                 effect: Effect::GenericEffect {
                     static_abilities: vec![
                         imperative::must_attack_static_definition().affected(affected)
@@ -2092,6 +2124,7 @@ fn try_parse_subject_restriction_clause(
             kind: None,
         };
         return Some(ParsedEffectClause {
+            unlowered_guard: None,
             effect: Effect::GenericEffect {
                 static_abilities: vec![StaticDefinition::new(mode.clone())
                     .affected(affected)
@@ -2137,6 +2170,7 @@ fn try_parse_subject_restriction_clause(
         let affected = static_affected_for_application(&application);
         let mode = StaticMode::CantBeRegenerated;
         return Some(ParsedEffectClause {
+            unlowered_guard: None,
             effect: Effect::GenericEffect {
                 static_abilities: vec![StaticDefinition::new(mode.clone())
                     .affected(affected)
@@ -2184,7 +2218,8 @@ fn try_parse_subject_restriction_clause(
     // Transient rule modification that prevents combat damage assignment.
     if let Some((before, after)) = tp.split_around(" assigns no combat damage") {
         let subject = before.original.trim();
-        let application = parse_subject_application(subject, ctx)?;
+        let application =
+            parse_subject_application_for(subject, ctx, AnaphorConsumer::AffectedObject)?;
         // CR 514.2: "this combat" → UntilEndOfCombat; default "this turn" → UntilEndOfTurn.
         let after_lower = after.lower.trim_start();
         let duration = if after_lower.starts_with("this combat") {
@@ -2194,6 +2229,7 @@ fn try_parse_subject_restriction_clause(
         };
         let affected = static_affected_for_application(&application);
         return Some(ParsedEffectClause {
+            unlowered_guard: None,
             effect: Effect::GenericEffect {
                 static_abilities: vec![StaticDefinition::new(StaticMode::AssignNoCombatDamage)
                     .affected(affected)
@@ -2227,7 +2263,7 @@ fn try_parse_subject_restriction_clause(
         let (before, after) = tp.split_at(pos);
         (before.original.trim(), after.original[1..].trim())
     };
-    let application = parse_subject_application(subject, ctx)?;
+    let application = parse_subject_application_for(subject, ctx, AnaphorConsumer::AffectedObject)?;
     build_restriction_clause(application, predicate)
 }
 
@@ -2244,7 +2280,7 @@ fn try_parse_can_attack_with_defender(
         return None;
     }
     let subject = text[..pos].trim();
-    let application = parse_subject_application(subject, ctx)?;
+    let application = parse_subject_application_for(subject, ctx, AnaphorConsumer::AffectedObject)?;
     // Determine duration: "this turn" implies UntilEndOfTurn.
     let duration = if lower.contains("this turn") {
         Some(Duration::UntilEndOfTurn)
@@ -2253,6 +2289,7 @@ fn try_parse_can_attack_with_defender(
     };
     let affected = static_affected_for_application(&application);
     Some(ParsedEffectClause {
+        unlowered_guard: None,
         effect: Effect::GenericEffect {
             static_abilities: vec![StaticDefinition::new(StaticMode::CanAttackWithDefender)
                 .affected(affected)
@@ -2295,7 +2332,7 @@ fn try_parse_can_block_additional(
             is_optional: false,
         }
     } else {
-        parse_subject_application(subject_text.trim(), ctx)?
+        parse_subject_application_for(subject_text.trim(), ctx, AnaphorConsumer::AffectedObject)?
     };
 
     let (_rest, (_, _, _, _, _, count, duration, _)) = all_consuming((
@@ -2318,6 +2355,7 @@ fn try_parse_can_block_additional(
     let mode = StaticMode::ExtraBlockers { count };
     let affected = static_affected_for_application(&application);
     Some(ParsedEffectClause {
+        unlowered_guard: None,
         effect: Effect::GenericEffect {
             static_abilities: vec![StaticDefinition::new(mode.clone())
                 .affected(affected)
@@ -2493,9 +2531,30 @@ enum PlayerSubjectAnaphor {
     AttackingPlayer,
 }
 
+/// CR 608.2c: which consumer reads a subject's "that [type]" anaphor.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AnaphorConsumer {
+    /// The affected object of a continuous grant, restriction or type/P&T change
+    /// ("That creature can't be blocked this turn"): an anaphor naming the chain's
+    /// declared object target binds that target (CR 601.2c), and nothing when the
+    /// optional target was declined (CR 115.6).
+    AffectedObject,
+    /// Every other reader (the imperative fallback, damage source and recipient
+    /// stamps): keeps the trigger-source stamp.
+    Other,
+}
+
 pub(super) fn parse_subject_application(
     subject: &str,
     ctx: &mut ParseContext,
+) -> Option<SubjectApplication> {
+    parse_subject_application_for(subject, ctx, AnaphorConsumer::Other)
+}
+
+fn parse_subject_application_for(
+    subject: &str,
+    ctx: &mut ParseContext,
+    consumer: AnaphorConsumer,
 ) -> Option<SubjectApplication> {
     if subject.trim().is_empty() {
         return None;
@@ -2604,26 +2663,20 @@ pub(super) fn parse_subject_application(
         application.multi_target = Some(MultiTargetSpec::exact(count));
         return Some(application);
     }
-    // CR 115.1d: "any number of target creatures" — variable-count targeting.
-    // Strip "any number of " prefix, delegate to parse_target for the filter,
-    // and attach MultiTargetSpec { min: 0, max: None } (unlimited).
-    if let Ok((after_prefix, _)) =
-        tag::<_, _, OracleError<'_>>("any number of ").parse(lower.as_str())
-    {
-        // CR 115.1d: Accept "any number of target X" and "any number of other
-        // target X". consumed is kept at the end of "any number of " so that
-        // target_text starts with "other target..." or "target..." and
-        // parse_target_with_ctx can add FilterProp::Another for the "other" form
-        // (Guardian of Faith: "any number of other target creatures you control").
-        let consumed = lower.len() - after_prefix.len();
-        let target_text = &subject[consumed..];
-        if alt((
-            tag::<_, _, OracleError<'_>>("target "),
-            tag("other target "),
-        ))
-        .parse(after_prefix)
+    // CR 107.1c + CR 115.1: "any number of [other|another] target X" —
+    // variable-count targeting with a zero minimum and no upper bound, for any
+    // spell or ability kind.
+    // `strip_optional_target_prefix` is the single authority for the quantifier
+    // and its target-article guard; it leaves `target_text` at "target …" /
+    // "other target …" / "another target …" so `parse_target_with_ctx` adds
+    // `FilterProp::Another` for the "other" forms (Guardian of Faith: "any
+    // number of other target creatures you control").
+    if tag::<_, _, OracleError<'_>>("any number of ")
+        .parse(lower.as_str())
         .is_ok()
-        {
+    {
+        let (target_text, multi_target) = super::strip_optional_target_prefix(subject);
+        if multi_target.is_some() {
             let (filter, rest) = parse_target_with_ctx(target_text, ctx);
             // CR 115.1d (issue #8581): "any number of target players other
             // than that player" (Curse of Surveillance) is not silently
@@ -2655,7 +2708,7 @@ pub(super) fn parse_subject_application(
                 return None;
             }
             let mut application = subject_filter_application(filter, true)?;
-            application.multi_target = Some(MultiTargetSpec::unlimited(0));
+            application.multi_target = multi_target;
             return Some(application);
         }
     }
@@ -2834,6 +2887,17 @@ pub(super) fn parse_subject_application(
         return subject_filter_application(TargetFilter::ParentTarget, false);
     }
 
+    // CR 608.2c + CR 607.2d: "creatures other than ~ and the chosen creature" —
+    // a bare-plural population subject carrying a multi-item exclusion list.
+    // Must precede the bare-plural arm below (which would consume "creatures"
+    // and silently drop the exclusions) while declining every form that arm or
+    // `parse_other_than_exclusion` already consumes: the list must parse whole
+    // (all_consuming) and contain at least one chosen-object item, and the base
+    // must be an unquantified bare plural.
+    if let Some(application) = try_parse_exclusion_list_subject(lower.as_str(), ctx) {
+        return Some(application);
+    }
+
     // Bare plural noun phrase subjects ("creatures you control", "other creatures you control")
     // are implicit "all X" forms — strip any "other " prefix and route through parse_target.
     let (had_other, noun_subject) =
@@ -2890,6 +2954,61 @@ pub(super) fn parse_subject_application(
         let (neighbor_filter, rest) = parse_target(subject);
         if rest.trim().is_empty() && matches!(neighbor_filter, TargetFilter::Neighbor { .. }) {
             return subject_filter_application(neighbor_filter, false);
+        }
+    }
+    // CR 102.1 + CR 608.2c: "the player with the most <property>" / "the
+    // player who has the most <property>" as an effect SUBJECT — a live
+    // per-candidate predicate, not an anaphor. Structural sibling of the
+    // seating-neighbor arm above: a definite-article player subject resolved
+    // to a concrete `TargetFilter` and handed to `subject_filter_application`,
+    // from which the GainControl -> GiveControl rewrite takes `recipient`.
+    //
+    // On the three corpus cards a tie among equally-qualifying players CANNOT
+    // occur when the ability resolves, because U1's CR 603.4 intervening-if
+    // rechecks uniqueness on resolution and removes the ability from the
+    // stack otherwise — a tie means multiple players satisfy the superlative,
+    // not a choice the effect offers the controller. This coupling is why U1
+    // and U2 must ship together, and it is also why the engine's fail-closed
+    // `unique_recipient_from_filter` (game/effects/gain_control.rs,
+    // "ambiguous GiveControl recipient") is never reached on these cards.
+    //
+    // Placement here (before the bare "the player"/"that player" anaphor
+    // `alt` below) mirrors the seating-neighbor convention for locality, but
+    // is not load-bearing: both this arm and the bare anaphor below are
+    // `all_consuming` over lexically disjoint inputs ("the player" exactly,
+    // versus "the player with/who has the most <property>"), so neither can
+    // shadow the other at any position. The `all_consuming` wrapper IS
+    // load-bearing — it makes an unrecognized tail fall through to the
+    // existing failure rather than binding a prefix.
+    //
+    // The head-noun tags MUST carry their own trailing space:
+    // `parse_most_property_tail` opens with `tag("with the most ")` /
+    // `tag("who has the most ")`, so a bare `tag("the player")` would leave
+    // " with the most life" behind and the tail could never match. The
+    // `oracle_target.rs` target-position seam and U2.1's
+    // `parse_opponent_most_life_restriction` caller each peel that space
+    // themselves before calling; this site has no one to peel it for it, so
+    // the tag owns it. `value()` also carries the relation off the same arm.
+    {
+        let mut superlative_player_subject = all_consuming(pair(
+            alt((
+                value(
+                    PlayerRelation::All,
+                    tag::<_, _, OracleError<'_>>("the player "),
+                ),
+                value(PlayerRelation::Opponent, tag("the opponent ")),
+            )),
+            super::parse_most_property_tail,
+        ));
+        if let Ok((_, (relation, property))) = superlative_player_subject.parse(lower.as_str()) {
+            if let Some(player) = nom_quantity::player_property_leader_filter(property, relation) {
+                return subject_filter_application(
+                    TargetFilter::PlayerMatching {
+                        player: Box::new(player),
+                    },
+                    false,
+                );
+            }
         }
     }
     // CR 608.2c + CR 117.3a: "that player" / "the player" as subject,
@@ -2990,6 +3109,7 @@ pub(super) fn parse_subject_application(
             TargetFilter::TriggeringPlayer
                 | TargetFilter::DefendingPlayer
                 | TargetFilter::TriggeringSourceController
+                | TargetFilter::EventTargetController
         ) {
             // CR 608.2c + CR 109.4 (issue #534): "That player" after a
             // `Choose(Player)`/`Choose(Opponent)` clause binds to the
@@ -3236,6 +3356,33 @@ pub(super) fn parse_subject_application(
             is_optional: false,
         });
     }
+    // CR 115.1 + CR 608.2c: "[that|the] <noun>'s controller or that player" —
+    // the disjunctive restatement of a damage recipient (Acorn Catapult: "That
+    // permanent's controller or that player creates a 1/1 green Squirrel
+    // creature token"). Both arms name one player — the parent target's
+    // controller for a permanent target (CR 109.4: only objects on the stack
+    // or battlefield have a controller), the target itself for a player
+    // target — which is exactly what `TargetFilter::ParentTargetController`
+    // resolves to (`parent_target_controller` matches both `TargetRef` kinds).
+    // Mirrors the unless-payer arm in `parse_resolution_unless_payer`
+    // (oracle_effect/mod.rs), which collapses the same phrase for Rhystic
+    // Lightning's "unless … pays" clause.
+    if all_consuming((
+        alt((tag::<_, _, OracleError<'_>>("that "), tag("the "))),
+        take_until("'s controller or that player"),
+        tag("'s controller or that player"),
+    ))
+    .parse(lower.as_str())
+    .is_ok()
+    {
+        return Some(SubjectApplication {
+            affected: TargetFilter::ParentTargetController,
+            target: None,
+            multi_target: None,
+            inherits_parent: false,
+            is_optional: false,
+        });
+    }
     // CR 608.2c: Definite/anaphoric "[the|that] <noun>'s controller" /
     // "[the|that] <noun>'s owner" — the parent target's controller/owner.
     // Mirrors the generic "the <noun>'s controller" path in `parse_target`
@@ -3332,6 +3479,29 @@ pub(super) fn parse_subject_application(
     // be reinterpreted as some unrelated typed referent). See
     // `chunk_subject`/`prior_typed_referent` in `parse_effect_chain_ir`.
     if lower == "it" {
+        // CR 608.2c + CR 601.2c: a bare "it" whose nearest antecedent in this
+        // ability is an earlier declared object target (or that target's own bound
+        // anaphor) names that target when it is the affected object of a grant,
+        // restriction or type/P&T change; nothing when the optional target was
+        // declined (CR 115.6). `chain_declared_object_target` stops at a
+        // self-reference, a non-target event object and any non-reflexive
+        // condition, and a nearer object this chain created is excluded below,
+        // so those antecedents keep the stamps below.
+        if consumer == AnaphorConsumer::AffectedObject
+            && matches!(ctx.chain_declared_object_target, Some(TargetFilter::Typed(_)))
+            // CR 608.2c + CR 111.1 + CR 707.2: an object this chain created (a token, a
+            // copy of the declared target included) is the nearer antecedent, so "it"
+            // keeps the created-object stamp.
+            && !ctx.token_created_in_chain
+        {
+            return Some(SubjectApplication {
+                affected: TargetFilter::ParentTarget,
+                target: None,
+                multi_target: None,
+                inherits_parent: true,
+                is_optional: false,
+            });
+        }
         if ctx.subject.is_none() && ctx.parent_target_available {
             return Some(SubjectApplication {
                 affected: TargetFilter::ParentTarget,
@@ -3422,7 +3592,24 @@ pub(super) fn parse_subject_application(
             // the transient effect to the specific triggering object via SpecificObject.
             // Outside triggers, fall back to the type filter (anaphor resolves via
             // `inherits_parent` + ParentTarget at the call site).
-            if ctx.subject.is_some() {
+            // CR 608.2c: "that [type]" names an earlier instruction's declared target
+            // when that target's filter carries every type the anaphor names; an
+            // affected-object consumer then binds the declared object (nothing when the
+            // optional target was declined, CR 115.6). Any other antecedent or consumer
+            // keeps the trigger-source stamp (Spiked Ripsaw's attacker; "that creature
+            // deals damage", phase 5).
+            let names_declared_target = matches!(
+                (ctx.chain_declared_object_target.as_ref(), &filter),
+                (Some(TargetFilter::Typed(antecedent)), TargetFilter::Typed(anaphor))
+                    if !anaphor.type_filters.is_empty()
+                        && anaphor
+                            .type_filters
+                            .iter()
+                            .all(|t| antecedent.type_filters.contains(t))
+            );
+            let binds_declared_target =
+                consumer == AnaphorConsumer::AffectedObject && names_declared_target;
+            if ctx.subject.is_some() && !binds_declared_target {
                 return Some(SubjectApplication {
                     affected: filter,
                     target: Some(TargetFilter::TriggeringSource),
@@ -3772,7 +3959,7 @@ fn subject_application_for_cant_be_activated(
     // "~'s", "each creature you control's"). Strip the possessive marker so the
     // remaining noun phrase routes through the full subject grammar.
     let possessor = strip_possessive_subject_suffix(subject);
-    parse_subject_application(possessor, ctx)
+    parse_subject_application_for(possessor, ctx, AnaphorConsumer::AffectedObject)
 }
 
 fn strip_possessive_subject_suffix(subject: &str) -> &str {
@@ -3897,6 +4084,82 @@ fn resolve_they_pronoun(ctx: &mut ParseContext) -> TargetFilter {
             .unwrap_or(TargetFilter::TriggeringSource),
         // No trigger context — anaphoric reference to previously mentioned objects
         _ => TargetFilter::ParentTarget,
+    }
+}
+
+/// CR 608.2c + CR 607.2d: Subject form "‹bare plural base› other than ‹ref›
+/// [and ‹ref›]" — a population subject whose exclusion list names the ability
+/// source ("~") and/or the remembered chosen object ("the chosen creature").
+///
+/// Recognition only; composition is [`apply_object_exclusions`]. Deliberately
+/// declines every form the existing single-referent `parse_other_than_exclusion`
+/// path already consumes (P1–P7: "other than ~", "other than enchanted
+/// creature") and the target/all/each bases with their own grammar (Loki's
+/// "each creature you control other than the chosen creature" keeps its
+/// existing path), because the list `all_consuming` parse refuses any item that
+/// is not a self-reference or a chosen-object reader.
+fn try_parse_exclusion_list_subject(
+    lower: &str,
+    ctx: &mut ParseContext,
+) -> Option<SubjectApplication> {
+    let (_, (base, list)) = nom_primitives::split_once_on(lower, " other than ").ok()?;
+    let base = base.trim_end();
+    if base.is_empty() || list.trim().is_empty() {
+        return None;
+    }
+    // Scope gate mirroring the bare-plural arm below: "target "/"all "/"each "
+    // subjects are handled by their own grammar, never silently re-scoped here.
+    if alt((
+        tag::<_, _, OracleError<'_>>("target "),
+        tag("all "),
+        tag("each "),
+    ))
+    .parse(base)
+    .is_ok()
+    {
+        return None;
+    }
+    let (_, exclusions) = parse_object_exclusion_list(list.trim()).ok()?;
+    if !exclusions.contains(&ObjectExclusion::ChosenObject) {
+        return None;
+    }
+    // The base is a bare plural ("creatures") — normalize to its implicit
+    // "all ‹base›" form, exactly as the bare-plural arm below does, and thread
+    // `ctx` for the same controller-suffix reason (a "that player controls"
+    // relative suffix must bind the enclosing scope, not default to `You`).
+    let normalized = format!("all {base}");
+    let (filter, rest) = parse_target_with_ctx(&normalized, ctx);
+    if !rest.trim().is_empty() {
+        return None;
+    }
+    subject_filter_application(apply_object_exclusions(filter, &exclusions), false)
+}
+
+/// CR 608.2c + CR 607.2d: Compose an "other than ‹ref› [and ‹ref›]" exclusion
+/// list onto the base population filter. The source item reuses the shared
+/// `FilterProp::Another` composition — the recursion-aware
+/// `imperative::add_another_to_filter_recursive`, so every typed leg of a
+/// composite base ("creatures and planeswalkers") excludes the source; the
+/// chosen object is `Not { ChosenCard }` — the shared CR 607.2d
+/// remembered-object reader.
+fn apply_object_exclusions(
+    mut filter: TargetFilter,
+    exclusions: &[ObjectExclusion],
+) -> TargetFilter {
+    if exclusions.contains(&ObjectExclusion::Source) {
+        imperative::add_another_to_filter_recursive(&mut filter);
+    }
+    if exclusions.contains(&ObjectExclusion::ChosenObject) {
+        TargetFilter::And {
+            filters: vec![
+                filter,
+                TargetFilter::Not {
+                    filter: Box::new(TargetFilter::ChosenCard),
+                },
+            ],
+        }
+    } else {
+        filter
     }
 }
 
@@ -4167,6 +4430,7 @@ fn try_split_pump_compound(
         )))
     };
     Some(ParsedEffectClause {
+        unlowered_guard: None,
         effect,
         duration,
         sub_ability,
@@ -4321,6 +4585,7 @@ fn build_keyword_choice_clause(
     };
 
     Some(ParsedEffectClause {
+        unlowered_guard: None,
         effect,
         duration: None,
         sub_ability,
@@ -4361,6 +4626,7 @@ fn build_continuous_clause(
     {
         let effect = build_pump_effect(&application, power, toughness);
         return Some(ParsedEffectClause {
+            unlowered_guard: None,
             effect,
             duration,
             sub_ability: None,
@@ -4400,6 +4666,7 @@ fn build_continuous_clause(
         build_defender_attack_continuous_compound(&application, predicate_text)
     {
         return Some(ParsedEffectClause {
+            unlowered_guard: None,
             effect: Effect::GenericEffect {
                 static_abilities,
                 duration: duration.clone(),
@@ -4491,6 +4758,7 @@ fn build_continuous_clause(
     if let Some((power, toughness)) = extract_pump_modifiers(&modifications) {
         let effect = build_pump_effect(&application, power, toughness);
         return Some(ParsedEffectClause {
+            unlowered_guard: None,
             effect,
             duration,
             sub_ability: None,
@@ -4527,6 +4795,7 @@ fn build_continuous_clause(
         };
 
     Some(ParsedEffectClause {
+        unlowered_guard: None,
         effect: Effect::GenericEffect {
             static_abilities,
             duration: duration.clone(),
@@ -4866,6 +5135,7 @@ fn build_become_clause(
             end_cost: None,
         };
         return Some(ParsedEffectClause {
+            unlowered_guard: None,
             effect,
             duration,
             sub_ability: None,
@@ -4895,6 +5165,7 @@ fn build_become_clause(
             end_cost: None,
         };
         return Some(ParsedEffectClause {
+            unlowered_guard: None,
             effect,
             duration,
             sub_ability: None,
@@ -4927,6 +5198,7 @@ fn build_become_clause(
             end_cost: None,
         };
         return Some(ParsedEffectClause {
+            unlowered_guard: None,
             effect,
             duration,
             sub_ability: None,
@@ -5066,6 +5338,7 @@ fn build_become_clause(
                 .unwrap_or_default();
         let recipient = copy_recipient_for_application(&application, &target);
         return Some(ParsedEffectClause {
+            unlowered_guard: None,
             effect: Effect::BecomeCopy {
                 target,
                 recipient,
@@ -5103,6 +5376,7 @@ fn build_become_clause(
                 .unwrap_or_default();
         let recipient = copy_recipient_for_application(&application, &target);
         return Some(ParsedEffectClause {
+            unlowered_guard: None,
             effect: Effect::BecomeCopy {
                 target,
                 recipient,
@@ -5144,6 +5418,7 @@ fn build_become_clause(
             end_cost: None,
         };
         return Some(ParsedEffectClause {
+            unlowered_guard: None,
             effect,
             duration,
             sub_ability: None,
@@ -5202,6 +5477,7 @@ fn build_become_clause(
 
     let affected = static_affected_for_application(&application);
     Some(ParsedEffectClause {
+        unlowered_guard: None,
         effect: Effect::GenericEffect {
             static_abilities: vec![StaticDefinition::continuous()
                 .affected(affected)
@@ -5338,6 +5614,7 @@ fn try_parse_become_and_attack_if_able(
     };
 
     Some(ParsedEffectClause {
+        unlowered_guard: None,
         effect: Effect::GenericEffect {
             static_abilities: vec![StaticDefinition::continuous()
                 .affected(affected)
@@ -5444,6 +5721,7 @@ fn try_parse_set_life_total(
         .clone()
         .unwrap_or_else(|| application.affected.clone());
     Some(ParsedEffectClause {
+        unlowered_guard: None,
         effect: Effect::SetLifeTotal { target, amount },
         duration: None,
         sub_ability: None,
@@ -5663,6 +5941,7 @@ fn try_parse_become_choice(
     )));
 
     Some(ParsedEffectClause {
+        unlowered_guard: None,
         effect: Effect::Choose {
             choice_type,
             persist: false,
@@ -5712,6 +5991,7 @@ fn build_life_lock_clause(scope_filter: TargetFilter) -> ParsedEffectClause {
             .modifications(vec![ContinuousModification::AddStaticMode { mode }])
     };
     ParsedEffectClause {
+        unlowered_guard: None,
         effect: Effect::GenericEffect {
             static_abilities: vec![
                 make_static(StaticMode::CantGainLife),
@@ -5779,6 +6059,7 @@ fn build_restriction_clause(
             .modifications(vec![ContinuousModification::AddKeyword { keyword }])
             .description(predicate.to_string());
         return Some(ParsedEffectClause {
+            unlowered_guard: None,
             effect: Effect::GenericEffect {
                 static_abilities: vec![static_def],
                 duration: duration.clone(),
@@ -5887,6 +6168,7 @@ fn build_restriction_clause(
         .collect();
 
     Some(ParsedEffectClause {
+        unlowered_guard: None,
         effect: Effect::GenericEffect {
             static_abilities,
             duration: duration.clone(),
@@ -6412,6 +6694,7 @@ fn try_parse_copula_goaded_clause(
     };
     let target = resolve_it_pronoun(ctx);
     Some(ParsedEffectClause {
+        unlowered_guard: None,
         effect: Effect::Goad { target },
         duration,
         sub_ability: None,
@@ -7045,6 +7328,16 @@ pub(crate) fn starts_with_subject_prefix(lower: &str) -> bool {
             // before the bare "the player " arm.
             value((), tag("the attacking player ")),
             value((), tag("the player ")),
+            // CR 102.2 + CR 608.2c: "the opponent with/who has the most
+            // <property>" as an effect subject — the sibling of the "the
+            // player " superlative arm above, routed through the same
+            // `strip_subject_clause` -> `parse_subject_application` seam so
+            // `superlative_player_subject`'s `PlayerRelation::Opponent` arm
+            // (this file, `parse_subject_application`) becomes reachable
+            // from `parse_effect_clause`. Lexically disjoint from "the
+            // player " (distinct second word), so ordering relative to it
+            // is not load-bearing.
+            value((), tag("the opponent ")),
             // CR 609.7 + CR 615.5: "the source's controller" / "the source's
             // owner" as a subject in a damage-prevention follow-up (Swans of
             // Bryn Argoll, Eye for an Eye class). The "that source's …" form
@@ -7217,17 +7510,46 @@ fn token_starts_predicate(token: &str) -> bool {
         || PREDICATE_VERBS.contains(&super::normalize_verb_token(token).as_str())
 }
 
+/// CR 102.1 + CR 608.2c: "who has the most `<property>`" (U2.3's superlative
+/// player-subject copula, e.g. "the player who has the most cards in hand
+/// gains control of ~") is a RELATIVE CLAUSE embedded inside the subject noun
+/// phrase, not the sentence's own predicate. Without this guard,
+/// `find_predicate_start`'s token scan mistakes the copula's own "has" —
+/// which deconjugates to the registered `PREDICATE_VERBS` entry "have" — for
+/// the sentence's real predicate verb, truncating the subject at "the player
+/// who " and leaving "has the most cards in hand gains control of ~" as a
+/// bogus predicate. This is why Sokenzan Renegade's HandSize-axis subject
+/// ("who has the most cards in hand") failed to bind while Ghazbán Ogre's
+/// Life-axis "with the most life" (no embedded verb in the copula) did not —
+/// measured via the U2 integration suite. The guard is deliberately narrowed
+/// to exactly `has`/`have` followed by `"the most "`, not to every `who
+/// <verb>` predicate: the broader corpus's other `who <verb>` forms bind
+/// through the filter-subject path and must not be disturbed, so this covers
+/// only the superlative shape U2.3 introduces, not relative clauses in
+/// general.
+fn is_embedded_who_has_the_most(prev_token: Option<&str>, token: &str, rest_after: &str) -> bool {
+    matches!(token, "has" | "have")
+        && prev_token == Some("who")
+        && preceded(multispace0, tag::<_, _, OracleError<'_>>("the most "))
+            .parse(rest_after)
+            .is_ok()
+}
+
 pub(super) fn find_predicate_start(text: &str) -> Option<usize> {
     let lower = text.to_lowercase();
     let mut word_start = None;
+    let mut prev_token: Option<&str> = None;
 
     for (idx, ch) in lower.char_indices() {
         if ch.is_whitespace() {
             if let Some(start) = word_start.take() {
                 let token = &lower[start..idx];
-                if token_starts_predicate(token) {
+                if !is_embedded_who_has_the_most(prev_token, token, &lower[idx..])
+                    && token_starts_predicate(token)
+                {
                     return Some(start);
                 }
+                prev_token = Some(token);
             }
             continue;
         }
@@ -7239,7 +7561,7 @@ pub(super) fn find_predicate_start(text: &str) -> Option<usize> {
 
     if let Some(start) = word_start {
         let token = &lower[start..];
-        if token_starts_predicate(token) {
+        if !is_embedded_who_has_the_most(prev_token, token, "") && token_starts_predicate(token) {
             return Some(start);
         }
     }
@@ -7247,7 +7569,12 @@ pub(super) fn find_predicate_start(text: &str) -> Option<usize> {
     None
 }
 
-/// Add `FilterProp::Another` to a target filter, ensuring the source is excluded.
+/// Add `FilterProp::Another` to a lone `Typed` target filter, ensuring the
+/// source is excluded.
+///
+/// Composite (`Or`/`And`) classes use the recursion-aware
+/// `imperative::add_another_to_filter_recursive` instead — this helper is the
+/// single-`Typed` form consumed by the subject-composition paths below.
 fn add_another_property(filter: TargetFilter) -> TargetFilter {
     match filter {
         TargetFilter::Typed(mut tf) => {
@@ -9720,6 +10047,23 @@ mod tests {
         assert!(app.multi_target.is_some(), "multi_target must be set");
     }
 
+    /// CR 107.1c + CR 115.1: the subject "any number of" arm delegates to
+    /// `strip_optional_target_prefix`, so it accepts every target article that
+    /// helper does — including "another target".
+    #[test]
+    fn any_number_of_another_target_produces_multi_target() {
+        let mut ctx = ParseContext::default();
+        let app = parse_subject_application("any number of another target creature", &mut ctx)
+            .expect("should parse");
+        assert_eq!(app.multi_target, Some(MultiTargetSpec::unlimited(0)));
+        assert!(
+            matches!(app.target, Some(TargetFilter::Typed(ref tf))
+                if tf.properties.iter().any(|p| matches!(p, FilterProp::Another))),
+            "filter must have FilterProp::Another for 'another', got {:?}",
+            app.target
+        );
+    }
+
     // CR 115.1 + CR 115.1d: "one or more target X" variable-count subject tests.
     // The minimum is 1 (unlike "any number of", min 0); the maximum is unbounded.
     #[test]
@@ -10876,6 +11220,83 @@ mod tests {
             description.as_deref(),
             Some(CLAUSE),
             "the gap must quote the WHOLE printed clause, subject included"
+        );
+    }
+
+    /// CR 608.2c: a non-targeted MASS player subject ("each opponent") stated
+    /// once at the head of a same-sentence verb list must govern every
+    /// subjectless conjugated continuation after it, exactly like the
+    /// targeted (`CarriedPlayerSubject::Targeted`) and phase-scoped
+    /// (`::Scoped`) cases already covered by
+    /// `targeted_player_subject_carries_to_conjugated_predicates` above. This
+    /// carry does NOT run through `CarriedPlayerSubject` — "each opponent " is
+    /// peeled off the chunk's leading text before subject-application parsing
+    /// ever sees it (`clause_shell::peel_player_scope_subject` →
+    /// `oracle_effect::lower::strip_each_player_subject`), stamping the
+    /// ability-level `AbilityDefinition.player_scope` instead; a separate
+    /// `carried_player_scope` re-supplies that scope to each subjectless
+    /// continuation. Regression-guards that separate carry so a future edit
+    /// can't silently drop the mass scope from the second/third sibling
+    /// (leaving them wrongly attributed to the ability's default caster).
+    #[test]
+    fn plural_player_subject_scope_carries_across_conjugated_continuations() {
+        let chain = super::super::parse_effect_chain(
+            "Each opponent sacrifices a creature, discards a card, and loses 3 life.",
+            AbilityKind::Spell,
+        );
+        assert_eq!(chain.player_scope, Some(PlayerFilter::Opponent));
+        assert!(
+            matches!(&*chain.effect, Effect::Sacrifice { .. }),
+            "expected Sacrifice root, got {:?}",
+            chain.effect
+        );
+
+        let discard = chain.sub_ability.as_ref().expect("expected discard link");
+        assert!(
+            matches!(&*discard.effect, Effect::Discard { .. }),
+            "expected Discard link, got {:?}",
+            discard.effect
+        );
+        assert_eq!(
+            discard.player_scope,
+            Some(PlayerFilter::Opponent),
+            "the discard sibling must inherit the SAME each-opponent scope, not the default caster"
+        );
+
+        let lose_life = discard
+            .sub_ability
+            .as_ref()
+            .expect("expected lose-life link");
+        assert!(
+            matches!(&*lose_life.effect, Effect::LoseLife { .. }),
+            "expected LoseLife link, got {:?}",
+            lose_life.effect
+        );
+        assert_eq!(
+            lose_life.player_scope,
+            Some(PlayerFilter::Opponent),
+            "the lose-life sibling must inherit the SAME each-opponent scope, not the default caster"
+        );
+    }
+
+    /// Sibling of the "and"-joined regression above, covering the `then`
+    /// clause-boundary path through the SAME `carried_player_scope`
+    /// mechanism (a different boundary than a comma/"and" sibling split).
+    #[test]
+    fn plural_player_subject_scope_carries_across_then_continuation() {
+        let chain = super::super::parse_effect_chain(
+            "Each player discards a card, then draws a card.",
+            AbilityKind::Spell,
+        );
+        assert_eq!(chain.player_scope, Some(PlayerFilter::All));
+        assert!(matches!(&*chain.effect, Effect::Discard { .. }));
+
+        let draw = chain.sub_ability.as_ref().expect("expected draw link");
+        assert!(matches!(&*draw.effect, Effect::Draw { .. }));
+        assert_eq!(
+            draw.player_scope,
+            Some(PlayerFilter::All),
+            "the draw sibling must inherit the SAME each-player scope across the `then` boundary"
         );
     }
 }

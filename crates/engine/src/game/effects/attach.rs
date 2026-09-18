@@ -547,7 +547,7 @@ fn prompt_resolution_attachment_choice(
     }
 
     let ctx = FilterContext::from_ability(ability);
-    let effective = crate::game::effects::resolved_object_filter(ability, attachment_filter);
+    let effective = crate::game::effects::resolved_object_filter(state, ability, attachment_filter);
     let eligible: Vec<ObjectId> = state
         .battlefield
         .iter()
@@ -944,7 +944,7 @@ fn resolve_bound_attachment_targets(
             .collect();
     }
     let ctx = FilterContext::from_ability(ability);
-    let effective = crate::game::effects::resolved_object_filter(ability, filter);
+    let effective = crate::game::effects::resolved_object_filter(state, ability, filter);
     ability
         .attach_attachment_targets()
         .iter()
@@ -976,7 +976,7 @@ fn resolve_attach_target<'a>(
             return AttachHostTargetResolution::Found(host.object_id);
         }
         let ctx = FilterContext::from_ability(ability);
-        let effective = crate::game::effects::resolved_object_filter(ability, filter);
+        let effective = crate::game::effects::resolved_object_filter(state, ability, filter);
         return matches_target_filter(state, host.object_id, &effective, &ctx)
             .then_some(host.object_id)
             .map_or(
@@ -1099,7 +1099,7 @@ fn explicit_attachment_target_chosen(
     attachment_filter: &TargetFilter,
 ) -> bool {
     let ctx = FilterContext::from_ability(ability);
-    let effective = crate::game::effects::resolved_object_filter(ability, attachment_filter);
+    let effective = crate::game::effects::resolved_object_filter(state, ability, attachment_filter);
     ability.targets.iter().any(|target| {
         matches!(
             target,
@@ -1191,17 +1191,17 @@ fn resolve_object_filter<'a>(
         // CR 608.2c: a precise slot anaphor ("Attach it to the chosen creature"
         // → attachment slot 1, target slot 0) resolves against the whole
         // resolving chain's accumulated targets. The per-clause `ability.targets`
-        // may carry only this clause's nearest target, so route through
-        // `resolved_targets`, whose `ParentTargetSlot` arm walks the ROOT chain
-        // (CR 608.2c) — the same authority the GainControl handler falls back to.
+        // may carry only this clause's nearest target, so resolve through the
+        // chain-root slot authority — the same one the GainControl handler uses.
+        // CR 608.2b: a slot whose target was illegal at resolution (or whose
+        // pinned referent departed, CR 400.7) yields no operand.
         // The shared `target_slots` iterator is intentionally not consumed here.
         TargetFilter::ParentTargetSlot { index } => {
-            crate::game::targeting::resolve_parent_slot_from_root(state, ability, *index).and_then(
-                |target| match target {
+            crate::game::targeting::resolve_live_parent_slot_from_root(state, ability, *index)
+                .and_then(|target| match target {
                     TargetRef::Object(id) => Some(id),
                     TargetRef::Player(_) => None,
-                },
-            )
+                })
         }
         _ => {
             let ctx = FilterContext::from_ability(ability);
@@ -4184,12 +4184,13 @@ mod tests {
 
     #[test]
     fn attachment_restriction_power_ge_blocks_weak_host_allows_strong_host() {
-        // CR 301.5b + CR 701.3a: Strata Scythe class — Equipment that "can be
-        // attached only to a creature with power 3 or greater" may not attach to a
-        // power-2 creature, but may attach to a power-3 creature. The restriction
-        // lives on the ATTACHMENT, not the host (contrast CantBeEquipped).
+        // CR 301.5b + CR 701.3a: positive-attachment-restriction class —
+        // O-Naginata ("can be attached only to a creature with power 3 or
+        // greater") may not attach to a power-2 creature, but may attach to a
+        // power-3 creature. The restriction lives on the ATTACHMENT, not the
+        // host (contrast CantBeEquipped).
         let mut state = setup();
-        let equipment = spawn_with_subtype(&mut state, "Strata Scythe", "Equipment");
+        let equipment = spawn_with_subtype(&mut state, "O-Naginata", "Equipment");
         let power_filter = TargetFilter::Typed(
             crate::types::ability::TypedFilter::creature().properties(vec![
                 crate::types::ability::FilterProp::PtComparison {
