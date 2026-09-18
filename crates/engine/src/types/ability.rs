@@ -38337,6 +38337,8 @@ mod cast_cost_modifier_serde_tests {
         );
     }
 }
+
+#[cfg(test)]
 mod chain_description_backfill_tests {
     use super::*;
 
