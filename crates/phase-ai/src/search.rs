@@ -15141,4 +15141,64 @@ mod tests {
             PolicyVerdict::Reject { .. } => panic!("a printed fetchland must not be gated"),
         }
     }
+
+    /// Field of Ruin sacrifices itself and its printed chain holds a land
+    /// search and a put onto the battlefield — but as riders on "Destroy target
+    /// nonbasic land an opponent controls", not as a replacement for itself.
+    /// Against the real card database, with a basic in the AI's library, the
+    /// fetch-land policy must not treat that activation as a fetch.
+    #[test]
+    fn field_of_ruin_is_not_scored_as_a_fetchland() {
+        let db = integration_card_db();
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let field = scenario.add_real_card(P0, "Field of Ruin", Zone::Battlefield, &db);
+        scenario.add_real_card(P0, "Mountain", Zone::Library, &db);
+        let mut runner = scenario.build();
+        rehydrate_game_from_card_db(runner.state_mut(), &db);
+        let config = create_config(AiDifficulty::Medium, Platform::Native);
+        let state = runner.state();
+
+        let ability_index = state.objects[&field]
+            .abilities
+            .iter()
+            .position(|ability| matches!(&*ability.effect, Effect::Destroy { .. }))
+            .expect("Field of Ruin's printed ability destroys a land");
+        let candidate = CandidateAction {
+            action: GameAction::ActivateAbility {
+                source_id: field,
+                ability_index,
+            },
+            metadata: ActionMetadata::for_actor(Some(P0), TacticalClass::Ability),
+        };
+        let decision = AiDecisionContext {
+            waiting_for: state.waiting_for.clone(),
+            candidates: vec![candidate.clone()],
+        };
+        let context = crate::context::AiContext::empty(&config.weights);
+        let ctx = PolicyContext {
+            state,
+            decision: &decision,
+            candidate: &candidate,
+            ai_player: P0,
+            config: &config,
+            context: &context,
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        let verdict = crate::policies::registry::PolicyRegistry::shared()
+            .verdicts(&ctx)
+            .into_iter()
+            .find_map(|(id, verdict)| {
+                (id == crate::policies::registry::PolicyId::FetchLandPatience).then_some(verdict)
+            })
+            .expect("the fetch-land policy must report on an activation candidate");
+        match verdict {
+            PolicyVerdict::Score { delta, reason } => {
+                assert_eq!(reason.kind, "fetch_patience_na");
+                assert_eq!(delta, 0.0);
+            }
+            PolicyVerdict::Reject { .. } => panic!("land destruction must not be gated as a fetch"),
+        }
+    }
 }
