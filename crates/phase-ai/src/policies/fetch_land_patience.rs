@@ -31,6 +31,7 @@
 use engine::game::filter::{matches_target_filter, FilterContext};
 use engine::types::ability::{AbilityCost, AbilityDefinition, Effect, TargetFilter};
 use engine::types::actions::GameAction;
+use engine::types::card_type::CoreType;
 use engine::types::game_state::GameState;
 use engine::types::identifiers::ObjectId;
 use engine::types::phase::Phase;
@@ -106,12 +107,19 @@ impl TacticalPolicy for FetchLandPatiencePolicy {
             return na();
         };
 
-        let Some(def) = ctx
-            .state
-            .objects
-            .get(source_id)
-            .and_then(|obj| obj.abilities.get(*ability_index))
-        else {
+        let Some(source) = ctx.state.objects.get(source_id) else {
+            return na();
+        };
+        // A fetchland is a land replacing itself. Sakura-Tribe Elder and
+        // Wayfarer's Bauble carry the identical sacrifice-search-put chain but
+        // are a creature and an artifact: sacrificing them spends a body or a
+        // rock, not a land drop already made, so this policy's timing argument
+        // does not apply and its end-step `Reject` would veto their real lines
+        // (the Elder's block-then-sacrifice among them).
+        if !source.card_types.core_types.contains(&CoreType::Land) {
+            return na();
+        }
+        let Some(def) = source.abilities.get(*ability_index) else {
             return na();
         };
 
@@ -325,17 +333,23 @@ mod tests {
     }
 
     fn ai_land_with_ability(state: &mut GameState, ability: AbilityDefinition) -> ObjectId {
+        ai_permanent_with_ability(state, CoreType::Land, ability)
+    }
+
+    fn ai_permanent_with_ability(
+        state: &mut GameState,
+        core_type: CoreType,
+        ability: AbilityDefinition,
+    ) -> ObjectId {
         let id = create_object(
             state,
             CardId(1),
             AI,
-            "Evolving Wilds".to_string(),
+            "Fetch Source".to_string(),
             Zone::Battlefield,
         );
         let obj = state.objects.get_mut(&id).unwrap();
-        obj.card_types
-            .core_types
-            .push(engine::types::card_type::CoreType::Land);
+        obj.card_types.core_types.push(core_type);
         Arc::make_mut(&mut obj.abilities).push(ability);
         id
     }
@@ -404,9 +418,7 @@ mod tests {
     fn ai_library_land(state: &mut GameState) -> ObjectId {
         let id = create_object(state, CardId(2), AI, "Forest".to_string(), Zone::Library);
         let obj = state.objects.get_mut(&id).unwrap();
-        obj.card_types
-            .core_types
-            .push(engine::types::card_type::CoreType::Land);
+        obj.card_types.core_types.push(CoreType::Land);
         id
     }
 
@@ -558,6 +570,28 @@ mod tests {
         *destination = Zone::Hand;
         let id = ai_land_with_ability(&mut state, ability);
         assert_not_a_fetch(&state, id);
+    }
+
+    /// Sakura-Tribe Elder ("Sacrifice this creature: Search your library for a
+    /// basic land card, put that card onto the battlefield tapped") and
+    /// Wayfarer's Bauble carry the Evolving Wilds chain on a nonland source.
+    /// Without the land gate the tapped arm would `Reject` them in main phase
+    /// — the same fixture on a land source is rejected, so only the source
+    /// type separates the two outcomes.
+    #[test]
+    fn nonland_self_sacrifice_tutors_are_not_fetchlands() {
+        for core_type in [CoreType::Creature, CoreType::Artifact] {
+            let mut state = GameState::new_two_player(42);
+            state.active_player = AI;
+            state.phase = Phase::PreCombatMain;
+            ai_library_land(&mut state);
+            let id = ai_permanent_with_ability(
+                &mut state,
+                core_type,
+                fetch_land_ability(EtbTapState::Tapped),
+            );
+            assert_not_a_fetch(&state, id);
+        }
     }
 
     /// With something on the stack the live question is whether to respond to
