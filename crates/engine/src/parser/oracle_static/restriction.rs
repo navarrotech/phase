@@ -247,7 +247,7 @@ pub(crate) fn parse_cant_be_countered_subject(tp: &TextPair) -> TargetFilter {
 /// entire remainder must be consumed; a non-empty tail means the filter phrase
 /// was only partially understood, so we bail to avoid a silently-wrong filter.
 ///
-/// Corpus: Strata Scythe ("a creature with power 3 or greater"), Brass Knuckles
+/// Corpus: O-Naginata ("a creature with power 3 or greater"), Gate Smasher
 /// ("a creature with toughness 4 or greater"), Konda's Banner ("a legendary
 /// creature").
 pub(crate) fn parse_attach_only_restriction(
@@ -1976,6 +1976,55 @@ pub(crate) fn try_parse_graveyard_cast_permission(
         );
     }
 
+    // CR 611.2a + CR 514.2: strip an optional LEADING duration head HERE, before
+    // the combined-permission branch below, so a sentence that states its window
+    // up front reaches the same body as its headless twin.
+    //
+    // This used to sit further down, AFTER
+    // `try_parse_unlimited_combined_graveyard_permission`. That branch requires
+    // a leading `"you may play "` and splits on `" and cast "` — it is the only
+    // one that builds the two-part `Or[Land, Card]` filter — so the Will cycle's
+    // windowed form never reached it and fell through to the single-verb
+    // dispatch, which yields a LAND-ONLY `affected`.
+    //
+    // MEASURED, the same sentence in both forms:
+    //   "You may play lands and cast spells from your graveyard."
+    //       -> affected = Or[ Typed[Land], Typed[Card] ]   (both halves)
+    //   "Until end of turn, you may play lands and cast spells from your graveyard."
+    //       -> affected = Typed[Land]                      (cast half LOST)
+    //
+    // `graveyard_permission_sources` consults `affected` to decide which
+    // graveyard cards a permission offers, so dropping the `Card` branch removed
+    // the spell half of every windowed permission in this class — silently, and
+    // only at runtime, which is why parse-shape tests never saw it.
+    //
+    // The phrase -> `Duration` mapping stays owned by the single duration grammar
+    // (`oracle_nom::duration::parse_duration`); this site owns only the leading
+    // position and the ", " split. `opt`-shaped, so text with no leading duration
+    // reaches every branch below byte-identically.
+    //
+    // CR 611.2a's second sentence ("If no duration is stated, it lasts until the
+    // end of the game") makes the captured window load-bearing, but
+    // `StaticDefinition` has no duration/expiry field, so there is no storage
+    // site at this layer. The value is consumed and EXPLICITLY DISCARDED to make
+    // the body reachable.
+    //
+    // DISCARDING IT IS SAFE ONLY BECAUSE NO CARD ROUTES HERE YET. Measured: the
+    // corpus contains zero `GraveyardCastPermission` statics, because the Will
+    // cycle's sentence reaches the EFFECT path, not this static path. Any future
+    // change that routes a windowed permission through here must thread the
+    // window to a real expiry first — otherwise CR 611.2a makes the grant last
+    // until end of GAME, which is strictly worse than not parsing it.
+    let lower = {
+        use crate::parser::oracle_nom::duration::parse_duration;
+        match nom_on_lower(lower, lower, |i| {
+            terminated(parse_duration, tag::<_, _, OracleError<'_>>(", ")).parse(i)
+        }) {
+            Some((_duration, rest)) => rest,
+            None => lower,
+        }
+    };
+
     // CR 305.1 + CR 601.2a + CR 114.4: Unlimited combined permission —
     // "You may play lands and cast permanent spells from your graveyard."
     // (Wrenn and Realmbreaker emblem). Composed through the shared branch
@@ -2004,42 +2053,12 @@ pub(crate) fn try_parse_graveyard_cast_permission(
         return Some(def);
     }
 
-    // CR 611.2a + CR 514.2: Optional LEADING duration head — "Until end of
-    // turn, you may play lands and cast spells from your graveyard."
-    // (Yawgmoth's Will / Gaea's Will / Magus of the Will class). Without this
-    // head the whole permission body below is unreachable for any sentence
-    // that states its window up front; with it, the body is reachable under
-    // the ENTIRE duration grammar, not one hard-coded phrase.
-    //
-    // The phrase -> `Duration` mapping is owned by the single duration grammar
-    // (`oracle_nom::duration::parse_duration`); this site owns only the leading
-    // position and the ", " split. It is the general-duration sibling of the
-    // fixed "during your turn, " head immediately below.
-    //
-    // CR 611.2a's second sentence ("If no duration is stated, it lasts until
-    // the end of the game") is what makes the captured window load-bearing —
-    // but `StaticDefinition` has NO duration/expiry field, so there is no
-    // storage site at this layer. The value is therefore consumed and
-    // EXPLICITLY DISCARDED so the body below is reachable; its host is
-    // `Effect::GenericEffect { static_abilities, duration }`, and threading it
-    // there is deferred to a later phase. Measured safe: the cards carrying
-    // this shape reach the effect path rather than the static-line path, so
-    // this head produces no duration-less permission static today.
-    //
-    // CR 305.1 + CR 601.2a: the body below grants both the land play and the
-    // spell cast, so a single stated window scopes both halves.
-    //
-    // `opt`-shaped: text with no leading duration reaches the body
-    // byte-identically.
-    let lower = {
-        use crate::parser::oracle_nom::duration::parse_duration;
-        match nom_on_lower(lower, lower, |i| {
-            terminated(parse_duration, tag::<_, _, OracleError<'_>>(", ")).parse(i)
-        }) {
-            Some((_duration, rest)) => rest,
-            None => lower,
-        }
-    };
+    // NOTE: the leading-duration head (B1's U1) is stripped ABOVE, before the
+    // combined-permission branch, rather than here. It used to sit at this
+    // position, which put it AFTER
+    // `try_parse_unlimited_combined_graveyard_permission` and so hid the Will
+    // cycle's windowed form from the only branch that builds the two-part
+    // `Or[Land, Card]` filter. See the hoisted site for the measurement.
 
     // CR 117.1c: Optional "during your turn, " timing qualifier (Festival of
     // Embers). When present, the permission is gated to the source controller's
@@ -2455,6 +2474,7 @@ fn usable_disjunctive_permission_filter(filter: &TargetFilter) -> bool {
         | TargetFilter::TriggeringSource
         | TargetFilter::EventTarget
         | TargetFilter::TriggeringSourceController
+        | TargetFilter::EventTargetController
         | TargetFilter::ParentTarget
         | TargetFilter::ParentTargetSlot { .. }
         | TargetFilter::ParentTargetController
@@ -3107,6 +3127,15 @@ pub(crate) fn try_parse_filtered_spend_any_type_to_cast(
 /// life equal to its mana value rather than paying its mana cost.") is
 /// recognised via the existing `oracle_effect::try_parse_alt_cost_rider`
 /// helper and stamped into `StaticMode::TopOfLibraryCastPermission.alt_cost`.
+///
+/// Also recognises the direct-object surface form — "you may [play|cast] the
+/// top card of your library[<gate>]" (The Lunar Whale) — in which the verb's
+/// object names the singular top card instead of bounding a filter with "from
+/// the top of your library". There is no eligibility filter, so `affected` is
+/// `TargetFilter::Any`. The object form's trailing text is validated
+/// fail-closed by [`parse_top_of_library_object_form_trailing`]: only a bare
+/// sentence end, a fully-typed " as long as <condition>" gate (optionally
+/// followed by a supported alt-cost rider), or an alt-cost rider is accepted.
 pub(crate) fn try_parse_top_of_library_cast_permission(
     text: &str,
     lower: &str,
@@ -3174,6 +3203,34 @@ pub(crate) fn try_parse_top_of_library_cast_permission(
         (r, CardPlayMode::Cast)
     };
 
+    // CR 601.3 + CR 601.1a: Direct-object surface form — "you may [play|cast]
+    // the top card of your library[<gate>]". The verb names the singular top
+    // card as its object rather than bounding a filter with "from the top of
+    // your library", so the permission carries no eligibility filter and
+    // `affected` is `Any`: every top card is eligible, and the verb alone
+    // selects the play mode. Same permission class as the perimeter forms
+    // above — a surface variant, not a new mode.
+    if let Some(after) = nom_tag_lower(rest, rest, "the top card of your library") {
+        // CR 611.3a: a trailing shape the class cannot model — including an
+        // " as long as " gate whose condition does not type — declines the
+        // whole line (`?` propagates the `None`). Claiming it would emit an
+        // UNCONDITIONAL permission with the printed gate dropped: the inverted
+        // "as long as" rewrite re-attaches the split condition only when it
+        // types, so the gate would otherwise be silently lost.
+        let (condition, alt_cost) = parse_top_of_library_object_form_trailing(after)?.into_parts();
+        let mut def = StaticDefinition::new(StaticMode::TopOfLibraryCastPermission {
+            play_mode,
+            frequency,
+            alt_cost,
+        })
+        .affected(TargetFilter::Any)
+        .description(text.to_string());
+        if let Some(condition) = condition {
+            def = def.condition(condition);
+        }
+        return Some(def);
+    }
+
     // Anchor on " from the top of your library". The split helper returns
     // (consumed_so_far, after_split) — we need both halves: the filter text
     // sits before the anchor; the optional alt-cost rider sits after.
@@ -3212,6 +3269,153 @@ pub(crate) fn try_parse_top_of_library_cast_permission(
         def = def.condition(condition);
     }
     Some(def)
+}
+
+/// CR 611.3a: The trailing shapes the direct-object top-of-library permission
+/// accepts after its "the top card of your library" anchor. One variant per
+/// accepted shape (a gate may additionally carry a CR 118.9 rider), so every
+/// accepted spelling has exactly one constructor and unsupported combinations
+/// cannot be produced by accident.
+enum ObjectFormTrailing {
+    /// Nothing beyond a closing sentence period.
+    Bare,
+    /// " as long as <condition>" — a fully-typed CR 611.3a gate, optionally
+    /// followed by a supported alt-cost rider (both components preserved).
+    Gated {
+        condition: StaticCondition,
+        alt_cost: Option<AbilityCost>,
+    },
+    /// CR 118.9 alt-cost rider ("If you cast a spell this way, pay … rather
+    /// than pay its mana cost.") with no gate.
+    AltCost(AbilityCost),
+}
+
+impl ObjectFormTrailing {
+    /// Flatten to the `(condition, alt_cost)` pair `StaticDefinition` carries.
+    fn into_parts(self) -> (Option<StaticCondition>, Option<AbilityCost>) {
+        match self {
+            Self::Bare => (None, None),
+            Self::Gated {
+                condition,
+                alt_cost,
+            } => (Some(condition), alt_cost),
+            Self::AltCost(cost) => (None, Some(cost)),
+        }
+    }
+}
+
+/// CR 611.3a: Validate the text following the direct-object anchor of
+/// [`try_parse_top_of_library_cast_permission`]. Fail-closed: only the accepted
+/// shapes are taken, and every other trailing — in particular a
+/// " as long as " gate whose condition does not type — returns `None` so the
+/// caller emits no permission at all. The line then keeps its prior handling
+/// (a modeless conditional static that is reported as a coverage gap) instead
+/// of becoming an unconditional grant.
+///
+/// Accepted shapes: a bare sentence end; a typed " as long as <condition>"
+/// gate, optionally followed by a supported CR 118.9 rider (both components
+/// preserved and assigned independently); or a rider alone. The rider must
+/// open the tail and be its LAST sentence, so a dropped gate or a following
+/// sentence can never be laundered through it (within the rider sentence the
+/// cost recognizer is still a scan — see the DEFER below).
+///
+/// DEFER: the three perimeter siblings in
+/// [`try_parse_top_of_library_cast_permission`] (compound, disjunctive,
+/// filtered) keep the class's pre-existing looser policy — they attach a
+/// typed gate when one parses and otherwise ignore the trailing text, whether
+/// that trailing is an untypeable " as long as " gate, unmodeled text after a
+/// recognized rider (the class's rider recognizer, `parse_top_of_library_alt_cost_rider`,
+/// is a scan predicate that consumes nothing and returns no remainder), or any
+/// other trailing restriction (Cemetery Illuminator's "…if it shares a card
+/// type with a card exiled with this creature" currently parses with
+/// `condition: null`). No printed card exercises those shapes today, so this
+/// change stays scoped to the object form rather than widening the guard
+/// class-wide.
+fn parse_top_of_library_object_form_trailing(trailing: &str) -> Option<ObjectFormTrailing> {
+    // Bare sentence end: "" | "." | ". ".
+    if is_bare_sentence_end(trailing) {
+        return Some(ObjectFormTrailing::Bare);
+    }
+
+    // CR 611.3a: a typed gate at the head; a supported rider sentence may
+    // follow it, in which case both components are preserved. Anything else
+    // after a typed gate declines (fail-closed).
+    if let Some((after_gate, condition)) =
+        parse_top_of_library_permission_condition_and_rest(trailing)
+    {
+        if is_bare_sentence_end(after_gate) {
+            return Some(ObjectFormTrailing::Gated {
+                condition,
+                alt_cost: None,
+            });
+        }
+        return object_form_rider(after_gate).map(move |alt_cost| ObjectFormTrailing::Gated {
+            condition,
+            alt_cost: Some(alt_cost),
+        });
+    }
+
+    // CR 611.3a: a gate that did not type must decline BEFORE the rider
+    // branch. The rider recognizer scans for its phrases anywhere, so a
+    // trailing that stacks a rider and an untyped gate — in either order —
+    // would otherwise be accepted with the gate silently dropped. The needle is
+    // space-terminated because `scan_contains` tries position 0 and trimmed
+    // word starts only: a space-ledged needle would miss a gate sitting
+    // mid-trailing after the rider sentence. Keep the marker in lockstep with
+    // `parse_top_of_library_permission_condition_and_rest` (grammar.rs), whose
+    // tag is the typed-gate authority's spelling of the same phrase.
+    if nom_primitives::scan_contains(trailing, "as long as ") {
+        return None;
+    }
+
+    // CR 118.9: rider-only trailing.
+    object_form_rider(trailing).map(ObjectFormTrailing::AltCost)
+}
+
+/// CR 611.3a: True when `text` is nothing but an optional sentence period and
+/// spaces — the "no further clause" shape.
+fn is_bare_sentence_end(text: &str) -> bool {
+    all_consuming(terminated(opt(tag::<_, _, OracleError<'_>>(".")), space0))
+        .parse(text)
+        .is_ok()
+}
+
+/// CR 118.9: Parse the alt-cost rider tail — "if you cast a spell this way,
+/// <cost>" — at the head of `trailing` (an optional sentence period may lead).
+/// The rider must also be the tail's LAST sentence, because the class's cost
+/// recognizer is a scan predicate that consumes nothing: a further sentence
+/// would be silently dropped. Pinning the opening at the head keeps untypable
+/// text (e.g. a dropped gate) from being skipped over into this branch.
+fn object_form_rider(trailing: &str) -> Option<AbilityCost> {
+    let body = opt(terminated(tag::<_, _, OracleError<'_>>("."), space0))
+        .parse(trailing)
+        .ok()
+        .map(|(rest, _)| rest)?;
+    let mut rider_anchor = alt((
+        tag::<_, _, OracleError<'_>>("if you cast a spell this way"),
+        tag("if you cast it this way"),
+    ));
+    if rider_anchor.parse(body).is_err() {
+        return None;
+    }
+    let body = body.trim();
+    if !is_terminal_sentence(body) {
+        return None;
+    }
+    super::oracle_effect::try_parse_alt_cost_rider(body)
+}
+
+/// CR 118.9: True when `text` is exactly one sentence — no period except an
+/// optional final one. The riders the class recognizes are single sentences,
+/// so a second sentence here is unmodeled text the scan-based cost recognizer
+/// would drop.
+fn is_terminal_sentence(text: &str) -> bool {
+    all_consuming(terminated(
+        take_while1::<_, _, OracleError<'_>>(|c| c != '.'),
+        opt(tag::<_, _, OracleError<'_>>(".")),
+    ))
+    .parse(text)
+    .is_ok()
 }
 
 /// CR 702.170f: Parse "You may plot [filter] cards from the top of your library"

@@ -6,9 +6,10 @@ use crate::types::ability::{
     AbilityKind, AdditionalCost, AdditionalCostInstance, AdditionalCostOrigin, AggregateFunction,
     BeholdCostAction, CastTimingPermission, Comparator, CostPaidObjectSnapshot,
     CounterCostSelection, Effect, KickerVariant, NotedManaPayment, ObjectProperty, QuantityExpr,
-    QuantityRef, ReplacementDefinition, ResolvedAbility, SacrificeCost, SacrificeRequirement,
-    SpellCastingOptionKind, SpellContext, SpellStackToGraveyardReplacement, StaticCondition,
-    TapCreaturesSelectionMode, TargetFilter, ThisWayCause, TypeFilter, TypedFilter, EXILE_COST_X,
+    QuantityRef, ReplacementDefinition, ResolutionCastCleanup, ResolvedAbility, SacrificeCost,
+    SacrificeRequirement, SpellCastingOptionKind, SpellContext, SpellStackToGraveyardReplacement,
+    StaticCondition, TapCreaturesSelectionMode, TargetFilter, TargetRef, ThisWayCause, TypeFilter,
+    TypedFilter, EXILE_COST_X,
 };
 use crate::types::card_type::CoreType;
 use crate::types::events::{GameEvent, ManaTapState};
@@ -323,6 +324,16 @@ pub(crate) fn additional_cost_declaration_is_offerable(
     pending: &PendingCast,
     cost: AbilityCost,
 ) -> Result<bool, EngineError> {
+    // CR 601.2h: "Unpayable costs can't be paid." A cost the parser could not
+    // read has no payment procedure at all, so it can never be declared — a
+    // required one makes the cast illegal (CR 601.2 + CR 733.1), and an optional
+    // one is simply never offered. `AbilityCost::is_payable` deliberately answers
+    // true for `Unimplemented` so unrelated fallback paths stay ungated (see the
+    // comment on that arm in `cost_payability.rs`), so the refusal belongs here,
+    // at the declaration authority, rather than in that shared predicate.
+    if matches!(cost, AbilityCost::Unimplemented { .. }) {
+        return Ok(false);
+    }
     let exile_this_way_cost = is_exile_any_number_effect_cost(&cost);
     let split = split_declared_mana_addition_and_residual(state, pending, cost)?;
     if let Some(residual) = split.residual.as_ref() {
@@ -2573,25 +2584,7 @@ pub(crate) fn resume_interrupted_cost_payment(
     finish_pending_cost_or_cast(state, player, pending, events)
 }
 
-fn replace_first_one_of_cost(cost: &mut AbilityCost, chosen: AbilityCost) -> bool {
-    match cost {
-        AbilityCost::OneOf { .. } => {
-            *cost = chosen;
-            true
-        }
-        AbilityCost::Composite { costs } => {
-            for cost in costs {
-                if replace_first_one_of_cost(cost, chosen.clone()) {
-                    return true;
-                }
-            }
-            false
-        }
-        _ => false,
-    }
-}
-
-/// CR 118.12a + CR 602.2b: Complete disjunctive activation-cost branch selection.
+/// CR 601.2h + CR 602.2b: Complete disjunctive activation-cost branch selection.
 pub(crate) fn handle_activation_cost_one_of_choice(
     state: &mut GameState,
     player: PlayerId,
@@ -2608,27 +2601,22 @@ pub(crate) fn handle_activation_cost_one_of_choice(
     }
 
     let chosen_cost = &costs[index];
-    if !super::casting::can_pay_ability_cost_now(
-        state,
-        player,
-        pending.object_id,
-        chosen_cost,
-        pending.activation_ability_index,
-    ) {
+    if !super::casting::activation_one_of_branch_payable(state, player, &pending, chosen_cost) {
         return Err(EngineError::ActionNotAllowed(
             "Chosen cost branch is not payable".to_string(),
         ));
     }
 
-    let replaced = pending
+    let Some(resolved) = pending
         .activation_cost
-        .as_mut()
-        .is_some_and(|cost| replace_first_one_of_cost(cost, chosen_cost.clone()));
-    if !replaced {
+        .as_ref()
+        .and_then(|cost| cost.resolve_first_one_of(chosen_cost))
+    else {
         return Err(EngineError::InvalidAction(
             "Pending activation cost no longer has a OneOf branch".to_string(),
         ));
-    }
+    };
+    pending.activation_cost = Some(resolved);
 
     if let Some(waiting_for) =
         surface_next_unpaid_interactive_activation_cost(state, player, &mut pending, events)?
@@ -5362,6 +5350,7 @@ pub(crate) fn surface_next_unpaid_interactive_activation_cost(
             state,
             player,
             source_id,
+            cost,
             costs,
             pending
                 .activation_ability_index
@@ -7027,6 +7016,18 @@ pub(super) fn check_additional_cost_or_pay_with_distribute(
                 pending.cast_timing_permission = cast_timing_permission;
                 pending.origin_zone = origin_zone;
                 pending.payment_mode = payment_mode;
+                // CR 601.2f + CR 601.2h: a required additional cost the parser
+                // could not read is part of the total cost and has no payment
+                // procedure, so the cast is illegal. Refused here rather than by
+                // the generic check below only so the message names the cost, in
+                // the wording the activation-cost sibling in `costs.rs` and the
+                // payment-step backstop below both use.
+                if let AbilityCost::Unimplemented { description } = req_cost {
+                    super::casting::handle_cancel_cast(state, &pending, events);
+                    return Err(EngineError::ActionNotAllowed(format!(
+                        "Cost not implemented: {description}"
+                    )));
+                }
                 // CR 601.2b + CR 601.2f: Required additional cost whose
                 // residual object choice is unavailable or whose declared mana
                 // total is unaffordable makes the spell uncastable.
@@ -8490,6 +8491,39 @@ fn pay_additional_cost_with_source(
                 },
             });
         }
+        AbilityCost::Unimplemented { description } => {
+            // CR 601.2f + CR 601.2h: an additional cost the parser could not read
+            // is part of the total cost and cannot be paid, so the payment step
+            // must refuse it. Without this arm it falls into the catch-all below,
+            // which does nothing and then continues to `finish_pending_cost_or_cast`
+            // — i.e. the unpayable cost is silently declared PAID and the spell is
+            // cast for free.
+            //
+            // BACKSTOP, AND DELIBERATELY UNCOVERED BY TEST. Every path a shipping
+            // card takes today is already refused upstream — enumeration by
+            // `can_cast_prepared_now_with_probe`, declaration by
+            // `additional_cost_declaration_is_offerable`, and a directly submitted
+            // announcement by the `Required` arm of
+            // `check_additional_cost_or_pay_with_distribute`. Deleting this arm
+            // breaks no test, and that is expected rather than a gap in the suite.
+            //
+            // It is not dead code: the `AdditionalCost::Required` arm of the
+            // additional-cost QUEUE walk calls this function directly, without
+            // re-consulting the offerable gate. No corpus card puts a
+            // `Required(Unimplemented)` on that queue today — a card's own single
+            // additional cost travels via `additional_cost_flow` — so the path is
+            // reachable in principle and unreached in practice. Removing the arm
+            // to satisfy coverage would restore the silent-satisfaction hole for
+            // the first card that does queue one.
+            //
+            // The wording matches the activation-cost sibling in `costs.rs`, which
+            // has always refused here (CR 602.2b extends CR 601.2h to an
+            // activation cost).
+            super::casting::handle_cancel_cast(state, &pending, events);
+            return Err(EngineError::ActionNotAllowed(format!(
+                "Cost not implemented: {description}"
+            )));
+        }
         _ => {
             // Other cost types (Exile, etc.) — not yet interactive
         }
@@ -9853,7 +9887,7 @@ fn finalize_cast_pre_payment_checks(
             resulting_mv,
             casting_permission_index,
             events,
-        ) {
+        )? {
             CascadeCheck::NotApplicable => None,
             CascadeCheck::Accepted {
                 cast_transformed,
@@ -9862,20 +9896,9 @@ fn finalize_cast_pre_payment_checks(
                 resolution_success_waiting_for = waiting_for.map(|wf| *wf);
                 Some(cast_transformed)
             }
-            CascadeCheck::Rejected {
-                source_id,
-                exiled_misses,
-                reject_action,
-            } => {
-                let waiting_for = handle_resolution_cast_rejection(
-                    state,
-                    player,
-                    object_id,
-                    source_id,
-                    exiled_misses,
-                    reject_action,
-                    events,
-                )?;
+            CascadeCheck::Rejected { cleanup } => {
+                let waiting_for =
+                    handle_resolution_cast_rejection(state, player, object_id, *cleanup, events)?;
                 return Ok(FinalizePrePaymentChecks {
                     early_waiting_for: Some(waiting_for),
                     cascade_cast_transformed: false,
@@ -10192,6 +10215,19 @@ fn finalize_cast_with_phyrexian_choices_inner(
     ability.context.cast_from_zone = Some(source_zone);
     ability.context.cast_controller = Some(player);
     ability.context.cast_phase = Some(state.phase);
+    // CR 601.2c + CR 608.2c: latch the declared object targets so a nested
+    // sub-ability — whose own `targets` may hold a resolution-chosen recipient
+    // instead — can still name the spell's own target with
+    // `ObjectScope::ChainRootTarget` ("If that artifact had counters on it, put
+    // that many … on an artifact you control"). Runs after target selection and
+    // before resolution, so `set_context_recursive` and every later
+    // `apply_parent_chain_context` carry it down the chain.
+    ability.context.chain_root_targets = ability
+        .targets
+        .iter()
+        .filter(|target| matches!(target, TargetRef::Object(_)))
+        .cloned()
+        .collect();
     stamp_controller_controlled_as_cast(state, &mut ability, player, object_id);
 
     // CR 107.3m: Stash the paid X value directly on the permanent so replacement
@@ -10862,9 +10898,9 @@ enum CascadeCheck {
     /// `handle_resolution_cast_rejection`, which sends the hit to its
     /// `reject_action` destination.
     Rejected {
-        source_id: ObjectId,
-        exiled_misses: Vec<ObjectId>,
-        reject_action: crate::types::ability::ResolutionMvRejectAction,
+        /// Rejection is infrequent and the cleanup payload carries the frozen
+        /// authority; keep it indirect so the common outcome stays compact.
+        cleanup: Box<ResolutionCastCleanup>,
     },
 }
 
@@ -10890,7 +10926,7 @@ fn evaluate_cascade_constraint_with_resulting_mv(
     resulting_mv: u32,
     casting_permission_index: Option<CastingPermissionIndex>,
     events: &mut Vec<GameEvent>,
-) -> CascadeCheck {
+) -> Result<CascadeCheck, EngineError> {
     use crate::types::ability::CastingPermission;
 
     let index = match state.objects.get(&object_id) {
@@ -10903,7 +10939,7 @@ fn evaluate_cascade_constraint_with_resulting_mv(
                             state, obj, player, p, None,
                         )
                     }) else {
-                        return CascadeCheck::NotApplicable;
+                        return Ok(CascadeCheck::NotApplicable);
                     };
                     index
                 }
@@ -10918,11 +10954,11 @@ fn evaluate_cascade_constraint_with_resulting_mv(
                 _ => None,
             }
         }
-        None => return CascadeCheck::NotApplicable,
+        None => return Ok(CascadeCheck::NotApplicable),
     };
     let index = match index {
         Some(i) => i,
-        None => return CascadeCheck::NotApplicable,
+        None => return Ok(CascadeCheck::NotApplicable),
     };
 
     let permission = state
@@ -10960,18 +10996,29 @@ fn evaluate_cascade_constraint_with_resulting_mv(
         Some(resulting_mv),
     );
 
+    // This permission can be rehomed into a normal-cost manual payment or
+    // removed on rejection. Validate its immutable cleanup authority before
+    // either mutation so forged receipts cannot alter permissions, objects, or
+    // the parent resolution state.
+    super::engine_resolution_choices::validate_resolution_cast_cleanup_authority(player, &cleanup)?;
+    super::engine_resolution_choices::validate_resolution_cast_delayed_trigger_receipts(
+        state, &cleanup,
+    )?;
+
     if accepted {
         // CR 609.4b: A during-resolution PAID cast (Quistis Trepe, Tinybones the
         // Pickpocket) carries a "mana of any type can be spent to cast that spell"
         // concession on the consumed resolution permission. The CR 608.2g timing
-        // marker (`resolution_cleanup`) is consumed here, but the selected slot
-        // must remain stable through payment and finalization. Re-home a neutral
-        // `ExileWithAltCost` (no cleanup or riders, so this gate never re-fires)
+        // marker's constraint is consumed here, but the exact cleanup receipt
+        // must remain stable through payment: a later `CancelCast` still has to
+        // withdraw the offered tail trigger. Re-home a neutral
+        // `ExileWithAltCost` (no constraint, so this gate never rejects again)
         // at the same index. Its optional CR 609.4b concession remains available
         // to the real mana payment below (`finalize_cast` →
         // `pay_mana_cost_with_choices`), while a no-concession cast cannot shift
         // a sibling permission into the elected slot. Normal zone-exit cleanup
         // removes the neutral entry when the spell leaves exile for the stack.
+        let cleanup_for_pending_cancel = cleanup.clone();
         if let Some(obj) = state.objects.get_mut(&object_id) {
             obj.casting_permissions[index] = CastingPermission::ExileWithAltCost {
                 cost: crate::types::mana::ManaCost::SelfManaCost,
@@ -10981,7 +11028,7 @@ fn evaluate_cascade_constraint_with_resulting_mv(
                 cast_transformed: false,
                 constraint: None,
                 granted_to,
-                resolution_cleanup: None,
+                resolution_cleanup: Some(cleanup_for_pending_cancel),
                 duration: None,
                 // CR 611.2a: no duration, so no host to bind to.
                 source_id: None,
@@ -10989,6 +11036,7 @@ fn evaluate_cascade_constraint_with_resulting_mv(
                 enters_with_counter: None,
                 enters_with_modifications: Vec::new(),
                 mana_spend_permission,
+                cast_cost_modifier: None,
             };
         }
         let waiting_for = handle_resolution_cast_success(
@@ -11002,10 +11050,10 @@ fn evaluate_cascade_constraint_with_resulting_mv(
             cleanup.success_action,
             events,
         );
-        CascadeCheck::Accepted {
+        Ok(CascadeCheck::Accepted {
             cast_transformed,
             waiting_for,
-        }
+        })
     } else {
         state
             .objects
@@ -11013,11 +11061,9 @@ fn evaluate_cascade_constraint_with_resulting_mv(
             .expect("object present above")
             .casting_permissions
             .remove(index);
-        CascadeCheck::Rejected {
-            source_id: cleanup.source_id,
-            exiled_misses: cleanup.exiled_misses,
-            reject_action: cleanup.reject_action,
-        }
+        Ok(CascadeCheck::Rejected {
+            cleanup: Box::new(cleanup),
+        })
     }
 }
 
@@ -11116,10 +11162,9 @@ fn handle_resolution_cast_success(
             controller,
             remaining_casts,
             remaining_mv_budget,
-            filter,
+            face_policy,
             zones,
             graveyard_replacement,
-            source,
             member_pool,
         } => {
             if let Some(destination) = graveyard_replacement.clone() {
@@ -11137,17 +11182,24 @@ fn handle_resolution_cast_success(
             if casts_left == Some(0) {
                 return None;
             }
+            let request = super::effects::free_cast_from_zones::free_cast_window_resolution_request(
+                controller,
+                casts_left,
+                budget_left,
+                (*face_policy).clone(),
+                zones.clone(),
+                graveyard_replacement.clone(),
+                member_pool.clone(),
+            );
             let mut candidates = crate::game::effects::free_cast_from_zones::eligible_candidates(
                 state,
-                controller,
-                source,
-                &filter,
                 &zones,
                 budget_left,
                 // CR 607.2a: the re-offer stays confined to THIS resolution's
                 // "exiled this way" batch (Plargg and Nassari) — see the
                 // window's `member_pool` docs; empty means no restriction.
                 &member_pool,
+                &request,
             );
             // CR 608.2g: Finalize runs before the chosen card is removed from
             // its origin zone; it cannot be offered again while already cast.
@@ -11161,10 +11213,9 @@ fn handle_resolution_cast_success(
                     candidates,
                     remaining_casts: casts_left,
                     remaining_mv_budget: budget_left,
-                    filter,
+                    face_policy: *face_policy,
                     zones,
                     graveyard_replacement,
-                    source,
                     member_pool,
                 },
             }))
@@ -11275,12 +11326,19 @@ fn handle_resolution_cast_rejection(
     state: &mut GameState,
     player: PlayerId,
     object_id: ObjectId,
-    source_id: ObjectId,
-    exiled_misses: Vec<ObjectId>,
-    reject_action: crate::types::ability::ResolutionMvRejectAction,
+    cleanup: ResolutionCastCleanup,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
     use crate::types::ability::ResolutionMvRejectAction;
+
+    super::engine_resolution_choices::validate_resolution_cast_cleanup_authority(player, &cleanup)?;
+    super::engine_resolution_choices::withdraw_resolution_cast_delayed_triggers(state, &cleanup)?;
+    let ResolutionCastCleanup {
+        source_id,
+        exiled_misses,
+        reject_action,
+        ..
+    } = cleanup;
 
     // CR 601.2a: Remove the announcement-time stack entry. The spell never
     // finishes entering the stack because we abort before the Hand→Stack
@@ -13456,6 +13514,12 @@ fn finalize_mana_payment_with_resume(
     // a later spend.)
     state.active_payment_pins = pending.pinned_pool_units.clone();
     state.active_casting_permission_index = pending.casting_permission_index;
+    let spend_only_on_x_count = state
+        .objects
+        .get(&pending.object_id)
+        .map(|obj| super::casting::compute_spend_only_on_x_generic_count(state, obj, &pending))
+        .unwrap_or(0);
+    state.active_spend_only_on_x_count = Some((pending.object_id, spend_only_on_x_count));
     let finalize_result = (|| -> Result<WaitingFor, EngineError> {
         // CR 702.132a + CR 601.2h: payment has reached the Assist contribution;
         // helper resources begin changing only inside this final payment step.
@@ -13802,6 +13866,7 @@ fn finalize_mana_payment_with_resume(
     // CR 118.3a: the transient is self-contained — cleared on Ok and Err alike.
     state.active_payment_pins.clear();
     state.active_casting_permission_index = None;
+    state.active_spend_only_on_x_count = None;
     match finalize_result {
         Ok(waiting_for) => Ok(waiting_for),
         Err(err) if is_abandoned_cast_finalization(&err) => Err(err),
@@ -13880,6 +13945,12 @@ pub fn finalize_mana_payment_with_phyrexian_choices(
     // empty outside an in-progress finalize spend".
     state.active_payment_pins = pending.pinned_pool_units.clone();
     state.active_casting_permission_index = pending.casting_permission_index;
+    let spend_only_on_x_count = state
+        .objects
+        .get(&pending.object_id)
+        .map(|obj| super::casting::compute_spend_only_on_x_generic_count(state, obj, &pending))
+        .unwrap_or(0);
+    state.active_spend_only_on_x_count = Some((pending.object_id, spend_only_on_x_count));
     let finalize_result = (|| -> Result<WaitingFor, EngineError> {
         // CR 702.132a + CR 601.2h: payment has reached the Assist contribution;
         // helper resources begin changing only inside this final payment step.
@@ -14237,6 +14308,7 @@ pub fn finalize_mana_payment_with_phyrexian_choices(
     // CR 118.3a: the transient is self-contained — cleared on Ok and Err alike.
     state.active_payment_pins.clear();
     state.active_casting_permission_index = None;
+    state.active_spend_only_on_x_count = None;
     match finalize_result {
         Ok(waiting_for) => Ok(waiting_for),
         Err(err) if is_abandoned_cast_finalization(&err) => Err(err),
@@ -14648,6 +14720,7 @@ mod tests {
             token: DelayedTriggerToken(token),
             instance: DelayedTriggerInstanceId(token),
             source_id,
+            offer_id: None,
         }
     }
 
@@ -20229,9 +20302,22 @@ mod tests {
                     granted_to: None,
                     resolution_cleanup: Some(ResolutionCastCleanup {
                         source_id: hit,
+                        offer_id: None,
+                        face_policy: crate::types::ability::ResolutionCastFacePolicy::new(
+                            crate::types::ability::TargetFilter::Any,
+                            hit,
+                            PlayerId(0),
+                            Some(CastPermissionConstraint::ManaValue {
+                                comparator: Comparator::LT,
+                                value: QuantityExpr::Fixed {
+                                    value: source_mv as i32,
+                                },
+                            }),
+                        ),
                         exiled_misses: vec![miss_a, miss_b],
                         reject_action: ResolutionMvRejectAction::BottomWithMisses,
                         success_action: ResolutionCastSuccessAction::BottomMisses,
+                        delayed_trigger_receipts: Vec::new(),
                     }),
                     duration: None,
 
@@ -20239,6 +20325,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
 
             (state, hit, vec![miss_a, miss_b])
@@ -20286,7 +20373,8 @@ mod tests {
                 resulting_mv,
                 Some(CastingPermissionIndex(0)),
                 &mut events,
-            );
+            )
+            .expect("constraint evaluation must succeed");
             assert!(matches!(
                 outcome,
                 CascadeCheck::Accepted {
@@ -20300,7 +20388,7 @@ mod tests {
                 matches!(
                     hit_obj.casting_permissions.as_slice(),
                     [CastingPermission::ExileWithAltCost {
-                        resolution_cleanup: None,
+                        resolution_cleanup: Some(_),
                         mana_spend_permission: None,
                         graveyard_replacement: None,
                         enters_with_counter: None,
@@ -20308,7 +20396,7 @@ mod tests {
                         ..
                     }] if enters_with_modifications.is_empty()
                 ),
-                "the consumed cascade permission must retain a neutral stable slot"
+                "the consumed cascade permission must retain its cleanup receipt for cancellation"
             );
 
             for miss in &misses {
@@ -20345,11 +20433,19 @@ mod tests {
                     granted_to: Some(PlayerId(0)),
                     resolution_cleanup: Some(ResolutionCastCleanup {
                         source_id: hit,
+                        offer_id: None,
+                        face_policy: crate::types::ability::ResolutionCastFacePolicy::new(
+                            crate::types::ability::TargetFilter::Any,
+                            hit,
+                            PlayerId(0),
+                            None,
+                        ),
                         exiled_misses: vec![miss],
                         reject_action: ResolutionMvRejectAction::BottomWithMisses,
                         success_action: ResolutionCastSuccessAction::RippleOfferRemaining {
                             remaining_hits: vec![next_hit],
                         },
+                        delayed_trigger_receipts: Vec::new(),
                     }),
                     duration: None,
 
@@ -20357,6 +20453,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
 
             let outcome = evaluate_cascade_constraint_with_resulting_mv(
@@ -20366,7 +20463,8 @@ mod tests {
                 2,
                 Some(CastingPermissionIndex(0)),
                 &mut Vec::new(),
-            );
+            )
+            .expect("constraint evaluation must succeed");
 
             match outcome {
                 CascadeCheck::Accepted {
@@ -20418,11 +20516,19 @@ mod tests {
                     granted_to: Some(PlayerId(0)),
                     resolution_cleanup: Some(ResolutionCastCleanup {
                         source_id: hit,
+                        offer_id: None,
+                        face_policy: crate::types::ability::ResolutionCastFacePolicy::new(
+                            crate::types::ability::TargetFilter::Any,
+                            hit,
+                            PlayerId(0),
+                            None,
+                        ),
                         exiled_misses: vec![miss],
                         reject_action: ResolutionMvRejectAction::BottomWithMisses,
                         success_action: ResolutionCastSuccessAction::RippleOfferRemaining {
                             remaining_hits: vec![],
                         },
+                        delayed_trigger_receipts: Vec::new(),
                     }),
                     duration: None,
 
@@ -20430,6 +20536,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
 
             let outcome = evaluate_cascade_constraint_with_resulting_mv(
@@ -20439,7 +20546,8 @@ mod tests {
                 2,
                 Some(CastingPermissionIndex(0)),
                 &mut Vec::new(),
-            );
+            )
+            .expect("constraint evaluation must succeed");
 
             assert!(matches!(
                 outcome,
@@ -20479,6 +20587,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
             push_announcement_stack_entry(&mut state, hit);
 
@@ -20538,6 +20647,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
             hit_obj
                 .casting_permissions
@@ -20555,6 +20665,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
             push_announcement_stack_entry(&mut state, hit);
 
@@ -20606,6 +20717,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
             state.players[0].mana_pool.add(ManaUnit {
                 color: ManaType::Colorless,
@@ -20677,6 +20789,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
             hit_obj
                 .casting_permissions
@@ -20692,9 +20805,20 @@ mod tests {
                     granted_to: Some(PlayerId(0)),
                     resolution_cleanup: Some(ResolutionCastCleanup {
                         source_id: hit,
+                        offer_id: None,
+                        face_policy: crate::types::ability::ResolutionCastFacePolicy::new(
+                            crate::types::ability::TargetFilter::Any,
+                            hit,
+                            PlayerId(0),
+                            Some(CastPermissionConstraint::ManaValue {
+                                comparator: Comparator::LT,
+                                value: QuantityExpr::Fixed { value: 10 },
+                            }),
+                        ),
                         exiled_misses: vec![miss],
                         reject_action: ResolutionMvRejectAction::BottomWithMisses,
                         success_action: ResolutionCastSuccessAction::BottomMisses,
+                        delayed_trigger_receipts: Vec::new(),
                     }),
                     duration: None,
 
@@ -20702,6 +20826,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
             push_announcement_stack_entry(&mut state, hit);
 
@@ -20752,9 +20877,20 @@ mod tests {
                     granted_to: Some(PlayerId(1)),
                     resolution_cleanup: Some(ResolutionCastCleanup {
                         source_id: hit,
+                        offer_id: None,
+                        face_policy: crate::types::ability::ResolutionCastFacePolicy::new(
+                            crate::types::ability::TargetFilter::Any,
+                            hit,
+                            PlayerId(1),
+                            Some(CastPermissionConstraint::ManaValue {
+                                comparator: Comparator::LT,
+                                value: QuantityExpr::Fixed { value: 1 },
+                            }),
+                        ),
                         exiled_misses: vec![miss],
                         reject_action: ResolutionMvRejectAction::BottomWithMisses,
                         success_action: ResolutionCastSuccessAction::BottomMisses,
+                        delayed_trigger_receipts: Vec::new(),
                     }),
                     duration: None,
 
@@ -20762,6 +20898,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
             hit_obj
                 .casting_permissions
@@ -20779,6 +20916,7 @@ mod tests {
                     enters_with_counter: None,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
             push_announcement_stack_entry(&mut state, hit);
 
@@ -20826,10 +20964,11 @@ mod tests {
                 resulting_mv,
                 Some(CastingPermissionIndex(0)),
                 &mut events,
-            );
+            )
+            .expect("constraint evaluation must succeed");
             match outcome {
-                CascadeCheck::Rejected { exiled_misses, .. } => {
-                    assert_eq!(exiled_misses, misses);
+                CascadeCheck::Rejected { cleanup } => {
+                    assert_eq!(cleanup.exiled_misses, misses);
                 }
                 other => panic!("Expected Rejected, got {:?}", matches_name(&other)),
             }
@@ -20865,7 +21004,8 @@ mod tests {
                 resulting_mv,
                 Some(CastingPermissionIndex(0)),
                 &mut events,
-            );
+            )
+            .expect("constraint evaluation must succeed");
             assert!(matches!(outcome, CascadeCheck::Rejected { .. }));
         }
 
@@ -20894,9 +21034,20 @@ mod tests {
                 &mut state,
                 PlayerId(0),
                 hit,
-                hit,
-                misses.clone(),
-                ResolutionMvRejectAction::BottomWithMisses,
+                ResolutionCastCleanup {
+                    source_id: hit,
+                    offer_id: None,
+                    face_policy: crate::types::ability::ResolutionCastFacePolicy::new(
+                        crate::types::ability::TargetFilter::Any,
+                        hit,
+                        PlayerId(0),
+                        None,
+                    ),
+                    exiled_misses: misses.clone(),
+                    reject_action: ResolutionMvRejectAction::BottomWithMisses,
+                    success_action: ResolutionCastSuccessAction::BottomMisses,
+                    delayed_trigger_receipts: Vec::new(),
+                },
                 &mut events,
             )
             .expect("rejection handler must succeed");
@@ -22938,6 +23089,14 @@ its replicate cost was paid.)\nDraw a card.";
         builder.from_oracle_text_with_keywords(&["replicate:{1}"], REPLICATE_DRAW_ORACLE);
         let spell_id = builder.id();
         let card_id = scenario.state.objects[&spell_id].card_id;
+        // CR 104.3c: stock the library so the copies' draws cannot deck the
+        // caster out mid-drain. A game that ends partway through resolution
+        // truncates `drain_counting_spell_copies`, which would hide an
+        // over-copying regression behind a correct-looking tally.
+        scenario.with_library_top(
+            PlayerId(0),
+            &["Filler A", "Filler B", "Filler C", "Filler D"],
+        );
         let runner = scenario.build();
         (runner, spell_id, card_id)
     }
@@ -22973,6 +23132,12 @@ its replicate cost was paid.)\nDraw a card.";
         builder.from_oracle_text("Draw a card.");
         let spell_id = builder.id();
         let card_id = scenario.state.objects[&spell_id].card_id;
+        // CR 104.3c: see `replicate_draw_scenario` — the library keeps the game
+        // alive through the whole drain so the copy tally cannot be truncated.
+        scenario.with_library_top(
+            PlayerId(0),
+            &["Filler A", "Filler B", "Filler C", "Filler D"],
+        );
         let runner = scenario.build();
         (runner, spell_id, card_id)
     }
@@ -22980,27 +23145,29 @@ its replicate cost was paid.)\nDraw a card.";
     /// Count `SpellCopied` events emitted while resolving the stack to empty.
     /// Each `Effect::CopySpell` iteration emits exactly one (CR 707.10), so the
     /// total equals the number of replicate copies created.
+    ///
+    /// Strict by design. Swallowing an `Err` (or leaving the stack unresolved)
+    /// stops the tally early, and an early stop reads as a LOWER copy count —
+    /// which is exactly the direction an over-copying regression needs in order
+    /// to look correct. Both replicate scenarios stock a library so the copied
+    /// draws cannot end the game mid-drain and reach these guards.
     fn drain_counting_spell_copies(runner: &mut crate::game::scenario::GameRunner) -> usize {
         use crate::types::actions::GameAction;
         let mut copies = 0usize;
         for _ in 0..40 {
             if runner.state().stack.is_empty() {
-                break;
+                return copies;
             }
-            match runner.act(GameAction::PassPriority) {
-                Ok(result) => {
-                    copies += result
-                        .events
-                        .iter()
-                        .filter(|e| {
-                            matches!(e, crate::types::events::GameEvent::SpellCopied { .. })
-                        })
-                        .count();
-                }
-                Err(_) => break,
-            }
+            let result = runner
+                .act(GameAction::PassPriority)
+                .expect("resolving the replicate stack must not error mid-drain");
+            copies += result
+                .events
+                .iter()
+                .filter(|e| matches!(e, crate::types::events::GameEvent::SpellCopied { .. }))
+                .count();
         }
-        copies
+        panic!("replicate stack never resolved to empty; the copy tally is not trustworthy");
     }
 
     /// CR 702.56a: Replicate paid twice copies the spell twice — two extra
@@ -24789,6 +24956,7 @@ its replicate cost was paid.)\nDraw a card.";
                 granted_to: Some(PlayerId(0)),
                 duration: None,
                 source_id: None,
+                cast_cost_modifier: None,
             });
 
         let ability = ResolvedAbility::new(

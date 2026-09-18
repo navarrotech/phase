@@ -196,11 +196,22 @@ export type WishOutsideGameScope = "PostM10SideboardOnly" | "PreM10ReachesExile"
  *  all-controllers form. Schema only — unenforced. */
 export type LegendRuleScope = "Modern" | "PreM14AnyController";
 
+/** CR 407: whether the format is played for ante. `Excluded` is the modern
+ *  default and the only value the engine implements; unlike its sibling axes
+ *  it is enforced, at deck construction (CR 407.3). */
+export type AntePolicy = "Excluded" | "Enabled";
+
 export interface LegacyRuleSet {
   mana_burn: ManaBurnPolicy;
   damage_timing: CombatDamageTiming;
   wish_scope: WishOutsideGameScope;
   legend_rule_scope: LegendRuleScope;
+  /** Optional because this axis postdates the Axis-A save path: a definition
+   *  persisted before it existed carries no `ante` key. Mirrors the engine's
+   *  `#[serde(default)]` on the same field, where absent likewise means
+   *  `"Excluded"` — which is what such a save meant. The engine always emits
+   *  it, so only a locally-persisted definition can be missing it. */
+  ante?: AntePolicy;
 }
 
 /** CR 903.3 and the Tiny Leaders / Oathbreaker / Brawl deck-construction
@@ -244,6 +255,10 @@ export interface StructuralRules {
 /** `legal_sets: null` means unrestricted; a list restricts to exactly it. */
 export interface LegalityRules {
   legal_sets: SetCode[] | null;
+  /** Cards legal regardless of `legal_sets`, unioned with it — a ruleset can
+   *  name a card its set list cannot express. Optional because it postdates
+   *  the Axis-A save path; absent means an empty list. */
+  legal_cards?: string[];
   banned: string[];
   restricted: string[];
   legacy: LegacyRuleSet;
@@ -435,7 +450,12 @@ export interface LobbyGame {
 export interface DraftLobbyMetadata {
   /** Three-letter set code (e.g. "MKM", "OTJ"). For cube drafts, "custom-cube". */
   setCode: string;
-  /** Draft kind: "Quick", "Premier", or "Traditional". */
+  /**
+   * Draft kind, as the serialized name of a `DraftKind`. Deliberately not
+   * enumerated here: `DRAFT_KINDS` in `adapter/draft-adapter.ts` is the single
+   * authority, and a second enumeration in a doc comment goes stale silently
+   * (this one already had, naming three of the then-five kinds).
+   */
   draftKind: string;
   /** Human-readable cube name when the pod is a cube draft. Absent for set drafts. */
   cubeName?: string;
@@ -550,8 +570,14 @@ export type OutsideGameChoiceSource =
   | { type: "FaceUpExile"; data: { object_id: ObjectId } }
   | {
       type: "BoosterPack";
-      data: { pack_slot: number; set_code: string; card: CardFacePartial };
+      data: { pack_slot: number; origin: PackOrigin; card: CardFacePartial };
     };
+
+/**
+ * Where an opened booster pack came from, for display. Mirrors Rust
+ * `PackOrigin` (engine `types/game_state.rs`).
+ */
+export type PackOrigin = { type: "Set"; data: string } | { type: "Cube" };
 
 export interface OutsideGameChoiceEntry {
   source: OutsideGameChoiceSource;
@@ -679,7 +705,12 @@ export type Zone =
 export type LibraryPosition =
   | { type: "Top" }
   | { type: "Bottom" }
-  | { type: "NthFromTop"; n: number };
+  | { type: "NthFromTop"; n: number }
+  // Engine QuantityExpr values are resolved only by the engine. Keep these
+  // dynamic library positions wire-exact without making the presentation layer
+  // a second quantity evaluator.
+  | { type: "BeneathTop"; depth: Record<string, unknown> }
+  | { type: "RandomWithinTop"; n: Record<string, unknown> };
 
 export type SearchOrderingHint = "Unordered" | "OrderedToLibraryTop";
 
@@ -1008,8 +1039,11 @@ export type CastingVariant =
   | { type: "Freerunning" }
   | { type: "Fuse" };
 
+export type CastingVariantFace = "Current" | "Left" | "Right";
+
 export interface CastingVariantChoiceOption {
   variant: CastingVariant;
+  face: CastingVariantFace;
   mana_cost: ManaCost;
 }
 
@@ -1225,10 +1259,75 @@ export interface DecisionGroupKey {
 
 // ── Casting Permission ───────────────────────────────────────────────────
 
+export interface ResolutionCastFacePolicy {
+  /** Normalized engine filter, preserved verbatim across resolution pauses. */
+  filter: TargetFilter;
+  /** Real resolving source used for source-relative filter evaluation. */
+  source_id: ObjectId;
+  /** Real controller of that resolving source. */
+  controller: PlayerId;
+  /** Fixed cast-time constraint; null is the explicit no-extra-constraint form. */
+  constraint: Record<string, unknown> | null;
+}
+
+/** Opaque identity for a delayed trigger installed by a resolution cast offer. */
+export interface ResolutionCastDelayedTriggerReceipt {
+  token: number;
+  instance: number;
+  source_id: ObjectId;
+}
+
+export interface ResolutionCastCleanup {
+  source_id: ObjectId;
+  face_policy: ResolutionCastFacePolicy;
+  exiled_misses: ObjectId[];
+  reject_action: Record<string, unknown>;
+  success_action: Record<string, unknown>;
+  /** Absent for legacy and empty cleanup payloads. */
+  delayed_trigger_receipts?: ResolutionCastDelayedTriggerReceipt[];
+}
+
+export type CastCostModifier = {
+  /** CR 601.2f: direction only — the engine never serializes a `Minimum`
+   *  here; a cost floor is a board-wide static, not a per-grant rider. */
+  mode: "Raise" | "Reduce";
+  amount: ManaCost;
+};
+
 export type CastingPermission =
   | { type: "AdventureCreature" }
-  | { type: "ExileWithAltCost"; cost: ManaCost }
-  | { type: "PlayFromExile"; duration: string }
+  | {
+      type: "ExileWithAltCost";
+      cost: ManaCost;
+      resolution_cleanup?: ResolutionCastCleanup;
+      /** CR 601.2f: "Spells you cast this way cost {N} more/less to cast."
+       *  Absent when the grant carries no such rider. Display only — the
+       *  engine has already applied it to every cost it reports. */
+      cast_cost_modifier?: CastCostModifier;
+    }
+  | {
+      /** Non-mana alternative cost carried by the same exile-cast grant. */
+      type: "ExileWithAltAbilityCost";
+      cost: SerializedAbilityCost;
+      /** Optional engine-enforced condition for using this grant. */
+      constraint?: Record<string, unknown>;
+      /** Player to whom the engine granted this permission. */
+      granted_to?: PlayerId;
+      /** Grant lifetime; unit variants serialize as strings and payload variants as objects. */
+      duration?: string | Record<string, unknown>;
+      /** Source whose identity can bound the grant's duration. */
+      source_id?: ObjectId;
+      /** CR 601.2f: see `ExileWithAltCost.cast_cost_modifier`. */
+      cast_cost_modifier?: CastCostModifier;
+    }
+  | {
+      type: "PlayFromExile";
+      duration: string;
+      /** CR 601.2f: see `ExileWithAltCost.cast_cost_modifier`. CR 305.1: a
+       *  land played under this same grant is never a spell and is
+       *  unaffected by it. */
+      cast_cost_modifier?: CastCostModifier;
+    }
   | { type: "ExileWithEnergyCost" }
   | { type: "WarpExile"; castable_after_turn: number };
 
@@ -1587,30 +1686,40 @@ export interface CopyEffectInstanceRef {
   modification_index: number;
 }
 
+export interface TriggerPrintedOrigin {
+  printed_ref: PrintedCardRef;
+  printed_occurrence: number;
+}
+
 export type TriggerDefinitionOccurrenceRef =
-  | { Printed: { base_set: number; printed_index: number } }
+  | { type: "Printed"; data: { base_set: number; printed_index: number } }
   | {
-      CopiedValue: {
+      type: "CopiedValue";
+      data: {
         copy_effect: CopyEffectInstanceRef;
         copied_slot: number;
+        printed_origin?: TriggerPrintedOrigin;
       };
     }
   | {
-      KeywordCompanion: {
+      type: "KeywordCompanion";
+      data: {
         grant_instance: number;
         companion_index: number;
       };
     }
   | {
-      CopyRetained: {
+      type: "CopyRetained";
+      data: {
         grant_instance: number;
         source_base_set: number;
         source_printed_index: number;
       };
     }
-  | { Granted: { grant_instance: number } }
+  | { type: "Granted"; data: { grant_instance: number } }
   | {
-      ExpandedGrant: {
+      type: "ExpandedGrant";
+      data: {
         grant_instance: number;
         provider: TriggerDefinitionRef;
         provider_output_index: number;
@@ -2050,6 +2159,12 @@ export type AlternativeAdditionalCostDescription = {
 
 export type OpeningHandBottomReason = { type: "TinyLeadersMultiCommander" };
 
+/** Mirrors engine `SpellStackToGraveyardReplacement` on a paid cast offer. */
+export type SpellStackToGraveyardReplacement =
+  | { type: "Exile" }
+  | { type: "Library"; position: LibraryPosition }
+  | { type: "Hand" };
+
 export type CastOfferKind =
   | { type: "Adventure"; object_id: ObjectId; card_id: CardId; payment_mode?: CastPaymentMode }
   | { type: "Miracle"; object_id: ObjectId; cost: ManaCost }
@@ -2066,6 +2181,15 @@ export type CastOfferKind =
       // copy is fixed — but carried to mirror the serialized shape.
       mana_spend_permission?: "AnyTypeOrColor" | "AnyColor";
       cast_transformed?: boolean;
+      // CR 601.2b: an additional mana cost the grant attaches to this cast
+      // ("by paying {R}{R} in addition to its other costs", Ogre Battlecaster).
+      // Absent for every other paid offer.
+      additional_cost?: ManaCost;
+      // CR 614.1a + CR 608.2n: optional cast-this-way redirect.
+      graveyard_replacement?: SpellStackToGraveyardReplacement;
+      // Frozen resolution authority, including receipts to withdraw if the
+      // accepted offer never becomes a cast.
+      cleanup: ResolutionCastCleanup;
     }
   | {
       type: "FreeCastWindow";
@@ -2075,12 +2199,10 @@ export type CastOfferKind =
       // `None` omits the key rather than sending a sentinel cap.
       remaining_casts?: number;
       remaining_mv_budget?: number;
-      filter: TargetFilter;
+      /** Required bridge carrier; old filter-only windows fail closed. */
+      face_policy: ResolutionCastFacePolicy;
       zones: Zone[];
       exile_instead_of_graveyard?: boolean;
-      // CR 406.6: source of the granting ability (engine serde-default;
-      // absent in payloads predating the field).
-      source?: ObjectId;
       // CR 607.2a: THIS resolution's "exiled this way" batch (Plargg and
       // Nassari); omitted when empty (no batch restriction). Display-only
       // pass-through — the modal renders `candidates`.
@@ -2612,6 +2734,7 @@ export type DebugAction =
         attach_to?: AttachTarget;
         run_etb: boolean;
         nonlegendary: boolean;
+        creation_kind: "Card" | "Token";
         count: number;
       };
     }
@@ -3393,13 +3516,19 @@ export type DecisionSource =
  */
 export type DecisionTemplate = Record<string, unknown>;
 
-/** Mirrors `engine::analysis::loop_check::ShortcutProposal`. */
+/**
+ * Mirrors `engine::analysis::loop_check::ShortcutProposal`. `shortened_by` is the responder
+ * whose named place is the proposal's current ending point (CR 732.2b); it is `skip_serializing_if
+ * none` on the wire, so an unshortened proposal serializes exactly as before and no protocol
+ * version moves — the same posture the two optional fields this interface does not mirror ship.
+ */
 export interface ShortcutProposal {
   proposer: PlayerId;
   predicted_winner: PlayerId | null;
   count: IterationCount;
   unbounded: ResourceAxis[];
   win_kind: WinKind;
+  shortened_by?: PlayerId;
 }
 
 /**
@@ -4710,6 +4839,36 @@ export type TournamentStatus =
 export type BracketShape = "Swiss" | "SingleElimination";
 
 /**
+ * Why the broker would refuse a report for one pairing, or `"Open"` if it would
+ * not. Mirrors `lobby_broker::tournament::ReportGate` (added in lobby protocol
+ * v6), the single authority for the viewer-INDEPENDENT half of the broker's
+ * report gate — every conjunct of `TournamentManager::report_result` that does
+ * not depend on WHO is asking, carried as the REASON rather than a bare bool so
+ * a client can gate on `=== "Open"` and a new refusal arm is a compile error.
+ *
+ * `TournamentNotRunning` is the arm the outcome-only client fallback cannot
+ * see: a `Reported` pairing on a `Completed`/`Abandoned` event is not
+ * reportable, but its outcome alone still looks re-reportable. The broker
+ * checks `TournamentStatus::is_terminal` first, so consuming this field is what
+ * removes the "Report on a finished event" affordance.
+ *
+ * `Bye` and `Forfeit` are server-assigned outcomes with nothing to report;
+ * `Open` includes an already-`Reported` pairing, because re-reporting is how a
+ * mistyped tally is corrected.
+ */
+export type ReportGate = "Open" | "TournamentNotRunning" | "Bye" | "Forfeit";
+
+/**
+ * One tournament-scoped gated action, as an axis rather than sibling
+ * `can_start` / `can_end` / `can_drop` booleans. Mirrors
+ * `lobby_broker::tournament::TournamentAction` (lobby protocol v6). These are
+ * the members carried by {@link TournamentSummary.open_actions}; the set is
+ * viewer-INDEPENDENT (it rides a frame fanned to every subscriber), so a client
+ * composes it with its own credential rather than reading authority from it.
+ */
+export type TournamentAction = "StartRound" | "EndTournament" | "Drop";
+
+/**
  * The reported content of a *played* pairing. Mirrors the externally-tagged
  * `crates/lobby-broker/src/tournament.rs:336-348`. `game_wins` is keyed by
  * `player_key`, and is empty for a pod (arity > 2) because pods are single-game
@@ -4799,17 +4958,24 @@ export interface PlayerSummary {
  * `outcome` is emitted with **no** `skip_serializing_if`, so a pending pairing
  * arrives as an explicit `"outcome": null`.
  *
- * NOTE (protocol v6, client-render deferred): the wire struct now also carries
- * a required `report_gate` (broker-owned per-pairing report legality). It is
- * intentionally not mirrored here yet — the client-rendering follow-up adds the
- * field and consumes it. Received unknown fields are ignored by `JSON.parse`,
- * so omitting it is inert. The Rust line citations below predate the v6 shift.
+ * `report_gate` is REQUIRED on the v6 wire but typed OPTIONAL here on purpose:
+ * {@link MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL} stays at 2, so this client still
+ * talks to a pre-v6 broker that emits a pairing with no `report_gate` at all. A
+ * consumer treats its absence as "fall back to the outcome-only reportability
+ * heuristic" and its presence as the authority — see
+ * `isPairingReportable` in `pages/tournamentPageState.ts`.
  */
 export interface TournamentPairingView {
   id: PairingId;
   round: number;
   players: PlayerSummary[];
   outcome: PairingOutcome | null;
+  /**
+   * Broker-owned per-pairing report legality (lobby protocol v6). Absent from a
+   * pre-v6 broker's frame; a consumer degrades to the outcome-only fallback
+   * when it is `undefined`.
+   */
+  report_gate?: ReportGate;
 }
 
 /**
@@ -4826,14 +4992,35 @@ export interface TournamentPairingView {
 export type TournamentCredentialRole = "Organizer" | "Player";
 
 /**
+ * `LobbyServerMessage::TournamentCredentialRenewed`'s payload
+ * (`crates/lobby-broker/src/protocol.rs`) — the point reply to
+ * `RenewTournamentCredential`. Carries the secret the caller should hold going
+ * forward. Under lobby protocol v9 (idempotent-nonce replay) this is the newly
+ * MINTED secret when the request presented the current secret, OR — on a retry
+ * that presents the now-superseded secret with the same `rotation_nonce` — the
+ * SAME already-committed secret REPLAYED (the broker mints nothing the second
+ * time). Either way it is the one live secret; the superseded secret is not kept
+ * valid. `role` echoes which authority was rotated, and `expires_at_ms` is the
+ * expiry, measured from the mint. Never broadcast.
+ */
+export interface TournamentCredentialRenewedReply {
+  code: string;
+  role: TournamentCredentialRole;
+  token: string;
+  expires_at_ms: number;
+}
+
+/**
  * One row of the tournament list. Mirrors
  * `crates/lobby-broker/src/protocol.rs:507-528` (citation predates the v6 shift).
  *
- * NOTE (protocol v6, client-render deferred): the wire struct now also carries
- * a required `scoring` (resolved `ScoringPolicy`) and `open_actions`
- * (broker-owned set of legal tournament actions). Both are intentionally not
- * mirrored here yet — the client-rendering follow-up adds and consumes them.
- * Unknown received fields are ignored by `JSON.parse`, so omitting them is inert.
+ * `scoring` and `open_actions` are REQUIRED on the v6 wire but typed OPTIONAL
+ * here for the same reason `report_gate` is on {@link TournamentPairingView}:
+ * {@link MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL} stays at 2, so a pre-v6 broker
+ * emits a summary carrying neither. A consumer reads the resolved `scoring` when
+ * present (and never recomputes it — that duplicate is exactly what the field
+ * exists to delete), and treats an absent `open_actions` as "fall back to the
+ * credential-only gate" rather than as "no action is open".
  */
 export interface TournamentSummary {
   code: string;
@@ -4857,6 +5044,23 @@ export interface TournamentSummary {
    */
   total_rounds: number;
   created_at: number;
+  /**
+   * The RESOLVED scoring policy the event is actually scored under — the
+   * organizer's explicit choice, or the broker's `ScoringPolicy::default_for_arity`
+   * applied when `CreateTournament.scoring` was omitted (lobby protocol v6).
+   * Absent from a pre-v6 broker's frame. Render it; never recompute it.
+   */
+  scoring?: ScoringPolicy;
+  /**
+   * Which tournament-scoped gated actions the broker would currently admit from
+   * a correctly credentialed actor (lobby protocol v6). A viewer-INDEPENDENT
+   * set — the authorization conjuncts cannot ride a broadcast frame — so a
+   * client composes it with its own credential. Absent from a pre-v6 broker's
+   * frame, where a consumer degrades to the credential-only gate. Reporting is
+   * deliberately not here: its gate is pairing-scoped and lives on
+   * {@link TournamentPairingView.report_gate}.
+   */
+  open_actions?: TournamentAction[];
   /**
    * The event's game-format label (Standard, Commander, …), a display label
    * only — the tournament enforces no deck legality. Typed `| null` because the
@@ -4898,14 +5102,16 @@ export interface TournamentView {
  * (`crates/lobby-broker/src/protocol.rs:830-834`; citation predates the v6 shift).
  * A point reply only — `organizer_token` is minted here and is never broadcast.
  *
- * NOTE (protocol v6, client-render deferred): the wire payload now also carries
- * a required `expires_at_ms` beside the token (credential expiry). It is
- * intentionally not mirrored here yet — the credential-rotation client
- * follow-up adds and consumes it; the unknown field is ignored on parse.
+ * `expires_at_ms` (epoch ms) is when `organizer_token` stops being accepted. It
+ * rides the mint reply because expiry is per-holder and no broadcast frame can
+ * carry it. The credential-rotation client consumes it so a holder can renew
+ * (`RenewTournamentCredential`) before the credential lapses — an already-lapsed
+ * one is unrenewable (`crates/lobby-broker/src/tournament.rs`).
  */
 export interface TournamentCreatedReply {
   code: string;
   organizer_token: string;
+  expires_at_ms: number;
   view: TournamentView;
 }
 
@@ -4914,14 +5120,14 @@ export interface TournamentCreatedReply {
  * (`crates/lobby-broker/src/protocol.rs:837-841`; citation predates the v6 shift).
  * A point reply only — `player_token` is minted here and is never broadcast.
  *
- * NOTE (protocol v6, client-render deferred): the wire payload now also carries
- * a required `expires_at_ms` beside the token (credential expiry). It is
- * intentionally not mirrored here yet — the credential-rotation client
- * follow-up adds and consumes it; the unknown field is ignored on parse.
+ * `expires_at_ms` (epoch ms) is when `player_token` stops being accepted — same
+ * reasoning as {@link TournamentCreatedReply}'s. Consumed by the credential
+ * rotation client to renew before the entrant token lapses.
  */
 export interface TournamentJoinedReply {
   code: string;
   player_token: string;
+  expires_at_ms: number;
   view: TournamentView;
 }
 

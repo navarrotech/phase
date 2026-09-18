@@ -832,6 +832,22 @@ async function joinGuest(
 }
 
 describe("P2PHostAdapter — 3-4p multiplayer", () => {
+  it("shares host-measured latency for both guests with every participant", async () => {
+    const { adapter, emitConnection } = makeHost(3);
+    const events = vi.fn();
+    adapter.onEvent(events);
+    await adapter.initialize();
+    const first = await joinGuest(emitConnection, { type: "guest_deck", deckData: { player: { main_deck: [], sideboard: [] } } });
+    const second = await joinGuest(emitConnection, { type: "guest_deck", deckData: { player: { main_deck: [], sideboard: [] } } });
+    await first.simulateData({ type: "pong", timestamp: Date.now() - 42 });
+    await second.simulateData({ type: "pong", timestamp: Date.now() - 120 });
+    const latencies = { 0: 0, 1: 42, 2: 120 };
+    expect(events).toHaveBeenLastCalledWith({ type: "playerLatencies", latencies });
+    for (const conn of [first, second]) {
+      expect(await conn.getSentMessages()).toContainEqual(expect.objectContaining({ type: "player_latencies", latencies }));
+    }
+    adapter.dispose();
+  });
   beforeEach(() => {
     // `toFake` opt-in: keep `queueMicrotask` real so the binary wire-format
     // encode/decode chain (CompressionStream, Response.text) drives stream
@@ -1009,7 +1025,9 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
    * CMM+CLB draft that forwarded a single representative code could drop the
    * very set the grant keys on.
    */
-  it("carries the pod's draft set codes through the rebuilt payload to the engine", async () => {
+  it.each([
+    { pool: ["Cube A", "Cube A", "Undealt sentinel"] }, { pool: [] }, { pool: undefined },
+  ])("carries the pod's metadata through the rebuilt payload to the engine: $pool", async ({ pool }) => {
     const { peer, onGuestConnected } = createFakePeer();
     const adapter = new P2PHostAdapter(
       {
@@ -1017,6 +1035,7 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
         opponent: { main_deck: ["Forest"], sideboard: [] },
         ai_decks: [],
         draft_set_codes: ["CMM", "CLB"],
+        booster_pack_pool: pool,
       },
       peer as unknown as Peer,
       onGuestConnected,
@@ -1041,9 +1060,10 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
     // be read at all — the same reason `nativeWebSocketMocks.onEvent`'s
     // recorded handler is cast where it is read.
     const [payload] = mockInitializeHostGame.mock.calls[0] as unknown as [
-      { draft_set_codes?: string[] },
+      { draft_set_codes?: string[]; booster_pack_pool?: string[] },
     ];
     expect(payload.draft_set_codes).toEqual(["CMM", "CLB"]);
+    expect(payload.booster_pack_pool).toEqual(pool);
   });
 
   it("does not reinitialize the host during the lobby-to-game handoff", async () => {
@@ -1241,7 +1261,7 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
       .toBeLessThan(send.mock.invocationCallOrder[0]!);
     await vi.waitFor(async () => {
       expect((await reconnect.getSentMessages()).map((message) => (message as { type: string }).type))
-        .toEqual(["reconnect_ack", "terminal_result"]);
+        .toEqual(["reconnect_ack", "terminal_result", "player_latencies"]);
     });
     adapter.dispose();
   });
@@ -1994,6 +2014,7 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
           zone: "Hand",
           run_etb: false,
           nonlegendary: false,
+          creation_kind: "Card",
           count: 0,
         },
       },
@@ -2040,6 +2061,45 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
     expect(mockGetViewerSnapshot).not.toHaveBeenCalled();
     expect(mockGetState).not.toHaveBeenCalled();
   });
+
+  it.each(["Card", "Token"] as const)(
+    "preserves the %s creation kind from the guest action envelope to the host engine",
+    async (creationKind) => {
+      const { adapter, emitConnection } = makeHost(2);
+      await adapter.initialize();
+      const guest = await joinGuest(emitConnection, {
+        type: "guest_deck",
+        deckData: { player: { main_deck: [], sideboard: [] } },
+      });
+      await adapter.initializeGame();
+      mockSubmitAction.mockClear();
+
+      const action: GameAction = {
+        type: "Debug",
+        data: {
+          type: "CreateCard",
+          data: {
+            card_name: "Lightning Bolt",
+            owner: 1,
+            zone: "Battlefield",
+            run_etb: false,
+            nonlegendary: false,
+            creation_kind: creationKind,
+            count: 1,
+          },
+        },
+      };
+
+      await guest.simulateData({
+        type: "action",
+        senderPlayerId: 1,
+        action,
+      });
+
+      expect(mockSubmitAction).toHaveBeenCalledWith(action, 1);
+      adapter.dispose();
+    },
+  );
 
   it("holds the seat on guest disconnect and NEVER auto-concedes on grace expiry", async () => {
     const { adapter, emitConnection } = makeHost(3, 5_000);
@@ -2518,6 +2578,7 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
     expect(messages.map((message) => (message as { type: string }).type)).toEqual([
       "reconnect_ack",
       "ai_driver_fault",
+      "player_latencies",
     ]);
     expect(messages[1]).toMatchObject({ type: "ai_driver_fault", ...fault });
   });
@@ -3446,6 +3507,7 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
           zone: "Hand",
           run_etb: false,
           nonlegendary: false,
+          creation_kind: "Card",
           count: 0,
         },
       },
@@ -3484,6 +3546,17 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
     await adapter.initializeGame();
     return { adapter, conn };
   }
+
+  it("accepts host latency updates after the handshake and rejects invalid readings", async () => {
+    const { adapter, conn } = await joinedGuest();
+    const events = vi.fn();
+    adapter.onEvent(events);
+    await conn.simulateData({ type: "player_latencies", latencies: { 0: 0, 1: 42, 2: null } });
+    expect(events).toHaveBeenCalledExactlyOnceWith({ type: "playerLatencies", latencies: { 0: 0, 1: 42, 2: null } });
+    await conn.simulateData({ type: "player_latencies", latencies: { 1: -5 } });
+    expect(events).toHaveBeenCalledTimes(1);
+    adapter.dispose();
+  });
 
   it("guest submission the host never answers rejects at the timeout instead of parking forever", async () => {
     const { adapter, conn } = await joinedGuest();
@@ -4407,14 +4480,14 @@ describe("P2P wire-protocol version gate", () => {
   // Both halves stamp LITERALS. A frame built from WIRE_PROTOCOL_VERSION
   // cannot tell a bumped client from an unbumped one, which is why every
   // other handshake fixture in the suite is useless as an instrument for a
-  // bump. Revert 52 → 51 and BOTH halves red: the v51 frame stops being
-  // refused, and the v52 frame stops being admitted. The admitting half is
-  // the reach-guard — without it "refuses v51" is also satisfied by a client
+  // bump. Revert 56 → 55 and BOTH halves red: the v55 frame stops being
+  // refused, and the v57 frame stops being admitted. The admitting half is
+  // the reach-guard — without it "refuses v53" is also satisfied by a client
   // that refuses everything.
-  it("refuses the previous wire protocol (v51) and admits its own (v52)", async () => {
+  it("refuses the previous wire protocol (v56) and admits its own (v57)", async () => {
     const refusing = makeGuest();
     await refusing.adapter.initialize();
-    await refusing.conn.simulateData(setupFrameAt(51));
+    await refusing.conn.simulateData(setupFrameAt(56));
 
     await expect(refusing.adapter.initializeGame()).rejects.toMatchObject({
       code: "P2P_REJECTED",
@@ -4426,7 +4499,7 @@ describe("P2P wire-protocol version gate", () => {
 
     const admitting = makeGuest();
     await admitting.adapter.initialize();
-    await admitting.conn.simulateData(setupFrameAt(52));
+    await admitting.conn.simulateData(setupFrameAt(57));
 
     await expect(admitting.adapter.initializeGame()).resolves.toBeDefined();
     expect(admitting.emitted).not.toHaveBeenCalledWith(
@@ -5336,7 +5409,7 @@ describe("P2PHostAdapter — per-guest eventual state delivery", () => {
   function deliveryFramesIn(messages: unknown[]): unknown[] {
     return messages.filter((m) => {
       const type = (m as { type?: string }).type;
-      return type !== "ping" && type !== "pong";
+      return type !== "ping" && type !== "pong" && type !== "player_latencies";
     });
   }
 

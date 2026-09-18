@@ -3926,10 +3926,15 @@ pub(crate) fn deliver_replaced_zone_change(
         } else if !enter_with_counters.is_empty() {
             // CR 122.1: Effect-driven counters for non-battlefield
             // destinations — e.g., "exile it with three egg counters
-            // on it" (Darigaaz Reincarnated). Apply directly via the
-            // shared single-authority resolver so counter-doubling
-            // replacements (Doubling Season, Hardened Scales) and
-            // event emission stay consistent.
+            // on it" (Darigaaz Reincarnated), Delay's three time
+            // counters (issue #8795). Apply directly via the shared
+            // single-authority resolver so event emission and the
+            // replacement consult stay consistent — where CR 109.2 /
+            // CR 110.1 make "a permanent" replacements (Doubling
+            // Season, Hardened Scales) decline a card that is not on
+            // the battlefield (`replacement_valid_card_matches`, and
+            // `object_replacement_candidate_applies` for a replacement
+            // without a `valid_card`).
             if !crate::game::engine_replacement::apply_etb_counters(
                 state,
                 object_id,
@@ -6305,6 +6310,7 @@ mod effect_driven_transformed_entry_tests {
             obj.base_card_types = obj.card_types.clone();
             obj.back_face = Some(BackFaceData {
                 is_swap_snapshot: false,
+                trigger_printed_origins: Vec::new(),
                 name: "MDFC Back".to_string(),
                 power: None,
                 toughness: None,

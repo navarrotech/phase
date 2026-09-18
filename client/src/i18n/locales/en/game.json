@@ -1,4 +1,5 @@
 {
+  "playerLatency": {"host":"Host","waiting":"Waiting","value":"{{ms}} ms","description":"Round-trip latency to the host. A missing reply does not disconnect the game."},
   "abilityBlock": {
     "badge": "Blocked",
     "cantBeActivated": "This ability can't be activated",
@@ -17,10 +18,10 @@
     "declareTitle": "Loop Shortcut",
     "declareSubtitle": "You control a loop with a determined outcome. Take the shortcut to resolve it.",
     "respondTitle": "Loop Shortcut Proposed",
-    "respondSubtitle": "An opponent proposes taking a loop shortcut. Accept it, or break out to keep playing manually.",
+    "respondSubtitle": "An opponent proposes taking a loop shortcut. Accept it, or name the place where the sequence stops.",
     "confirm": "Take the shortcut",
     "accept": "Accept",
-    "shorten": "Break out",
+    "shorten": "Shorten it",
     "decline": "Decline the shortcut",
     "untilLethal": "Repeat until the game ends.",
     "fixedCount_one": "Repeat at most once.",
@@ -104,6 +105,7 @@
   },
   "debugCreate": {
     "copies": "Copies",
+    "asToken": "Create as token",
     "tokenPower": "Power",
     "tokenToughness": "Toughness",
     "tokenPowerPlaceholder": "Power",
@@ -311,8 +313,10 @@
     "underAttack_other": "Attacked by {{count}} creatures",
     "target": "Target",
     "sacrifice": "Sacrifice",
+    "token": "Token",
+    "tokenTooltip": "Token copy of a real card",
     "copy": "Copy",
-    "copyTooltip": "Token copy of a real card",
+    "copyTooltip": "Nontoken permanent copying another card",
     "cantBeBlocked": "Can't be blocked",
     "ringBearer": "Ring",
     "ringBearerTooltip": "Ring-bearer",
@@ -2035,10 +2039,15 @@
     "subtitleCascade": "Cascade exiled {{name}} (mana value below {{sourceMv}}). Cast it without paying its mana cost, or decline and shuffle all {{total}} exiled cards to the bottom of your library.",
     "subtitleDiscover": "Discover exiled {{name}}. Cast it without paying its mana cost, or put it into your hand and shuffle the other {{missCount}} exiled cards to the bottom of your library.",
     "subtitleRipple": "Ripple revealed {{name}}. Cast it without paying its mana cost, or decline and put all {{total}} revealed cards on the bottom of your library in a random order.",
-    "subtitleGraveyardPaid": "Cast {{name}} from a graveyard by paying its mana cost — mana of any type may be spent. Or decline and leave it in the graveyard.",
+    "subtitleGraveyardPaid": "Cast {{name}} from a graveyard by paying its mana cost{{extra}}{{concession}}. Or decline and leave it in the graveyard.",
     "castNamed": "Cast {{name}}",
     "castSuffix": "(without paying its mana cost)",
-    "castPaidSuffix": "(pay its mana cost — any type of mana may be spent)",
+    "castPaidSuffix": "(pay its mana cost{{extra}}{{concession}})",
+    "paidExtraFragment": " plus {{extra}}",
+    "paidAnyTypeSubtitleFragment": " — mana of any type may be spent",
+    "paidAnyColorSubtitleFragment": " — mana of any color may be spent",
+    "paidAnyTypeSuffixFragment": " — any type of mana may be spent",
+    "paidAnyColorSuffixFragment": " — any color of mana may be spent",
     "putIntoHand": "Put into hand",
     "decline": "Decline",
     "discoverDeclineSuffix": "(put the rest on the bottom)",
@@ -2150,6 +2159,7 @@
     "exportClientSnapshot": "Export client snapshot",
     "exported": "Exported",
     "exportFailed": "Export failed",
+    "exportRequested": "Export unconfirmed",
     "copyDiagnostic": "Copy diagnostic",
     "copied": "Copied!",
     "reportOnGithub": "Report on GitHub",
@@ -2253,7 +2263,7 @@
     "yes": "Yes",
     "no": "No",
     "dontAskAgain": "Don't ask again this game",
-    "dontAskAgainForSameCard": "Apply this to every copy of this card"
+    "dontAskAgainForSameCard": "Use this choice for every copy of this card this game"
   },
   "resolutionOptionalPayment": {
     "title": "Choose an optional payment",
@@ -2414,10 +2424,12 @@
   "outsideGame": {
     "fromExile": "From exile",
     "fromSideboard": "From sideboard",
-    "fromBoosterPack": "From {{setCode}} booster pack"
+    "fromBoosterPack": "From {{setCode}} booster pack",
+    "fromCubeBoosterPack": "From a Cube booster pack"
   },
   "boosterPack": {
     "title": "{{setCode}} Booster Pack",
+    "cubeTitle": "Cube Booster Pack",
     "subtitleExact_one": "Choose {{count}} card to keep — the rest are removed from the game",
     "subtitleExact_other": "Choose {{count}} cards to keep — the rest are removed from the game",
     "subtitleUpTo_one": "Choose up to {{count}} card to keep — the rest are removed from the game",

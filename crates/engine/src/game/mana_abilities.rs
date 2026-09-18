@@ -5222,7 +5222,7 @@ mod tests {
     use crate::types::mana::{
         ManaColor, ManaCost, ManaCostShard, ManaRestriction, ManaType, ManaUnit,
     };
-    use crate::types::proposed_event::{ProposedEvent, ReplacementId};
+    use crate::types::proposed_event::{DrawEventStage, ProposedEvent, ReplacementId};
     use crate::types::statics::{CostPaymentProhibition, ProhibitionScope, StaticMode};
     use crate::types::triggers::TriggerMode;
     use crate::types::zones::Zone;
@@ -5248,6 +5248,7 @@ mod tests {
             proposed: ProposedEvent::Draw {
                 player_id: PlayerId(0),
                 count: 1,
+                stage: DrawEventStage::Individual,
                 applied: HashSet::new(),
             },
             sacrifice_provenance: None,
@@ -5258,6 +5259,7 @@ mod tests {
             search_found_candidates: Vec::new(),
             depth: 0,
             is_optional: false,
+            choice_player: None,
             library_placement: None,
             exile_controller: None,
             exile_duration: None,
@@ -6649,6 +6651,7 @@ mod tests {
             enters_with_counter: None,
             enters_with_modifications: vec![],
             mana_spend_permission: None,
+            cast_cost_modifier: None,
         };
         let grant = |graveyard_replacement: Option<SpellStackToGraveyardReplacement>| {
             Effect::GrantCastingPermission {
@@ -7515,14 +7518,7 @@ mod tests {
         let goblin_spell = SpellMeta {
             types: vec!["Creature".to_string()],
             subtypes: vec!["Goblin".to_string()],
-            keyword_kinds: vec![],
-            cast_from_zone: None,
-            mana_value: None,
-            color_count: None,
-            colors: vec![],
-            has_x_in_cost: false,
-            is_face_down: false,
-            cant_spend_mana: false,
+            ..Default::default()
         };
         let goblin_ctx = PaymentContext::Spell(&goblin_spell);
         let mut pool_clone = pool.clone();
@@ -7536,14 +7532,7 @@ mod tests {
         let elemental_spell = SpellMeta {
             types: vec!["Creature".to_string()],
             subtypes: vec!["Elemental".to_string()],
-            keyword_kinds: vec![],
-            cast_from_zone: None,
-            mana_value: None,
-            color_count: None,
-            colors: vec![],
-            has_x_in_cost: false,
-            is_face_down: false,
-            cant_spend_mana: false,
+            ..Default::default()
         };
         let elemental_ctx = PaymentContext::Spell(&elemental_spell);
         assert!(

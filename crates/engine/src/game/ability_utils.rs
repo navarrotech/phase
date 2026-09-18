@@ -51,6 +51,54 @@ pub fn build_resolved_from_def(
     build_resolved_from_def_with_targets(def, source_id, controller, Vec::new())
 }
 
+/// CR 608.2h + CR 603.7a: `build_resolved_from_def`, but propagating the
+/// CREATING ability's `chain_root_targets` onto the built chain (and every
+/// `sub_ability`/`else_ability` link) instead of leaving it at the default
+/// empty list `build_resolved_from_def` always produces.
+///
+/// Single authority for every carrier that materializes a nested
+/// `AbilityDefinition` payload WHILE STILL WITHIN an active resolution chain
+/// that may have stamped `chain_root_targets` — a delayed trigger's payload
+/// (`delayed_trigger::resolve`), a vote's per-choice/outcome effect
+/// (`vote::resolve` and friends), a coin flip's win/lose branch
+/// (`flip_coin::resolve`), and a die-roll result branch
+/// (`roll_die::resolve`). A fresh TOP-LEVEL ability instantiation — a
+/// triggered ability going on the stack, an activated/loyalty ability being
+/// activated, a dungeon room, an Evoke ETB sacrifice — has no ambient
+/// chain-root context to inherit and must keep using the plain
+/// `build_resolved_from_def` above; do not switch those call sites to this
+/// one.
+pub fn build_resolved_from_def_with_chain_root(
+    def: &AbilityDefinition,
+    source_id: ObjectId,
+    controller: PlayerId,
+    chain_root_targets: Vec<TargetRef>,
+) -> ResolvedAbility {
+    build_resolved_from_def_with_targets_and_chain_root(
+        def,
+        source_id,
+        controller,
+        Vec::new(),
+        chain_root_targets,
+    )
+}
+
+/// `build_resolved_from_def_with_chain_root`, but also supplying the already
+/// selected root targets — the general case for a carrier whose payload has
+/// its own known recipient (`flip_coin`/`roll_die`'s branches, which reuse
+/// the CREATING ability's `targets`) as well as an inherited chain-root list.
+pub fn build_resolved_from_def_with_targets_and_chain_root(
+    def: &AbilityDefinition,
+    source_id: ObjectId,
+    controller: PlayerId,
+    targets: Vec<TargetRef>,
+    chain_root_targets: Vec<TargetRef>,
+) -> ResolvedAbility {
+    let mut resolved = build_resolved_from_def_with_targets(def, source_id, controller, targets);
+    resolved.set_chain_root_targets_recursive(chain_root_targets);
+    resolved
+}
+
 /// CR 601.2b + CR 602.2b: publish an announce-time-locked X onto an ability being
 /// announced. **Single computation authority** for the announce-locked X channel.
 ///
@@ -1462,7 +1510,15 @@ pub fn simple_legal_target_assignment_exists_for_ability(
         || target_filter_has_another_target_marker(&spec.filter)
         || is_per_opponent_target_fanout(ability)
         || matches!(ability.effect, Effect::PairWith { .. })
-        || damage_any_target_legal_targets(state, ability, &spec.filter).is_some()
+        || damage_any_target_legal_targets(
+            state,
+            ability,
+            AbilityTargetSlot::Declared {
+                index: 0,
+                filter: &spec.filter,
+            },
+        )
+        .is_some()
     {
         return None;
     }
@@ -1943,12 +1999,18 @@ fn stamp_other_batch_source_targets(ability: &mut ResolvedAbility) {
     visit(ability, &mut Vec::new());
 }
 
-pub fn flatten_targets_in_chain(ability: &ResolvedAbility) -> Vec<TargetRef> {
-    let mut targets = if is_per_opponent_target_fanout(ability) {
+/// The targets one chain node contributes to [`flatten_targets_in_chain`]'s
+/// numbering: a per-opponent fanout contributes only its object targets.
+fn chain_node_targets(ability: &ResolvedAbility) -> Vec<TargetRef> {
+    if is_per_opponent_target_fanout(ability) {
         object_targets_only(&ability.targets)
     } else {
         ability.targets.clone()
-    };
+    }
+}
+
+pub fn flatten_targets_in_chain(ability: &ResolvedAbility) -> Vec<TargetRef> {
+    let mut targets = chain_node_targets(ability);
     if let Some(sub_ability) = ability.sub_ability.as_deref() {
         targets.extend(flatten_targets_in_chain(sub_ability));
     }
@@ -1957,6 +2019,58 @@ pub fn flatten_targets_in_chain(ability: &ResolvedAbility) -> Vec<TargetRef> {
     }
     targets
 }
+
+/// CR 608.2b: The slots of `declared` — numbered exactly as
+/// [`flatten_targets_in_chain`] numbers them — whose target the resolution-time
+/// re-validation `validated` (the [`validate_targets_in_chain`] result for the
+/// same chain) no longer holds on the corresponding node. Those targets are
+/// illegal, and "illegal targets, if any, won't be affected by parts of a
+/// resolving spell's effect for which they're illegal."
+///
+/// Membership is tested per node, not by position: validation compacts a
+/// node's pruned targets, so positions shift while the survivors keep their
+/// identity. It counts multiplicity, because CR 115.3 lets one object fill
+/// several target slots of a node: each surviving copy vouches for one declared
+/// copy, so a pruned copy is marked. Compaction does not record WHICH copy was
+/// pruned, so the later declared copy is the one marked. A validation arm that
+/// deliberately keeps an illegal target in place (the multi-role mana and
+/// damage-replacement role arms, which re-validate each role where it is
+/// consumed) leaves that slot unmarked.
+pub(crate) fn illegal_declared_target_slots(
+    declared: &ResolvedAbility,
+    validated: &ResolvedAbility,
+) -> Vec<usize> {
+    fn visit(
+        declared: &ResolvedAbility,
+        validated: Option<&ResolvedAbility>,
+        next_slot: &mut usize,
+        illegal: &mut Vec<usize>,
+    ) {
+        let mut survivors = validated.map_or_else(Vec::new, |node| node.targets.clone());
+        for target in chain_node_targets(declared) {
+            match survivors.iter().position(|survivor| *survivor == target) {
+                Some(found) => {
+                    survivors.swap_remove(found);
+                }
+                None => illegal.push(*next_slot),
+            }
+            *next_slot += 1;
+        }
+        if let Some(sub_ability) = declared.sub_ability.as_deref() {
+            let validated_sub = validated.and_then(|node| node.sub_ability.as_deref());
+            visit(sub_ability, validated_sub, next_slot, illegal);
+        }
+        if let Some(else_ability) = declared.else_ability.as_deref() {
+            let validated_else = validated.and_then(|node| node.else_ability.as_deref());
+            visit(else_ability, validated_else, next_slot, illegal);
+        }
+    }
+
+    let mut illegal = Vec::new();
+    visit(declared, Some(validated), &mut 0, &mut illegal);
+    illegal
+}
+
 /// CR 608.2b + CR 115.10a: the targets this chain SPECIFIED — one entry per
 /// instance of the word "target" — as opposed to every `TargetRef` the chain
 /// happens to hold.
@@ -2177,7 +2291,28 @@ fn validate_pinned_targets(
     filter: &TargetFilter,
     ability: &ResolvedAbility,
 ) -> Vec<TargetRef> {
-    targeting::validate_targets_for_ability(state, targets, filter, ability)
+    validate_pinned_targets_for_slot(
+        state,
+        targets,
+        AbilityTargetSlot::Unpositioned(filter),
+        ability,
+    )
+}
+
+fn validate_pinned_targets_for_slot(
+    state: &GameState,
+    targets: &[TargetRef],
+    slot: AbilityTargetSlot<'_>,
+    ability: &ResolvedAbility,
+) -> Vec<TargetRef> {
+    // CR 608.2b + CR 115.4: a damage "any target" is rechecked against the same
+    // creature/player/planeswalker/battle domain it was chosen from, in addition
+    // to the ordinary ability-context legality check (narrowing only).
+    let mut legal = targeting::validate_targets_for_ability(state, targets, slot.filter(), ability);
+    if let Some(domain) = damage_any_target_legal_targets(state, ability, slot) {
+        legal.retain(|t| domain.contains(t));
+    }
+    legal
         .into_iter()
         .filter(|target| target_is_current(ability, target, state))
         .collect()
@@ -2514,7 +2649,27 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
             kept.extend(explicit);
             kept
         }
-    } else if let Some(src_leaf) = prevent_damage_source_slot_filter(&validated.effect).cloned() {
+    } else if let Some(role_legality) = damage_replacement_target_role_legality(state, &validated) {
+        // CR 115.1a + CR 601.2c + CR 608.2b: each declared damage-replacement
+        // role is independently targeted and revalidated in its declared order.
+        // The roles jointly specify one replacement event, so none can be
+        // compacted away: doing so would slide a later recipient or redirect
+        // destination into the declared-source position. Preserve the original
+        // role positions whenever any role remains legal: CR 608.2b lets the
+        // spell resolve in that case, and the CDR resolver independently turns
+        // the incomplete replacement instruction into a no-op. Only when every
+        // declared role is illegal do we clear them for the normal fizzle check.
+        //
+        // In particular, a stack spell source must not be checked against the
+        // recipient or redirect-destination filter just because it occupies
+        // `targets[0]`.
+        if role_legality.has_any_legal_role() {
+            validated.targets.clone()
+        } else {
+            Vec::new()
+        }
+    } else if let Some(src_leaf) = damage_replacement_source_slot_filter(&validated.effect).cloned()
+    {
         // CR 608.2b + CR 609.7a: A source-scoped `PreventDamage` carries its
         // chosen source spell in `targets[0]`. `extract_target_filter_from_effect`
         // returns `None` for its `Any` recipient, so the generic `None` arm below
@@ -2522,16 +2677,30 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
         // (the spell lives on the STACK). Re-validate against the source leaf
         // (`InZone Stack`-aware) instead, preserving the spell target.
         validate_pinned_targets(state, &validated.targets, &src_leaf, &validated)
-    } else if matches!(
-        &validated.effect,
-        Effect::ChangeZoneAll { target, .. } if crate::game::effects::filter_refs_parent_target(target)
-    ) {
-        // CR 115.1 + CR 608.2b: `ChangeZoneAll` is a resolution-time mass
-        // instruction when its filter carries a delayed `ParentTarget` snapshot
-        // inside a tracked set. Treating that internal filter as a target would
-        // fizzle a valid Exile -> Battlefield return before the mass resolver
-        // can inspect the tracked member. Ordinary ChangeZoneAll player filters
-        // remain declared targets and follow the generic validation below.
+    } else if crate::game::effects::mass_population_target(&validated.effect)
+        .is_some_and(crate::game::effects::filter_refs_parent_or_event_subject)
+    {
+        // CR 115.1 + CR 608.2b: a MASS-POPULATION instruction whose filter
+        // carries a delayed anaphor snapshot (`ParentTarget` from a tracked set,
+        // or an `EVENT_SUBJECT_ANAPHORS` referent concretized at delayed-trigger
+        // creation) is a RESOLUTION-TIME population scan, not a declared target.
+        // CR 608.2b governs targets; treating the internal filter as one makes
+        // the stale-pin drop below empty `targets`, which then reads as "no
+        // legal choice" and removes the whole ability from the stack before the
+        // mass resolver ever runs.
+        //
+        // That is the wrong outcome for an EXCLUSION: when "destroy each
+        // creature OTHER than that one" loses its referent to a blink, only the
+        // exclusion expires (CR 400.7) — every other creature is still
+        // destroyed. Liveness is enforced where it belongs, in
+        // `effects::resolved_object_filter`, which pin-checks the referents it
+        // concretizes.
+        //
+        // Previously scoped to `ChangeZoneAll` alone. The whole family shares
+        // one `target_filter() == None` shape, so the narrow form silently left
+        // `DestroyAll`, `DamageAll`, `BounceAll` and the rest fizzling on a
+        // stale snapshot. Routed through the single `mass_population_target`
+        // authority so the two lists cannot drift apart again.
         validated.targets.clone()
     } else if matches!(
         mass_all_target_filter(&validated.effect),
@@ -2683,25 +2852,163 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
 /// Returns `None` for recipient-scoped or `ChosenDamageSource`/`IsChosenColor`
 /// ("by …" Arachnogenesis) prevents, so those are NOT diverted into a source
 /// target slot.
-fn prevent_damage_source_slot_filter(effect: &Effect) -> Option<&TargetFilter> {
-    let Effect::PreventDamage {
-        damage_source_filter: Some(TargetFilter::And { filters }),
+fn damage_replacement_source_slot_filter(effect: &Effect) -> Option<&TargetFilter> {
+    let source_filter = match effect {
+        Effect::PreventDamage {
+            damage_source_filter,
+            ..
+        } => damage_source_filter.as_ref()?,
+        Effect::CreateDamageReplacement { source_filter, .. } => source_filter.as_ref()?,
+        _ => return None,
+    };
+    // The source-target contract is intentionally exact: its first declared
+    // target is captured by `ParentTargetSlot { index: 0 }`, followed by the
+    // source's live legality/recheck leaf. Other dynamic source forms do not
+    // announce a target slot.
+    let TargetFilter::And { filters } = source_filter else {
+        return None;
+    };
+    let [TargetFilter::ParentTargetSlot { index: 0 }, source_leaf] = filters.as_slice() else {
+        return None;
+    };
+    Some(source_leaf)
+}
+
+/// The announced target roles of a damage-redirection replacement, in Oracle
+/// declaration order. Keeping these together prevents the cast, modal,
+/// validation, retarget, and resolver paths from independently re-deriving a
+/// different index convention.
+#[derive(Clone, Copy)]
+pub(crate) enum DamageReplacementTargetRole<'a> {
+    DeclaredSource(&'a TargetFilter),
+    OriginalRecipient(&'a TargetFilter),
+    RedirectRecipient(&'a TargetFilter),
+}
+
+/// Resolution-time legality of the declared roles for a damage replacement.
+///
+/// The variants distinguish a fully valid replacement instruction from the
+/// partially legal spell case in CR 608.2b: the latter resolves, but its CDR
+/// instruction cannot use information from an illegal role.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DamageReplacementTargetRoleLegality {
+    All,
+    Partial,
+    None,
+}
+
+impl DamageReplacementTargetRoleLegality {
+    pub(crate) fn has_any_legal_role(self) -> bool {
+        matches!(self, Self::All | Self::Partial)
+    }
+
+    pub(crate) fn all_required_roles_are_legal(self) -> bool {
+        matches!(self, Self::All)
+    }
+}
+
+impl<'a> DamageReplacementTargetRole<'a> {
+    pub(crate) fn filter(self) -> &'a TargetFilter {
+        match self {
+            Self::DeclaredSource(filter)
+            | Self::OriginalRecipient(filter)
+            | Self::RedirectRecipient(filter) => filter,
+        }
+    }
+
+    /// CR 115.4 + CR 614.9: "any target" is a creature, player, planeswalker or
+    /// battle. Both damage-recipient roles of a redirection — the recipient the
+    /// damage would have been dealt to and the recipient it is redirected to —
+    /// name that domain when their filter is `Any`, so neither may admit a land
+    /// or a noncreature artifact at target selection or on the resolution
+    /// recheck. A declared source is not a damage recipient: its legal choices
+    /// are the CR 609.7a source domain, which `Any` must not narrow.
+    pub(crate) fn denotes_damage_any_target(self) -> bool {
+        match self {
+            Self::OriginalRecipient(filter) | Self::RedirectRecipient(filter) => {
+                is_any_target_filter(filter)
+            }
+            Self::DeclaredSource(_) => false,
+        }
+    }
+}
+
+/// CR 115.4: "any target" or "any other target" in damage effects denotes a creature, player,
+/// planeswalker or battle.
+fn is_any_target_filter(filter: &TargetFilter) -> bool {
+    matches!(filter, TargetFilter::Any)
+        || matches!(
+            filter,
+            TargetFilter::Typed(tf)
+                if tf.type_filters.is_empty()
+                    && tf.controller.is_none()
+                    && tf.properties.as_slice() == [FilterProp::Another]
+        )
+}
+
+pub(crate) fn damage_replacement_target_roles(
+    effect: &Effect,
+) -> Option<Vec<DamageReplacementTargetRole<'_>>> {
+    let Effect::CreateDamageReplacement {
+        recipient_object_filter,
+        redirect_object_filter,
         ..
     } = effect
     else {
         return None;
     };
-    // Only an `And` that carries the `ParentTargetSlot` sentinel is a
-    // source-scoped capture; return the sibling choosable leaf.
-    if !filters
-        .iter()
-        .any(|f| matches!(f, TargetFilter::ParentTargetSlot { .. }))
-    {
-        return None;
+
+    let mut roles = Vec::with_capacity(3);
+    if let Some(filter) = damage_replacement_source_slot_filter(effect) {
+        roles.push(DamageReplacementTargetRole::DeclaredSource(filter));
     }
-    filters
+    if let Some(filter) = recipient_object_filter
+        .as_ref()
+        .filter(|filter| !filter.is_context_ref())
+    {
+        roles.push(DamageReplacementTargetRole::OriginalRecipient(filter));
+    }
+    if let Some(filter) = redirect_object_filter {
+        roles.push(DamageReplacementTargetRole::RedirectRecipient(filter));
+    }
+    // CR 608.2b: A role-less replacement has no declared target slots, so it
+    // must fall through to generic target validation rather than report an
+    // empty role set as a separate targeting case.
+    (!roles.is_empty()).then_some(roles)
+}
+
+/// CR 608.2b: Revalidate every CDR role against its original declaration-order
+/// slot. A later legal target never substitutes for an earlier illegal role.
+pub(crate) fn damage_replacement_target_role_legality(
+    state: &GameState,
+    ability: &ResolvedAbility,
+) -> Option<DamageReplacementTargetRoleLegality> {
+    let roles = damage_replacement_target_roles(&ability.effect)?;
+
+    let legal_count = roles
         .iter()
-        .find(|f| !matches!(f, TargetFilter::ParentTargetSlot { .. }))
+        .enumerate()
+        .filter(|(index, role)| {
+            ability.targets.get(*index).is_some_and(|target| {
+                !validate_pinned_targets_for_slot(
+                    state,
+                    std::slice::from_ref(target),
+                    AbilityTargetSlot::Declared {
+                        index: *index,
+                        filter: role.filter(),
+                    },
+                    ability,
+                )
+                .is_empty()
+            })
+        })
+        .count();
+
+    Some(match legal_count {
+        0 => DamageReplacementTargetRoleLegality::None,
+        count if count == roles.len() => DamageReplacementTargetRoleLegality::All,
+        _ => DamageReplacementTargetRoleLegality::Partial,
+    })
 }
 
 /// CR 120.3a + CR 603.7c: Constrain a companion `ControllerRef::TargetPlayer`
@@ -3003,7 +3310,29 @@ fn collect_target_slots_inner(
     // do NOT `return`: the generic recipient logic still runs, but for the
     // source-scoped form `target == Any` so it adds nothing.
     if ability.target_choice_timing == TargetChoiceTiming::Stack {
-        if let Some(src_leaf) = prevent_damage_source_slot_filter(&ability.effect) {
+        if let Some(roles) = damage_replacement_target_roles(&ability.effect) {
+            for (index, role) in roles.into_iter().enumerate() {
+                let legal_targets = legal_targets_for_ability_slot(
+                    state,
+                    ability,
+                    AbilityTargetSlot::Declared {
+                        index,
+                        filter: role.filter(),
+                    },
+                    &acc.slots,
+                );
+                if legal_targets.is_empty() && !ability.optional_targeting {
+                    return Err(no_legal_target_slots());
+                }
+                acc.push(TargetSelectionSlot {
+                    legal_targets,
+                    optional: ability.optional_targeting,
+                    chooser: None,
+                    effect_kind: acc.current_effect_kind,
+                    effect_detail: acc.current_effect_detail,
+                });
+            }
+        } else if let Some(src_leaf) = damage_replacement_source_slot_filter(&ability.effect) {
             let legal_targets =
                 legal_targets_for_ability_filter(state, ability, src_leaf, &acc.slots);
             if legal_targets.is_empty() && !ability.optional_targeting {
@@ -3195,71 +3524,9 @@ fn collect_target_slots_inner(
                 });
             }
         }
-    } else if let Effect::CreateDamageReplacement {
-        recipient_object_filter,
-        redirect_object_filter,
-        ..
-    } = &ability.effect
-    {
-        // CR 115.1 + CR 614.9: Surface up to two object target slots for the
-        // one-shot damage replacement — `target_filter()` returns None for this
-        // effect, so the generic path below never reaches it.
-        //
-        // ORDER IS LOAD-BEARING: the *original-recipient* slot ("would deal
-        // damage to target creature" — Jade Monolith) is declared FIRST, then
-        // the *redirect-destination* slot ("...to target creature instead" —
-        // Soltari Guerrillas). The resolver reads `recipient_host` from
-        // `chosen_target_object(ability, 0)` and the redirect from
-        // `chosen_redirect_object` (which skips the recipient slot when present),
-        // so the surfacing order here must match that indexing exactly. The two
-        // positions are unrolled (not looped) because they use DIFFERENT skip
-        // predicates — see each arm below.
-        if let Some(filter) = recipient_object_filter {
-            // CR 614.9 + CR 608.2k: a context-ref original-recipient (`SelfRef` —
-            // "...dealt to ~", the en-Kor cycle — and any future event anaphor in
-            // this position) is not a chosen target, so it surfaces no target
-            // slot. The resolver hosts the shield on the source directly (or, for
-            // a non-SelfRef context ref, on whatever `targeting::resolved_targets`
-            // binds).
-            if !filter.is_context_ref() {
-                let legal_targets =
-                    legal_targets_for_ability_filter(state, ability, filter, &acc.slots);
-                if legal_targets.is_empty() && !ability.optional_targeting {
-                    return Err(no_legal_target_slots());
-                }
-                acc.push(TargetSelectionSlot {
-                    legal_targets,
-                    optional: ability.optional_targeting,
-                    chooser: None,
-                    effect_kind: acc.current_effect_kind,
-                    effect_detail: acc.current_effect_detail,
-                });
-            }
-        }
-        if let Some(filter) = redirect_object_filter {
-            // CR 614.9: the redirect-destination slot is declared UNCONDITIONALLY
-            // — it is never a context ref in the corpus. `redirect_object_filter`
-            // is `Some` exactly when `redirect_to ==
-            // DamageRedirectTarget::ChosenObjectTarget`, the variant that *means*
-            // "an object chosen as a target of the creating ability"; every other
-            // destination (`Controller`, `SourceObject`, `AttachedToSource`) has
-            // its own variant and carries no filter here. A context ref in this
-            // position would drop the slot `chosen_redirect_object` indexes, so
-            // this position does NOT share the recipient's `is_context_ref()`
-            // check.
-            let legal_targets =
-                legal_targets_for_ability_filter(state, ability, filter, &acc.slots);
-            if legal_targets.is_empty() && !ability.optional_targeting {
-                return Err(no_legal_target_slots());
-            }
-            acc.push(TargetSelectionSlot {
-                legal_targets,
-                optional: ability.optional_targeting,
-                chooser: None,
-                effect_kind: acc.current_effect_kind,
-                effect_detail: acc.current_effect_detail,
-            });
-        }
+    } else if damage_replacement_target_roles(&ability.effect).is_some() {
+        // The three damage-replacement roles were already surfaced above by
+        // `damage_replacement_target_roles`, before this generic cascade.
     } else if let Effect::EachDealsDamageEqualToPower {
         sources,
         recipient,
@@ -3963,9 +4230,10 @@ fn filter_prop_contains_quantity_scope(prop: &FilterProp, scope: ObjectScope) ->
 /// Both read `ability.targets` with `.find_map(first Object)` and NEITHER
 /// consults `target_incarnations`.
 ///
-/// DELIBERATELY EXCLUDED — the object-IDENTITY arm (`filter.rs:3620` for
-/// `TargetFilter::ParentTarget`, `:3628` for `ParentTargetSlot { index }`) and
-/// the positional read at `filter.rs:5331`/`:5333`. That arm additionally
+/// DELIBERATELY EXCLUDED — the object-IDENTITY arm (`filter::filter_inner_for_object` —
+/// the `TargetFilter::ParentTarget` and `ParentTargetSlot { index }` arms) and
+/// the positional read in that same function's `ParentTargetSlot { index }` arm
+/// (via `targeting::resolve_live_parent_slot_from_root`). That arm additionally
 /// requires `!ability.target_incarnations.is_empty()` and
 /// `target_pin_is_current`, and `target_incarnations` means "pinned at
 /// DELAYED-TRIGGER creation" (`set_target_incarnations_recursive`, CR 400.7 +
@@ -4957,9 +5225,10 @@ pub(crate) fn collect_player_targets(
     // CR 608.2c: a definite player anaphor may name one exact slot in the
     // flattened resolving chain after an intervening object target. Resolve
     // that slot before inspecting this node's propagated local targets, which
-    // may contain only the most-recent object slot.
+    // may contain only the most-recent object slot. CR 608.2b: a player slot
+    // that was an illegal target at resolution affects no player.
     if let TargetFilter::ParentTargetSlot { index } = target {
-        return crate::game::targeting::resolve_parent_slot_from_root(state, ability, *index)
+        return crate::game::targeting::resolve_live_parent_slot_from_root(state, ability, *index)
             .and_then(|target| match target {
                 TargetRef::Player(player) => Some(player),
                 TargetRef::Object(_) => None,
@@ -4999,6 +5268,18 @@ pub(crate) fn collect_player_targets(
                 // targets are resolved from ability.targets directly); fail closed.
                 Some(ControllerRef::TargetPlayer | ControllerRef::TargetOpponent) => false,
                 Some(ControllerRef::ParentTargetController) => false,
+                // CR 120.1 + CR 109.4 + CR 603.2: unlike the parent-target refs
+                // (which need a target slot this population expansion has no
+                // access to), the damage recipient's controller IS resolvable
+                // here — it comes off the firing event. Mirrors the
+                // `TriggeringPlayer` arm below rather than failing closed.
+                Some(ControllerRef::EventTargetController) => {
+                    targeting::resolve_effect_player_ref(
+                        state,
+                        ability,
+                        &TargetFilter::EventTargetController,
+                    ) == Some(p.id)
+                }
                 Some(ControllerRef::ParentTargetOwner) => false,
                 Some(ControllerRef::DefendingPlayer) => false,
                 // CR 613.1: no card scopes this shape to a persisted chosen
@@ -5540,7 +5821,17 @@ fn collect_target_slot_specs(
     // `collect_target_slots` one-for-one so per-slot specs line up with the
     // surfaced TargetSelectionSlots (the choosable source spell, declared first).
     if ability.target_choice_timing == TargetChoiceTiming::Stack {
-        if let Some(src_leaf) = prevent_damage_source_slot_filter(&ability.effect) {
+        if let Some(roles) = damage_replacement_target_roles(&ability.effect) {
+            for role in roles {
+                let id = TargetInstanceId(*next_instance);
+                *next_instance += 1;
+                specs.push(TargetSlotSpec {
+                    filter: role.filter().clone(),
+                    optional: ability.optional_targeting,
+                    instance: id,
+                });
+            }
+        } else if let Some(src_leaf) = damage_replacement_source_slot_filter(&ability.effect) {
             let id = TargetInstanceId(*next_instance);
             *next_instance += 1;
             specs.push(TargetSlotSpec {
@@ -5648,44 +5939,8 @@ fn collect_target_slot_specs(
                 });
             }
         }
-    } else if let Effect::CreateDamageReplacement {
-        recipient_object_filter,
-        redirect_object_filter,
-        ..
-    } = &ability.effect
-    {
-        // CR 115.1 + CR 614.9: Mirror `collect_target_slots` one-for-one — the
-        // recipient slot (Jade Monolith) before the redirect slot (Soltari) — so
-        // per-slot specs line up with the surfaced TargetSelectionSlots. Unrolled
-        // exactly as the `collect_target_slots_inner` mirror: the two positions
-        // use DIFFERENT skip predicates, so a single shared loop would apply the
-        // recipient's context-ref skip to the redirect position too.
-        if let Some(filter) = recipient_object_filter {
-            // CR 614.9 + CR 608.2k: mirror `collect_target_slots_inner` — a
-            // context-ref recipient (`SelfRef`, en-Kor) surfaces no slot, so it
-            // gets no spec either.
-            if !filter.is_context_ref() {
-                let id = TargetInstanceId(*next_instance);
-                *next_instance += 1;
-                specs.push(TargetSlotSpec {
-                    filter: filter.clone(),
-                    optional: ability.optional_targeting,
-                    instance: id,
-                });
-            }
-        }
-        if let Some(filter) = redirect_object_filter {
-            // CR 614.9: the redirect position is declared unconditionally — see
-            // `collect_target_slots_inner`'s mirror for why it does not share the
-            // recipient's `is_context_ref()` check.
-            let id = TargetInstanceId(*next_instance);
-            *next_instance += 1;
-            specs.push(TargetSlotSpec {
-                filter: filter.clone(),
-                optional: ability.optional_targeting,
-                instance: id,
-            });
-        }
+    } else if damage_replacement_target_roles(&ability.effect).is_some() {
+        // The role authority emitted all matching specs before this cascade.
     } else if let Effect::EachDealsDamageEqualToPower {
         sources,
         recipient,
@@ -5937,22 +6192,37 @@ fn legal_targets_for_ability_filter(
     filter: &TargetFilter,
     existing_slots: &[TargetSelectionSlot],
 ) -> Vec<TargetRef> {
+    legal_targets_for_ability_slot(
+        state,
+        ability,
+        AbilityTargetSlot::Unpositioned(filter),
+        existing_slots,
+    )
+}
+
+fn legal_targets_for_ability_slot(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    slot: AbilityTargetSlot<'_>,
+    existing_slots: &[TargetSelectionSlot],
+) -> Vec<TargetRef> {
     exclude_cost_paid_object_that_left_battlefield(
         state,
         ability,
-        legal_targets_for_ability_filter_uncapped(state, ability, filter, existing_slots),
+        legal_targets_for_ability_filter_uncapped(state, ability, slot, existing_slots),
     )
 }
 
 fn legal_targets_for_ability_filter_uncapped(
     state: &GameState,
     ability: &ResolvedAbility,
-    filter: &TargetFilter,
+    slot: AbilityTargetSlot<'_>,
     existing_slots: &[TargetSelectionSlot],
 ) -> Vec<TargetRef> {
-    if let Some(targets) = damage_any_target_legal_targets(state, ability, filter) {
+    if let Some(targets) = damage_any_target_legal_targets(state, ability, slot) {
         return targets;
     }
+    let filter = slot.filter();
 
     let needs_ability_context = target_filter_needs_ability_context(filter);
     let relative_kind = relative_controller_kind(filter);
@@ -6644,7 +6914,14 @@ fn legal_targets_for_selected_slot(
 
     let mut legal: Vec<TargetRef> = if matches!(ability.effect, Effect::PairWith { .. }) {
         pair_with_legal_choices(state, ability, &spec.filter)
-    } else if let Some(targets) = damage_any_target_legal_targets(state, ability, &spec.filter) {
+    } else if let Some(targets) = damage_any_target_legal_targets(
+        state,
+        ability,
+        AbilityTargetSlot::Declared {
+            index: prior_specs.len(),
+            filter: &spec.filter,
+        },
+    ) {
         targets
     } else if let Some(targets) = per_opponent_fanout_targets {
         targets
@@ -6763,37 +7040,78 @@ fn legal_targets_for_selected_slot(
     exclude_cost_paid_object_that_left_battlefield(state, ability, legal)
 }
 
+/// CR 601.2c: the target slot of an ability that a legality question is asked
+/// for. A damage replacement's role is a property of the slot's declaration
+/// position (`damage_replacement_target_roles` order), not of its filter: a
+/// declared source and a redirect recipient can both carry `Any`.
+#[derive(Clone, Copy)]
+enum AbilityTargetSlot<'a> {
+    /// The slot at `index` in the ability's own target declaration order.
+    Declared {
+        index: usize,
+        filter: &'a TargetFilter,
+    },
+    /// A filter checked by a caller that does not track slot positions. It
+    /// never selects a damage-replacement role; those roles are enumerated and
+    /// rechecked only by positioned callers.
+    Unpositioned(&'a TargetFilter),
+}
+
+impl<'a> AbilityTargetSlot<'a> {
+    fn filter(self) -> &'a TargetFilter {
+        match self {
+            Self::Declared { filter, .. } | Self::Unpositioned(filter) => filter,
+        }
+    }
+}
+
+/// CR 115.4: "any target" is a creature, player, planeswalker or battle.
+/// Single authority for which declared damage slots use that domain.
+fn effect_slot_denotes_damage_any_target(effect: &Effect, slot: AbilityTargetSlot<'_>) -> bool {
+    if !is_any_target_filter(slot.filter()) {
+        return false;
+    }
+    match effect {
+        Effect::DealDamage { target, .. } => is_any_target_filter(target),
+        // CR 609.7a + CR 614.9: only the role declared at THIS slot decides; a
+        // declared source is never narrowed because a sibling recipient is `Any`.
+        Effect::CreateDamageReplacement { .. } => match slot {
+            AbilityTargetSlot::Declared { index, .. } => damage_replacement_target_roles(effect)
+                .and_then(|roles| roles.get(index).copied())
+                .is_some_and(DamageReplacementTargetRole::denotes_damage_any_target),
+            AbilityTargetSlot::Unpositioned(_) => false,
+        },
+        _ => false,
+    }
+}
+
 fn damage_any_target_legal_targets(
     state: &GameState,
     ability: &ResolvedAbility,
-    filter: &TargetFilter,
+    slot: AbilityTargetSlot<'_>,
 ) -> Option<Vec<TargetRef>> {
-    if !matches!(
-        (&ability.effect, filter),
-        (
-            Effect::DealDamage {
-                target: TargetFilter::Any,
-                ..
-            },
-            TargetFilter::Any
-        )
-    ) {
+    if !effect_slot_denotes_damage_any_target(&ability.effect, slot) {
         return None;
     }
 
+    // CR 115.4: "any target" is a creature, player, planeswalker or battle
     let player_targets = targeting::find_legal_targets(
         state,
         &TargetFilter::Player,
         ability.controller,
         ability.source_id,
     );
+    let mut permanent_filter = TypedFilter::default().with_type(TypeFilter::AnyOf(vec![
+        TypeFilter::Creature,
+        TypeFilter::Planeswalker,
+        TypeFilter::Battle,
+    ]));
+    if let TargetFilter::Typed(tf) = slot.filter() {
+        permanent_filter.properties = tf.properties.clone();
+    }
     let permanent_targets = targeting::find_legal_targets(
         state,
-        &TargetFilter::Typed(TypedFilter::default().with_type(TypeFilter::AnyOf(vec![
-            TypeFilter::Creature,
-            TypeFilter::Planeswalker,
-            TypeFilter::Battle,
-        ]))),
+        &TargetFilter::Typed(permanent_filter),
         ability.controller,
         ability.source_id,
     );
@@ -6811,7 +7129,9 @@ fn damage_any_target_legal_targets(
 /// optional, and additional-cost-paid clauses retain their announced targets
 /// (CR 601.2c / CR 603.3d).
 fn defers_conditional_target_selection(sub: &ResolvedAbility) -> bool {
-    matches!(&sub.condition, Some(AbilityCondition::WhenYouDo))
+    sub.condition
+        .as_ref()
+        .is_some_and(AbilityCondition::has_when_you_do_marker)
         || matches!(
             &sub.condition,
             Some(AbilityCondition::AdditionalCostPaidInstead) if !sub.context.additional_cost_paid
@@ -7743,7 +8063,7 @@ fn assign_targets_recursive(
     // PRODUCER-AGNOSTIC BY CONSTRUCTION. `assign_targets_in_chain` has 18
     // production call sites and `targets` arrives from three different
     // producers: a player's `GameAction::SelectTargets`
-    // (`casting_targets.rs:387`, `engine_stack.rs:182`),
+    // (the `assign_targets_in_chain` call in `casting_targets::handle_select_targets`, the `assign_targets_in_chain` call in `engine_stack::restamp_pending_die_result`),
     // `auto_select_targets_for_ability` / `auto_select_targets` when EXACTLY
     // ONE legal assignment exists, and `random_select_targets_for_ability`
     // under `TargetSelectionMode::Random`. (CR 115.1d: a triggered ability's
@@ -7756,7 +8076,8 @@ fn assign_targets_recursive(
     // Making this node a sink additionally exposes the chain-level leftover
     // check (`next_target != targets.len()`) to paired nodes for the first
     // time at every one of those sites; on the trigger route
-    // (`triggers.rs:8347`) an error there is turned into
+    // (the `assign_targets_in_chain` call in `triggers::prepare_trigger_targets`)
+    // an error there is turned into
     // `PreparedTriggerTargets::NeedsFallbackPush` and the trigger is DROPPED
     // SILENTLY.
     //
@@ -7884,8 +8205,38 @@ fn assign_targets_recursive(
     // node's `targets` (the PreventDamage HEAD node) BEFORE descending into the
     // sub-chain, so the modal sub (mode 3's PutCounter) consumes its own target
     // next. Slot order matches `collect_target_slots`: source slot first.
+    if ability.target_choice_timing == TargetChoiceTiming::Stack {
+        if let Some(roles) = damage_replacement_target_roles(&ability.effect) {
+            for _role in roles {
+                if let Some(target) = targets.get(*next_target) {
+                    ability.targets.push(target.clone());
+                    *next_target += 1;
+                } else if !ability.optional_targeting {
+                    return Err(EngineError::InvalidAction(
+                        "Missing required target".to_string(),
+                    ));
+                }
+            }
+            if defers_sub_ability_target_selection(&ability.effect) {
+                assign_targets_after_deferred_effect(
+                    state,
+                    ability.sub_ability.as_deref_mut(),
+                    targets,
+                    next_target,
+                )?;
+                return Ok(());
+            }
+            if let Some(sub_ability) = ability.sub_ability.as_mut() {
+                if defers_conditional_target_selection(sub_ability) {
+                    return Ok(());
+                }
+                assign_targets_recursive(state, sub_ability, targets, next_target)?;
+            }
+            return Ok(());
+        }
+    }
     if ability.target_choice_timing == TargetChoiceTiming::Stack
-        && prevent_damage_source_slot_filter(&ability.effect).is_some()
+        && damage_replacement_source_slot_filter(&ability.effect).is_some()
     {
         if let Some(target) = targets.get(*next_target) {
             ability.targets.push(target.clone());
@@ -7969,8 +8320,7 @@ fn assign_targets_recursive(
         if let Some(spec) = ability.multi_target.as_ref() {
             // CR 601.2c + issue #3864: An inheriting rider (Solitude's life-gain)
             // surfaces no slot of its own, so it reserves no minimum here. Mirror
-            // the filter in `minimum_targets_in_chain`'s `rest` term and the
-            // step-by-step `assign_selected_slots_recursive` path.
+            // the filter in `minimum_targets_in_chain`'s `rest` term.
             let remaining_minimum = ability
                 .sub_ability
                 .as_deref()
@@ -7980,7 +8330,8 @@ fn assign_targets_recursive(
             let remaining_after_current = targets.len().saturating_sub(*next_target);
             // Issue #321: cap at this node's own resolved `multi_target` max so a
             // node does not claim a downstream `up to N` effect's optional
-            // targets. Mirrors the cap in `assign_selected_slots_recursive`.
+            // targets. The slot path sizes each node from its own collected
+            // slot group instead (`assign_selected_slots_recursive`).
             let bounds = resolve_multi_target_bounds(state, ability, spec, remaining_after_current)
                 .map_err(|err| EngineError::InvalidAction(format!("{err:?}")))?;
             let current_count = remaining_after_current
@@ -8201,9 +8552,10 @@ fn assign_selected_slots_recursive(
     // CR 601.2c + CR 700.2f: mirror of the paired-subject block in
     // `assign_targets_recursive`, for the ONE-SLOT-AT-A-TIME walk. The bulk
     // `GameAction::SelectTargets` path reaches that function
-    // (`casting_targets.rs:387`, `engine_stack.rs:182`); the step-by-step
+    // (the `assign_targets_in_chain` call in `casting_targets::handle_select_targets`, the `assign_targets_in_chain` call in `engine_stack::restamp_pending_die_result`); the step-by-step
     // `GameAction::ChooseTarget` walk reaches THIS one
-    // (`casting_targets.rs:498`, `engine_stack.rs:345`) — and
+    // (the `assign_selected_slots_in_chain` call in `casting_targets::handle_choose_target`, the `assign_selected_slots_in_chain` call in
+    // `engine_stack::handle_trigger_target_selection_choose_target`) — and
     // `ai_support::candidates::target_step_actions` emits ONLY `ChooseTarget`,
     // so this is the block every AI game goes through.
     //
@@ -8282,12 +8634,39 @@ fn assign_selected_slots_recursive(
         return Ok(());
     }
 
-    // CR 609.7 + CR 601.2c: Mirror the source-scoped `PreventDamage` slot — the
-    // modal cast pipeline drives the slots path, so the chosen source spell must
-    // be consumed into THIS node's `targets` here too, BEFORE descending into the
-    // (modal) sub-chain. Slot order matches `collect_target_slots`: source first.
+    // CR 609.7 + CR 601.2c: The modal path consumes the same structured roles
+    // as normal target assignment, before it descends into the chain.
+    if ability.target_choice_timing == TargetChoiceTiming::Stack {
+        if let Some(roles) = damage_replacement_target_roles(&ability.effect) {
+            for _role in roles {
+                let Some(selected_slot) = selected_slots.get(*next_slot) else {
+                    return Err(EngineError::InvalidAction(
+                        "Missing target selection".to_string(),
+                    ));
+                };
+                match selected_slot {
+                    Some(target) => ability.targets.push(target.clone()),
+                    None if ability.optional_targeting => {}
+                    None => {
+                        return Err(EngineError::InvalidAction(
+                            "Missing required target".to_string(),
+                        ));
+                    }
+                }
+                *next_slot += 1;
+            }
+            if let Some(sub_ability) = ability.sub_ability.as_mut() {
+                if defers_conditional_target_selection(sub_ability) {
+                    return Ok(());
+                }
+                assign_selected_slots_recursive(state, sub_ability, selected_slots, next_slot)?;
+            }
+            return Ok(());
+        }
+    }
+    // Source-scoped `PreventDamage` remains a one-role sibling.
     if ability.target_choice_timing == TargetChoiceTiming::Stack
-        && prevent_damage_source_slot_filter(&ability.effect).is_some()
+        && damage_replacement_source_slot_filter(&ability.effect).is_some()
     {
         let Some(selected_slot) = selected_slots.get(*next_slot) else {
             return Err(EngineError::InvalidAction(
@@ -8398,34 +8777,27 @@ fn assign_selected_slots_recursive(
         && triggers::extract_target_filter_from_effect(&ability.effect).is_some()
     {
         if let Some(spec) = ability.multi_target.as_ref() {
-            // CR 601.2c + issue #3864: A rider that inherits the parent's chosen
-            // creature ("exile up to one target creature. That creature's
-            // controller gains life equal to its power." — Solitude) surfaces no
-            // target slot of its own, so it reserves no minimum here. Filtering
-            // it out mirrors `minimum_targets_in_chain`'s own `rest` term; without
-            // the filter its phantom `Power{Target}` companion minimum (1) cancels
-            // this node's slot, leaving the chosen target unassigned and hard-
-            // erroring with "Unused selected target slots".
-            let remaining_minimum = ability
-                .sub_ability
-                .as_deref()
-                .filter(|sub| !sub_ability_inherits_parent_creature_target_only(ability, sub))
-                .map(|sub| minimum_targets_in_chain(state, sub))
-                .unwrap_or(0);
             let remaining_after_current = selected_slots.len().saturating_sub(*next_slot);
-            // Issue #321: A multi-target node must consume only as many slots as
-            // `collect_target_slots` produced for it — i.e. its own resolved
-            // `multi_target` max (clamped to `spec.min`). Subtracting only the
-            // sub-chain's *minimum* is not enough: when a downstream effect is
-            // itself `up to N` (min 0), the current node would greedily claim
-            // the sub-effect's optional slots too, applying its effect (e.g.
-            // Betor's "+1/+1 counters" PutCounter) to the graveyard-return
-            // target as well. Cap at this node's max so each effect resolves
-            // against exactly its own chosen targets (CR 601.2c).
+            // CR 601.2c + CR 115.1: each instance of "target" has its own announced
+            // choice, so a multi-target node receives exactly the declared slots of
+            // its own slot group. That group is the declared window minus the slots
+            // the collector produces for the rest of this chain: the same
+            // `collect_sub_chain_slots` walk that built the prompt, which already
+            // skips an inheriting rider (Solitude, #3864) and deferred sub-targets.
+            // Sizing from the chain's *minimum* instead let an unlimited node, or one
+            // bounded above its legal pool, claim a later min-0 group's declared
+            // slots (issue #321's class). CR 115.6 + CR 107.1c: that later group may
+            // legally be empty, and it keeps its own empty window.
+            let mut later_slots = SlotAccumulator::default();
+            collect_sub_chain_slots(state, ability, &mut later_slots)?;
             let bounds = resolve_multi_target_bounds(state, ability, spec, remaining_after_current)
                 .map_err(|err| EngineError::InvalidAction(format!("{err:?}")))?;
+            // The window's two terms divide the work: the collector's slot group
+            // sizes it, and the node's own resolved maximum still bounds it, as at
+            // base. The clamp is what keeps a re-collection that under-reports the
+            // rest of this chain from pushing this node past its own maximum.
             let current_slots = remaining_after_current
-                .saturating_sub(remaining_minimum)
+                .saturating_sub(later_slots.slots.len())
                 .min(bounds.max);
             let end_slot = *next_slot + current_slots;
             let Some(window) = selected_slots.get(*next_slot..end_slot) else {
@@ -8810,12 +9182,18 @@ fn chain_has_target_sink(ability: &ResolvedAbility) -> bool {
         return true;
     }
 
+    if ability.target_choice_timing == TargetChoiceTiming::Stack
+        && damage_replacement_target_roles(&ability.effect).is_some()
+    {
+        return true;
+    }
+
     // CR 609.7 + CR 601.2c: A source-scoped `PreventDamage` head node consumes
     // the chosen source spell into its own `targets[0]` — `collect_target_slots`
     // pushes a source slot for it, and `assign_targets_recursive` consumes one
     // target into this node BEFORE descending into the (modal) sub-chain.
     if ability.target_choice_timing == TargetChoiceTiming::Stack
-        && prevent_damage_source_slot_filter(&ability.effect).is_some()
+        && damage_replacement_source_slot_filter(&ability.effect).is_some()
     {
         return true;
     }
@@ -8977,7 +9355,9 @@ fn node_slot_filters(ability: &ResolvedAbility) -> NodeSlotFilters {
     // Arm 1 — `PreventDamage` source slot (declared FIRST, not returned early,
     // exactly mirroring `collect_target_slot_specs`).
     if stack_timing {
-        if let Some(src) = prevent_damage_source_slot_filter(&ability.effect) {
+        if let Some(roles) = damage_replacement_target_roles(&ability.effect) {
+            lead.extend(roles.into_iter().map(|role| role.filter().clone()));
+        } else if let Some(src) = damage_replacement_source_slot_filter(&ability.effect) {
             lead.push(src.clone());
         }
     }
@@ -9009,9 +9389,7 @@ fn node_slot_filters(ability: &ResolvedAbility) -> NodeSlotFilters {
         return NodeSlotFilters::PerSlot(lead);
     } else if matches!(
         ability.effect,
-        Effect::Attach { .. }
-            | Effect::CreateDamageReplacement { .. }
-            | Effect::EachDealsDamageEqualToPower { .. }
+        Effect::Attach { .. } | Effect::EachDealsDamageEqualToPower { .. }
     ) {
         return NodeSlotFilters::NotDerivable;
     }
@@ -9114,7 +9492,7 @@ fn node_slot_filters(ability: &ResolvedAbility) -> NodeSlotFilters {
 ///     (measured on Prey Upon, a printed `Fight` card, whose root is
 ///     fail-closed).
 ///
-///     BYTE-IDENTITY TO `bb28b0e8b` AT SUCH A POSITION IS CONDITIONAL, and the
+///     BYTE-IDENTITY TO BASE AT SUCH A POSITION IS CONDITIONAL, and the
 ///     condition is a DIFFERENT authority from the one that produced `Legacy`.
 ///     BASE's `retarget_slot_violation` is a no-op at a position exactly when
 ///
@@ -9598,6 +9976,13 @@ fn minimum_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -> usi
     } else {
         paired_subject_slot_filters(&ability.effect).count()
     };
+    let damage_replacement_targets = if ability.target_choice_timing == TargetChoiceTiming::Stack
+        && !ability.optional_targeting
+    {
+        damage_replacement_target_roles(&ability.effect).map_or(0, |roles| roles.len())
+    } else {
+        0
+    };
 
     // CR 601.2c: A multi-role mana surfaces a DIFFERENT number of slots than the
     // generic `extract_target_filter_from_effect` term below reserves. Add only
@@ -9728,6 +10113,7 @@ fn minimum_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -> usi
     let current = attach_targets
         + move_counter_targets
         + paired_subject_targets
+        + damage_replacement_targets
         + mana_extra_roles
         + player_companion
         + target_creature_quantity_companion
@@ -9974,7 +10360,7 @@ mod tests {
     }
 
     /// Row P-LEGACY-ROOT (ii) (phase-rs/phase#8355 round-8 review; m10's
-    /// stated predicate, `ability_utils.rs:8291-8299`) — cheap, and the only
+    /// stated predicate, in `assign_targets_recursive`) — cheap, and the only
     /// guard between a `node_slot_filters`/`emit_node` arm-order drift and a
     /// silent whole-cascade admission in release. `SlotEnforcement::Legacy`
     /// (`node_slot_filters`' `NotDerivable` verdict) is BASE-equivalent ONLY
@@ -11848,6 +12234,65 @@ mod tests {
             ),
             "a delayed-return ParentTarget ability must not fizzle when its \
              snapshotted object is off the battlefield"
+        );
+    }
+
+    /// CR 608.2b: validation compacts each node's pruned targets, so the
+    /// illegal declared slots are found by per-node membership and reported in
+    /// `flatten_targets_in_chain`'s numbering — a pruned first target does not
+    /// shift the verdict onto its surviving neighbour, and a later node's slots
+    /// continue the count.
+    #[test]
+    fn illegal_declared_target_slots_numbers_pruned_targets_across_the_chain() {
+        let [a, b, c, d] = [1, 2, 3, 4].map(|id| TargetRef::Object(ObjectId(id)));
+        let node = |targets: Vec<TargetRef>| {
+            ResolvedAbility::new(
+                Effect::TargetOnly {
+                    target: TargetFilter::Any,
+                },
+                targets,
+                ObjectId(99),
+                PlayerId(0),
+            )
+        };
+        let declared = node(vec![a, b.clone()]).sub_ability(node(vec![c.clone(), d]));
+        let validated = node(vec![b]).sub_ability(node(vec![c]));
+
+        assert_eq!(flatten_targets_in_chain(&declared).len(), 4);
+        assert_eq!(
+            illegal_declared_target_slots(&declared, &validated),
+            vec![0, 3],
+            "slot 0 (pruned, compacted away) and slot 3 (pruned in the sub) are illegal"
+        );
+        assert!(
+            illegal_declared_target_slots(&declared, &declared).is_empty(),
+            "an unpruned chain has no illegal slots"
+        );
+    }
+
+    /// CR 115.3 + CR 608.2b: one object may fill two target slots of a node.
+    /// When validation prunes one copy, the surviving copy vouches for only one
+    /// declared slot, so exactly one of the two is reported illegal.
+    #[test]
+    fn illegal_declared_target_slots_counts_a_duplicated_target_per_slot() {
+        let [x, y] = [1, 2].map(|id| TargetRef::Object(ObjectId(id)));
+        let node = |targets: Vec<TargetRef>| {
+            ResolvedAbility::new(
+                Effect::TargetOnly {
+                    target: TargetFilter::Any,
+                },
+                targets,
+                ObjectId(99),
+                PlayerId(0),
+            )
+        };
+        let declared = node(vec![x.clone(), x.clone(), y.clone()]);
+        let validated = node(vec![x, y]);
+
+        assert_eq!(
+            illegal_declared_target_slots(&declared, &validated),
+            vec![1],
+            "one pruned copy of a duplicated target marks one slot"
         );
     }
 
@@ -15137,6 +15582,8 @@ mod tests {
                 duration: None,
                 driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
                 mana_spend_permission: None,
+                additional_cost: None,
+                cast_cost_modifier: None,
             },
             Vec::new(),
             ObjectId(1),
@@ -15176,6 +15623,8 @@ mod tests {
                 duration: None,
                 driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
                 mana_spend_permission: None,
+                additional_cost: None,
+                cast_cost_modifier: None,
             },
             Vec::new(),
             ObjectId(1),
@@ -15209,6 +15658,8 @@ mod tests {
                 duration: None,
                 driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
                 mana_spend_permission: None,
+                additional_cost: None,
+                cast_cost_modifier: None,
             },
             Vec::new(),
             ObjectId(1),
@@ -16256,6 +16707,8 @@ mod tests {
                 duration: None,
                 driver: CastFromZoneDriver::DuringResolution,
                 mana_spend_permission: None,
+                additional_cost: None,
+                cast_cost_modifier: None,
             },
             vec![],
             ObjectId(900),
@@ -18796,7 +19249,7 @@ mod tests {
                 combat_scope: None,
                 target_filter: None,
                 modification: None,
-                redirect_to: Some(DamageRedirectTarget::ChosenObjectTarget),
+                redirect_to: Some(DamageRedirectTarget::ChosenTarget),
                 redirect_amount: None,
                 redirect_object_filter: Some(creature_filter()),
                 recipient_object_filter: None,
@@ -18878,7 +19331,8 @@ mod tests {
 
     /// Ordering contract (Nit 1): when BOTH filters are present the recipient
     /// slot is surfaced FIRST, then the redirect slot — matching the resolver's
-    /// `chosen_target_object(_, 0)` / `chosen_redirect_object` indexing.
+    /// `chosen_target_object(_, 0)` recipient read and its positional
+    /// `ability.targets.get(redirect_slot)` redirect-recipient read.
     #[test]
     fn build_target_slots_recipient_slot_precedes_redirect_slot() {
         use crate::types::ability::DamageRedirectTarget;
@@ -18908,7 +19362,7 @@ mod tests {
                 combat_scope: None,
                 target_filter: None,
                 modification: None,
-                redirect_to: Some(DamageRedirectTarget::ChosenObjectTarget),
+                redirect_to: Some(DamageRedirectTarget::ChosenTarget),
                 redirect_amount: None,
                 redirect_object_filter: Some(creature_filter()),
                 recipient_object_filter: Some(creature_filter()),
@@ -18923,6 +19377,372 @@ mod tests {
             slots.len(),
             2,
             "recipient + redirect slots must both surface when both filters are set"
+        );
+    }
+
+    /// CR 608.2b + CR 115.4 (secondary seam — the shared resolution recheck):
+    /// `validate_pinned_targets` narrows a damage "any target" to the
+    /// creature/player/planeswalker/battle domain for BOTH declaring effects
+    /// that use it. A noncreature artifact still on the battlefield is dropped;
+    /// a creature (positive control) is kept. Reverting the domain intersection
+    /// in `validate_pinned_targets` keeps the artifact for both effects.
+    #[test]
+    fn validate_targets_in_chain_rechecks_damage_any_target_domain() {
+        use crate::types::ability::{
+            DamageRedirectTarget, PreventionAmount, QuantityExpr, RedirectionLifetime,
+        };
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Source".into(),
+            Zone::Battlefield,
+        );
+        let artifact = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Probe Rock".into(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&artifact)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Artifact];
+        let creature = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(1),
+            "Bear".into(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&creature)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Creature];
+
+        let deal_damage = Effect::DealDamage {
+            amount: QuantityExpr::Fixed { value: 3 },
+            target: TargetFilter::Any,
+            damage_source: None,
+            excess: None,
+        };
+        let redirect = Effect::CreateDamageReplacement {
+            redirect_lifetime: RedirectionLifetime::OneOpportunity,
+            source_filter: Some(TargetFilter::ChosenDamageSource { filter: None }),
+            combat_scope: None,
+            target_filter: None,
+            modification: None,
+            redirect_to: Some(DamageRedirectTarget::ChosenTarget),
+            redirect_amount: Some(PreventionAmount::Next(2)),
+            redirect_object_filter: Some(TargetFilter::Any),
+            recipient_object_filter: None,
+        };
+
+        for (label, effect) in [
+            ("DealDamage", deal_damage),
+            ("CreateDamageReplacement", redirect),
+        ] {
+            let kept = |target: TargetRef| {
+                validate_targets_in_chain(
+                    &state,
+                    &ResolvedAbility::new(effect.clone(), vec![target], source, PlayerId(0)),
+                )
+                .targets
+            };
+            assert_eq!(
+                kept(TargetRef::Object(creature)),
+                vec![TargetRef::Object(creature)],
+                "{label}: a creature stays a legal damage 'any target' on resolution"
+            );
+            assert!(
+                kept(TargetRef::Object(artifact)).is_empty(),
+                "{label}: CR 115.4 — a noncreature artifact is not a legal 'any target'"
+            );
+        }
+    }
+
+    /// Fixture for an "any target" ORIGINAL recipient paired with a typed
+    /// (creature) redirect recipient: a non-creature host plus one battlefield
+    /// object per CR 115.4 domain probe. Returns the state, the host, and
+    /// `[land, artifact, creature_a, creature_b, planeswalker]`.
+    fn original_recipient_any_fixture() -> (GameState, ObjectId, [ObjectId; 5]) {
+        let mut state = GameState::new_two_player(42);
+        let host = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Redirector".into(),
+            Zone::Battlefield,
+        );
+        let mut probe = |cid: u64, name: &str, core_type: CoreType| {
+            let id = create_object(
+                &mut state,
+                CardId(cid),
+                PlayerId(1),
+                name.to_string(),
+                Zone::Battlefield,
+            );
+            state.objects.get_mut(&id).unwrap().card_types.core_types = vec![core_type];
+            id
+        };
+        let ids = [
+            probe(2, "Probe Land", CoreType::Land),
+            probe(3, "Probe Rock", CoreType::Artifact),
+            probe(4, "Bear A", CoreType::Creature),
+            probe(5, "Bear B", CoreType::Creature),
+            probe(6, "Probe Walker", CoreType::Planeswalker),
+        ];
+        (state, host, ids)
+    }
+
+    fn original_recipient_any_redirect() -> Effect {
+        use crate::types::ability::{DamageRedirectTarget, PreventionAmount, RedirectionLifetime};
+        Effect::CreateDamageReplacement {
+            redirect_lifetime: RedirectionLifetime::OneOpportunity,
+            source_filter: None,
+            combat_scope: None,
+            target_filter: None,
+            modification: None,
+            redirect_to: Some(DamageRedirectTarget::ChosenTarget),
+            redirect_amount: Some(PreventionAmount::Next(1)),
+            redirect_object_filter: Some(creature_filter()),
+            recipient_object_filter: Some(TargetFilter::Any),
+        }
+    }
+
+    /// CR 115.4 + CR 601.2c: an "any target" ORIGINAL recipient of a damage
+    /// redirection is chosen from the creature/player/planeswalker/battle
+    /// domain through the production slot builder — never a land or a
+    /// noncreature artifact — while its typed redirect sibling keeps its own
+    /// creature-only filter. Reverting `denotes_damage_any_target` to
+    /// redirect-only offers the land and the artifact for the recipient slot.
+    #[test]
+    fn build_target_slots_original_recipient_any_uses_damage_any_target_domain() {
+        let (state, host, [land, artifact, creature_a, creature_b, walker]) =
+            original_recipient_any_fixture();
+        let ability =
+            ResolvedAbility::new(original_recipient_any_redirect(), vec![], host, PlayerId(0));
+
+        let slots = build_target_slots(&state, &ability).expect("both role slots must build");
+        assert_eq!(
+            slots.len(),
+            2,
+            "original-recipient slot, then redirect slot"
+        );
+
+        let recipient = &slots[0].legal_targets;
+        for positive in [
+            TargetRef::Player(PlayerId(0)),
+            TargetRef::Player(PlayerId(1)),
+            TargetRef::Object(creature_a),
+            TargetRef::Object(creature_b),
+            TargetRef::Object(walker),
+        ] {
+            assert!(
+                recipient.contains(&positive),
+                "{positive:?} is a legal 'any target' original recipient: {recipient:?}"
+            );
+        }
+        for negative in [TargetRef::Object(land), TargetRef::Object(artifact)] {
+            assert!(
+                !recipient.contains(&negative),
+                "CR 115.4 — {negative:?} is not a legal 'any target': {recipient:?}"
+            );
+        }
+
+        // Typed sibling: the creature redirect slot is not widened to the domain.
+        let redirect = &slots[1].legal_targets;
+        assert!(redirect.contains(&TargetRef::Object(creature_a)));
+        for negative in [
+            TargetRef::Player(PlayerId(1)),
+            TargetRef::Object(walker),
+            TargetRef::Object(artifact),
+        ] {
+            assert!(
+                !redirect.contains(&negative),
+                "the typed creature redirect slot must not offer {negative:?}: {redirect:?}"
+            );
+        }
+    }
+
+    /// CR 608.2b + CR 115.4 + CR 614.9: on resolution an "any target" ORIGINAL
+    /// recipient is rechecked against the same domain. A noncreature artifact
+    /// recipient is an illegal role: with a legal creature redirect the role set
+    /// is partial (positions preserved, no shield installed); with an illegal
+    /// redirect too, every role is illegal and the targets are cleared. A
+    /// creature recipient (positive control) keeps every role legal and installs
+    /// the shield. The typed redirect sibling stays creature-only. Reverting
+    /// `denotes_damage_any_target` to redirect-only accepts the artifact.
+    #[test]
+    fn validate_targets_in_chain_rechecks_original_recipient_any_domain() {
+        let (state, host, [_land, artifact, creature_a, creature_b, walker]) =
+            original_recipient_any_fixture();
+        let ability = |targets: Vec<TargetRef>| {
+            ResolvedAbility::new(
+                original_recipient_any_redirect(),
+                targets,
+                host,
+                PlayerId(0),
+            )
+        };
+        let legality = |targets: Vec<TargetRef>| {
+            damage_replacement_target_role_legality(&state, &ability(targets))
+                .expect("a declared-role damage replacement")
+        };
+        let installed_shields = |targets: Vec<TargetRef>| {
+            let mut resolved_state = state.clone();
+            let validated = validate_targets_in_chain(&resolved_state, &ability(targets));
+            crate::game::effects::create_damage_replacement::resolve(
+                &mut resolved_state,
+                &validated,
+                &mut Vec::new(),
+            )
+            .expect("the damage replacement resolves");
+            resolved_state
+                .objects
+                .values()
+                .map(|obj| obj.replacement_definitions.len())
+                .sum::<usize>()
+                + resolved_state.pending_damage_replacements.len()
+        };
+
+        // Positive control: a creature recipient and a creature redirect.
+        let legal = vec![TargetRef::Object(creature_a), TargetRef::Object(creature_b)];
+        assert_eq!(
+            legality(legal.clone()),
+            DamageReplacementTargetRoleLegality::All
+        );
+        assert_eq!(
+            validate_targets_in_chain(&state, &ability(legal.clone())).targets,
+            legal
+        );
+        assert_eq!(
+            installed_shields(legal),
+            1,
+            "a fully legal redirection installs"
+        );
+
+        // A noncreature artifact recipient is not an "any target".
+        let artifact_recipient = vec![TargetRef::Object(artifact), TargetRef::Object(creature_b)];
+        assert_eq!(
+            legality(artifact_recipient.clone()),
+            DamageReplacementTargetRoleLegality::Partial,
+            "CR 115.4 — the artifact original recipient is an illegal role"
+        );
+        assert_eq!(
+            validate_targets_in_chain(&state, &ability(artifact_recipient.clone())).targets,
+            artifact_recipient,
+            "CR 608.2b — a remaining legal role preserves every role position"
+        );
+        assert_eq!(
+            installed_shields(artifact_recipient),
+            0,
+            "an illegal original recipient installs no shield"
+        );
+
+        // Both roles illegal: the artifact recipient and a planeswalker in the
+        // typed creature redirect slot.
+        assert!(
+            validate_targets_in_chain(
+                &state,
+                &ability(vec![TargetRef::Object(artifact), TargetRef::Object(walker)])
+            )
+            .targets
+            .is_empty(),
+            "CR 608.2b — every declared role illegal clears the targets"
+        );
+
+        // Typed sibling: a planeswalker is a legal 'any target' but not a legal
+        // creature redirect; the typed slot is not widened.
+        assert_eq!(
+            legality(vec![
+                TargetRef::Object(creature_a),
+                TargetRef::Object(walker)
+            ]),
+            DamageReplacementTargetRoleLegality::Partial,
+            "the creature redirect filter still rejects a planeswalker"
+        );
+    }
+
+    /// CR 609.7a + CR 115.4 + CR 614.9: the "any target" domain is decided per
+    /// declared SLOT. A damage replacement whose declared source leaf is `Any`
+    /// and whose redirect recipient is also `Any` narrows only the redirect
+    /// slot: the source slot keeps the generic `Any` enumeration (a land and a
+    /// noncreature artifact stay offered, and stay legal on the resolution
+    /// recheck), while the redirect slot and its recheck exclude them.
+    /// Reverting `effect_slot_denotes_damage_any_target` to "any role denotes
+    /// any target" narrows the source slot too.
+    #[test]
+    fn declared_source_any_slot_is_not_narrowed_by_redirect_any_sibling() {
+        use crate::types::ability::{DamageRedirectTarget, PreventionAmount, RedirectionLifetime};
+        let (state, host, [land, artifact, creature_a, _creature_b, walker]) =
+            original_recipient_any_fixture();
+        let effect = Effect::CreateDamageReplacement {
+            redirect_lifetime: RedirectionLifetime::OneOpportunity,
+            source_filter: Some(TargetFilter::And {
+                filters: vec![
+                    TargetFilter::ParentTargetSlot { index: 0 },
+                    TargetFilter::Any,
+                ],
+            }),
+            combat_scope: None,
+            target_filter: None,
+            modification: None,
+            redirect_to: Some(DamageRedirectTarget::ChosenTarget),
+            redirect_amount: Some(PreventionAmount::Next(1)),
+            redirect_object_filter: Some(TargetFilter::Any),
+            recipient_object_filter: None,
+        };
+        let ability = |targets: Vec<TargetRef>| {
+            ResolvedAbility::new(effect.clone(), targets, host, PlayerId(0))
+        };
+        assert!(matches!(
+            damage_replacement_target_roles(&effect).as_deref(),
+            Some([
+                DamageReplacementTargetRole::DeclaredSource(TargetFilter::Any),
+                DamageReplacementTargetRole::RedirectRecipient(TargetFilter::Any),
+            ])
+        ));
+
+        let slots = build_target_slots(&state, &ability(vec![])).expect("both role slots build");
+        assert_eq!(slots.len(), 2, "declared-source slot, then redirect slot");
+
+        let source = &slots[0].legal_targets;
+        for positive in [TargetRef::Object(land), TargetRef::Object(artifact)] {
+            assert!(
+                source.contains(&positive),
+                "CR 609.7a — the declared source slot keeps {positive:?}: {source:?}"
+            );
+        }
+        let redirect = &slots[1].legal_targets;
+        assert!(redirect.contains(&TargetRef::Object(walker)));
+        for negative in [TargetRef::Object(land), TargetRef::Object(artifact)] {
+            assert!(
+                !redirect.contains(&negative),
+                "CR 115.4 — the redirect slot must not offer {negative:?}: {redirect:?}"
+            );
+        }
+
+        // Resolution recheck, same per-slot decision.
+        let legality = |targets: Vec<TargetRef>| {
+            damage_replacement_target_role_legality(&state, &ability(targets))
+                .expect("a declared-role damage replacement")
+        };
+        assert_eq!(
+            legality(vec![TargetRef::Object(land), TargetRef::Object(creature_a)]),
+            DamageReplacementTargetRoleLegality::All,
+            "a land declared source stays legal"
+        );
+        assert_eq!(
+            legality(vec![TargetRef::Object(artifact), TargetRef::Object(land)]),
+            DamageReplacementTargetRoleLegality::Partial,
+            "only the land redirect recipient is illegal"
         );
     }
 
@@ -20404,7 +21224,12 @@ mod tests {
             PlayerId(0),
         );
         let bare = targeting::find_legal_targets(&state, &filter, PlayerId(0), ObjectId(100));
-        let via_ability = legal_targets_for_ability_filter_uncapped(&state, &ability, &filter, &[]);
+        let via_ability = legal_targets_for_ability_filter_uncapped(
+            &state,
+            &ability,
+            AbilityTargetSlot::Unpositioned(&filter),
+            &[],
+        );
         assert_eq!(
             bare, via_ability,
             "no prior object slot exists, so both doors must agree"
@@ -20621,7 +21446,12 @@ mod tests {
             ObjectId(100),
             PlayerId(0),
         );
-        let _ = legal_targets_for_ability_filter_uncapped(&state, &bare_ability, &filter, &[]);
+        let _ = legal_targets_for_ability_filter_uncapped(
+            &state,
+            &bare_ability,
+            AbilityTargetSlot::Unpositioned(&filter),
+            &[],
+        );
         assert_eq!(
             crate::game::perf_counters::prior_target_binding_snapshot().static_union_enumerations,
             0,
@@ -20869,6 +21699,332 @@ mod tests {
             caster,
             "without the stamp the gate falls back to the ability's controller — the \
              wrong seat this change exists to correct"
+        );
+    }
+
+    #[test]
+    fn damage_any_target_legal_targets_narrows_deal_damage_any_target() {
+        use crate::types::ability::QuantityExpr;
+        use crate::types::card_type::CoreType;
+
+        let mut state = GameState::new_two_player(42);
+        let creature = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "Bear".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&creature)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+
+        let planeswalker = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Jace".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&planeswalker)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Planeswalker);
+
+        let battle = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(1),
+            "Invasion".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&battle)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Battle);
+
+        let land = create_object(
+            &mut state,
+            CardId(4),
+            PlayerId(1),
+            "Island".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&land)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Land);
+
+        let artifact = create_object(
+            &mut state,
+            CardId(5),
+            PlayerId(1),
+            "Sol Ring".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&artifact)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Artifact);
+
+        let enchantment = create_object(
+            &mut state,
+            CardId(6),
+            PlayerId(1),
+            "Blood Moon".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&enchantment)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Enchantment);
+
+        let source = create_object(
+            &mut state,
+            CardId(7),
+            PlayerId(0),
+            "Lightning Bolt".to_string(),
+            Zone::Battlefield,
+        );
+
+        let damage_ability = ResolvedAbility::new(
+            Effect::DealDamage {
+                target: TargetFilter::Any,
+                amount: QuantityExpr::Fixed { value: 3 },
+                damage_source: None,
+                excess: None,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+
+        let slot = AbilityTargetSlot::Declared {
+            index: 0,
+            filter: &TargetFilter::Any,
+        };
+
+        // CR 115.4: "any target" in damage effects denotes a creature, player, planeswalker, or battle.
+        let targets = damage_any_target_legal_targets(&state, &damage_ability, slot)
+            .expect("damage any target must return narrowed domain");
+
+        assert!(targets.contains(&TargetRef::Player(PlayerId(0))));
+        assert!(targets.contains(&TargetRef::Player(PlayerId(1))));
+        assert!(targets.contains(&TargetRef::Object(creature)));
+        assert!(targets.contains(&TargetRef::Object(planeswalker)));
+        assert!(targets.contains(&TargetRef::Object(battle)));
+        assert!(
+            !targets.contains(&TargetRef::Object(land)),
+            "Land must not be in damage any-target domain"
+        );
+        assert!(
+            !targets.contains(&TargetRef::Object(artifact)),
+            "Artifact must not be in damage any-target domain"
+        );
+        assert!(
+            !targets.contains(&TargetRef::Object(enchantment)),
+            "Enchantment must not be in damage any-target domain"
+        );
+        assert_eq!(targets.len(), 5); // 2 players + 3 valid permanents
+    }
+
+    #[test]
+    fn damage_any_target_legal_targets_narrows_deal_damage_bare_another_target() {
+        use crate::types::ability::QuantityExpr;
+        use crate::types::card_type::CoreType;
+
+        let mut state = GameState::new_two_player(42);
+        let creature = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "Bear".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&creature)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+
+        let planeswalker = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Jace".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&planeswalker)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Planeswalker);
+
+        let battle = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(1),
+            "Invasion".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&battle)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Battle);
+
+        let land = create_object(
+            &mut state,
+            CardId(4),
+            PlayerId(1),
+            "Island".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&land)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Land);
+
+        let source = create_object(
+            &mut state,
+            CardId(7),
+            PlayerId(0),
+            "Damage Source Creature".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+
+        let another_filter =
+            TargetFilter::Typed(TypedFilter::default().properties(vec![FilterProp::Another]));
+
+        let damage_ability = ResolvedAbility::new(
+            Effect::DealDamage {
+                target: another_filter.clone(),
+                amount: QuantityExpr::Fixed { value: 2 },
+                damage_source: None,
+                excess: None,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+
+        let slot = AbilityTargetSlot::Declared {
+            index: 0,
+            filter: &another_filter,
+        };
+
+        // CR 115.4: bare "another target" in damage effects denotes creature, player, planeswalker, or battle,
+        // excluding the source itself and non-creature/planeswalker/battle objects.
+        let targets = damage_any_target_legal_targets(&state, &damage_ability, slot)
+            .expect("damage another target must return narrowed domain");
+
+        assert!(targets.contains(&TargetRef::Player(PlayerId(0))));
+        assert!(targets.contains(&TargetRef::Player(PlayerId(1))));
+        assert!(targets.contains(&TargetRef::Object(creature)));
+        assert!(targets.contains(&TargetRef::Object(planeswalker)));
+        assert!(targets.contains(&TargetRef::Object(battle)));
+        assert!(
+            !targets.contains(&TargetRef::Object(source)),
+            "Source object must be excluded by FilterProp::Another"
+        );
+        assert!(
+            !targets.contains(&TargetRef::Object(land)),
+            "Land must not be in damage another-target domain"
+        );
+        assert_eq!(targets.len(), 5);
+    }
+
+    #[test]
+    fn damage_any_target_legal_targets_returns_none_for_non_damage_any() {
+        use crate::types::card_type::CoreType;
+
+        let mut state = GameState::new_two_player(42);
+        let land = create_object(
+            &mut state,
+            CardId(4),
+            PlayerId(1),
+            "Island".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&land)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Land);
+
+        let source = create_object(
+            &mut state,
+            CardId(7),
+            PlayerId(0),
+            "Aura Source".to_string(),
+            Zone::Battlefield,
+        );
+
+        let non_damage_ability = ResolvedAbility::new(
+            Effect::Attach {
+                attachment: TargetFilter::SelfRef,
+                target: TargetFilter::Any,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+
+        let slot = AbilityTargetSlot::Declared {
+            index: 0,
+            filter: &TargetFilter::Any,
+        };
+
+        // Non-damage effect must NOT narrow through damage_any_target_legal_targets
+        assert_eq!(
+            damage_any_target_legal_targets(&state, &non_damage_ability, slot),
+            None,
+            "Non-damage effect must return None from damage_any_target_legal_targets"
+        );
+
+        // And build_target_slots retains broad Any targeting, including lands
+        let slots = build_target_slots(&state, &non_damage_ability)
+            .expect("build_target_slots must succeed");
+        assert!(
+            slots[0].legal_targets.contains(&TargetRef::Object(land)),
+            "Non-damage Any target slot must include land"
         );
     }
 }
