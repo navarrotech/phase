@@ -15092,5 +15092,46 @@ mod tests {
             crack > pass,
             "cracking the fetchland ({crack}) must outscore passing ({pass})"
         );
+
+        // Pin the policy that supplies the preference against the real card, so
+        // a classifier or library-gate regression cannot hide behind the score
+        // ordering. `EtbTapState` and the search filter both come from the card
+        // database here, not from a synthetic fixture.
+        let candidates = validated_candidate_actions_for_semantic_owner(state, P0);
+        let candidate = candidates
+            .iter()
+            .find(|candidate| {
+                matches!(&candidate.action, GameAction::ActivateAbility { source_id, .. } if *source_id == misty)
+            })
+            .expect("Misty's printed activation must be a validated candidate");
+        let decision = AiDecisionContext {
+            waiting_for: state.waiting_for.clone(),
+            candidates: candidates.clone(),
+        };
+        let context = crate::context::AiContext::empty(&config.weights);
+        let ctx = PolicyContext {
+            state,
+            decision: &decision,
+            candidate,
+            ai_player: P0,
+            config: &config,
+            context: &context,
+            cast_facts: None,
+            search_depth: crate::policies::context::SearchDepth::Root,
+        };
+        let verdict = crate::policies::registry::PolicyRegistry::shared()
+            .verdicts(&ctx)
+            .into_iter()
+            .find_map(|(id, verdict)| {
+                (id == crate::policies::registry::PolicyId::FetchLandPatience).then_some(verdict)
+            })
+            .expect("the fetch-land policy must report on an activation candidate");
+        match verdict {
+            PolicyVerdict::Score { delta, reason } => {
+                assert_eq!(reason.kind, "fetch_untapped_own_turn");
+                assert!(delta > 0.0, "the real card must be scored up, got {delta}");
+            }
+            PolicyVerdict::Reject { .. } => panic!("a printed fetchland must not be gated"),
+        }
     }
 }

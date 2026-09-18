@@ -148,7 +148,14 @@ impl TacticalPolicy for FetchLandPatiencePolicy {
                 // be cracked later at no cost), so stay neutral rather than
                 // pushing either way. The own-turn score below means a fetch
                 // rarely survives to see that window at all.
-                if !own_turn {
+                //
+                // The empty stack is part of the same restraint. This policy's
+                // whole argument is about the turn's mana, which it can make
+                // only in a clean window; with something on the stack the
+                // question is whether to respond to *that*, which this policy
+                // has no information about. Cracking as a response stays legal
+                // and reachable, it just is not scored up from here.
+                if !own_turn || !ctx.state.stack.is_empty() {
                     return na();
                 }
                 // Paying the life to search a library that holds no match would
@@ -432,6 +439,39 @@ mod tests {
                 assert_eq!(delta, 0.0);
             }
             PolicyVerdict::Reject { .. } => panic!("an empty library must not be gated"),
+        }
+    }
+
+    /// With something on the stack the live question is whether to respond to
+    /// it, which this policy cannot judge — so it declines to score rather than
+    /// pushing a second fetch onto the stack ahead of the pending one.
+    #[test]
+    fn untapped_fetchland_with_a_non_empty_stack_is_neutral() {
+        let mut state = GameState::new_two_player(42);
+        state.active_player = AI;
+        state.phase = Phase::PreCombatMain;
+        ai_library_land(&mut state);
+        let id = ai_land_with_ability(&mut state, fetch_land_ability(EtbTapState::Untapped));
+        let pending = ai_land_with_ability(&mut state, fetch_land_ability(EtbTapState::Untapped));
+        state
+            .stack
+            .push_back(engine::types::game_state::StackEntry {
+                id: pending,
+                source_id: pending,
+                controller: AI,
+                kind: engine::types::game_state::StackEntryKind::Spell {
+                    card_id: CardId(1),
+                    ability: None,
+                    casting_variant: Default::default(),
+                    actual_mana_spent: 0,
+                },
+            });
+        match verdict_for(&state, id) {
+            PolicyVerdict::Score { delta, reason } => {
+                assert_eq!(reason.kind, "fetch_patience_na");
+                assert_eq!(delta, 0.0);
+            }
+            PolicyVerdict::Reject { .. } => panic!("a stack response must not be gated"),
         }
     }
 
