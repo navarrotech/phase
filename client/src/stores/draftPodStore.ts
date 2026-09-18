@@ -16,7 +16,7 @@
 
 import { create } from "zustand";
 
-import { DraftAdapter, distinctJoined, setPackSequence, type CubeDraftSettings, type DraftProcedure, type PackDistribution, type PoolInput, type SetPackSequence, type TournamentFormat, type PodPolicy } from "../adapter/draft-adapter";
+import { DraftAdapter, distinctJoined, setPackSequence, type CubeDraftSettings, type DraftProcedure, type PackDistribution, type PoolInput, type SetLayoutKind, type SetPackSequence, type TournamentFormat, type PodPolicy } from "../adapter/draft-adapter";
 import type { DraftPackChoice } from "./draftStore";
 import type { DraftPodHostConfig } from "../adapter/draftPodHostAdapter";
 import type { DraftPodGuestConfig } from "../adapter/draftPodGuestAdapter";
@@ -107,8 +107,25 @@ interface DraftPodState {
   procedureCacheKey: ProcedureCacheKey | null;
   /** A deep-link entry may adopt the engine procedure's default seat count once. */
   pendingProcedureDefault: ProcedureCacheKey | null;
-  /** Engine-published pack delivery behavior. `null` until the kind procedure loads. */
+  /**
+   * Engine-published pack delivery behavior. `null` until the kind procedure
+   * loads.
+   *
+   * `PackDistribution` now carries the tagged `{ SharedStackPiles: { … } }`
+   * member as well as its two string members, and every
+   * `packDistribution === "AllAtOnce"` comparison in the client stays both
+   * type-valid and meaning-correct against it: each asks "is this the one-shot
+   * sealed shape?", whose answer for a shared stack is `false`. They are
+   * verified against the widened union, deliberately not rewritten — a
+   * centralizing helper would buy consistency and no compiler force.
+   */
   packDistribution: PackDistribution | null;
+  /**
+   * Which set-layout shapes the selected kind admits, as published by the
+   * engine. `null` until a procedure has been published for the current
+   * selection -- the same "not yet known" shape `allowedPodSizes` uses.
+   */
+  allowedSetLayouts: SetLayoutKind[] | null;
   /**
    * The kind's engine-published booster count (`DraftProcedure.packs_per_player`),
    * cached alongside `allowedPodSizes` and on the same terms: a copy of an engine
@@ -140,6 +157,20 @@ interface DraftPodActions {
   setHostDisplayName: (name: string) => void;
   /** Set guest display name. */
   setGuestDisplayName: (name: string) => void;
+  /**
+   * Seed both pod display-name fields from the saved multiplayer identity
+   * (`multiplayerStore.displayName`), filling only a field still empty.
+   *
+   * Read at call time rather than captured into `initialState`, because that
+   * identity is editable — `PlayerIdentityBanner`, and Preferences →
+   * Multiplayer — long after this module is evaluated.
+   *
+   * The empty-field guard exists for the name the player typed for this pod.
+   * A host session restored by `resumeHostedPod` survives for a different
+   * reason: that path assigns `hostDisplayName` unconditionally, and on the
+   * page it lands after this seed rather than before it.
+   */
+  adoptSavedDisplayName: () => void;
   /** Set join code for guest. */
   setJoinCode: (code: string) => void;
   /**
@@ -196,6 +227,7 @@ const initialState: DraftPodState = {
   procedureCacheKey: null,
   pendingProcedureDefault: null,
   packDistribution: null,
+  allowedSetLayouts: null,
   packsPerPlayer: null,
   cubeMinDeckSize: null,
 };
@@ -272,15 +304,55 @@ function procedureCache(
   procedureCacheKey: ProcedureCacheKey,
 ): Pick<
   DraftPodState,
-  "allowedPodSizes" | "procedureCacheKey" | "packDistribution" | "packsPerPlayer" | "cubeMinDeckSize"
+  | "allowedPodSizes"
+  | "procedureCacheKey"
+  | "packDistribution"
+  | "allowedSetLayouts"
+  | "packsPerPlayer"
+  | "cubeMinDeckSize"
 > {
   return {
     allowedPodSizes: procedure.allowed_pod_sizes,
     procedureCacheKey,
     packDistribution: procedure.distribution,
+    allowedSetLayouts: procedure.allowed_set_layouts,
     packsPerPlayer: procedure.packs_per_player,
     cubeMinDeckSize: procedure.cube_min_deck_size,
   };
+}
+
+/**
+ * The set-to-booster mapping a distribution can actually express.
+ *
+ * A `Chaos` pod draws each `(seat, round)` booster from its own set and keeps
+ * the draw private. `SharedStackPiles` shuffles every booster into one stack
+ * before the first decision, so no seat holds the packs generated for it and
+ * nothing distinguishes the result from a mixed pool — except that the players
+ * cannot see which sets they are drafting. The engine refuses the pair
+ * (`DraftProcedure::validate_source`); this keeps the setup page from offering
+ * a choice that refusal would reject, and is the same dispatch on the same
+ * engine-published discriminant the Cube tab already uses for `AllAtOnce`.
+ */
+/** Which published layout shape each setup-page mode asks the engine for. */
+const SET_LAYOUT_KIND_BY_MODE: Record<SetDraftMode, SetLayoutKind> = {
+  uniform: "UniformByRound",
+  chaos: "Chaos",
+};
+
+function setDraftModeFor(
+  allowedSetLayouts: SetLayoutKind[] | null,
+  requested: SetDraftMode,
+): SetDraftMode {
+  // NOT PUBLISHED YET IS NOT PERMISSION. This used to keep the request until the
+  // contract arrived, on the reasoning that the engine refuses at `StartDraft`
+  // anyway -- but "the engine will refuse later" is not a reason to offer a
+  // choice now, and a stale Chaos selection surviving a kind change is exactly
+  // how a host reaches a control the engine cannot honour. Absent contract means
+  // the only layout every distribution admits.
+  // NULLISH, not `=== null`: a payload that omits the field entirely arrives as
+  // `undefined`, and `undefined.includes` is a TypeError rather than a refusal.
+  if (allowedSetLayouts == null) return "uniform";
+  return allowedSetLayouts.includes(SET_LAYOUT_KIND_BY_MODE[requested]) ? requested : "uniform";
 }
 
 function procedurePublication(
@@ -302,6 +374,7 @@ function procedurePublication(
       : { ...prev.config, podSize },
     pendingProcedureDefault: adoptsProcedureDefault ? null : prev.pendingProcedureDefault,
     poolMode: procedure.distribution === "AllAtOnce" ? "set" : prev.poolMode,
+    setDraftMode: setDraftModeFor(procedure.allowed_set_layouts, prev.setDraftMode),
     loadingPool: false,
     configError: null,
   };
@@ -333,6 +406,7 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
           procedureCacheKey: procedureChanged ? null : prev.procedureCacheKey,
           pendingProcedureDefault: procedureChanged ? null : prev.pendingProcedureDefault,
           packDistribution,
+          allowedSetLayouts: procedureChanged ? null : prev.allowedSetLayouts,
           packsPerPlayer: procedureChanged ? null : prev.packsPerPlayer,
           cubeMinDeckSize: procedureChanged ? null : prev.cubeMinDeckSize,
           loadingPool: false,
@@ -448,6 +522,22 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
       set({ guestDisplayName: name });
     },
 
+    adoptSavedDisplayName: () => {
+      // `typeof` rather than a bare `.trim()`, even though the field is typed
+      // `string`: `multiplayerStore`'s persist `merge` normalizes five of its
+      // siblings under "Persisted state is external input" but spreads
+      // `displayName` through unvalidated, so a corrupt localStorage blob can
+      // hydrate a non-string. `PodSetup` calls this from a mount effect, where
+      // a throw takes the whole Draft Pod route down over a cosmetic prefill.
+      const persisted: unknown = useMultiplayerStore.getState().displayName;
+      const saved = typeof persisted === "string" ? persisted.trim() : "";
+      if (!saved) return;
+      set((prev) => ({
+        hostDisplayName: prev.hostDisplayName || saved,
+        guestDisplayName: prev.guestDisplayName || saved,
+      }));
+    },
+
     setJoinCode: (code) => {
       set({ joinCode: code });
     },
@@ -460,7 +550,10 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
     },
 
     setSetDraftMode: (setDraftMode) => {
-      set({ setDraftMode, configError: null });
+      set((prev) => ({
+        setDraftMode: setDraftModeFor(prev.allowedSetLayouts, setDraftMode),
+        configError: null,
+      }));
     },
 
     setCubeForm: (form) => {
@@ -774,6 +867,7 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
             procedureCacheKey: null,
             pendingProcedureDefault: null,
             packDistribution: null,
+            allowedSetLayouts: null,
             packsPerPlayer: null,
             cubeMinDeckSize: null,
           });
@@ -804,6 +898,7 @@ export const useDraftPodStore = create<DraftPodState & DraftPodActions>()(
             procedureCacheKey: null,
             pendingProcedureDefault: null,
             packDistribution: null,
+            allowedSetLayouts: null,
             packsPerPlayer: null,
             cubeMinDeckSize: null,
           });

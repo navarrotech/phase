@@ -380,6 +380,10 @@ pub enum ClientMessage {
         /// Enable ranked rating updates for this room.
         #[serde(default)]
         ranked: bool,
+        /// Host-private Cube draft source for a native Full-server game. This
+        /// deliberately belongs to the Full session, never the lobby broker.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        booster_pack_pool: Option<Vec<String>>,
     },
     JoinGameWithPassword {
         game_code: String,
@@ -619,6 +623,11 @@ pub enum ClientMessage {
         code: String,
         role: TournamentRole,
         token: String,
+        /// Mirrors `rotation_nonce` on the lobby variant: the client-minted,
+        /// per-attempt nonce that lets a lost renewal reply be recovered by an
+        /// idempotent replay. `#[serde(default)]` for the same wire tolerance.
+        #[serde(default)]
+        rotation_nonce: String,
     },
 }
 
@@ -1584,6 +1593,11 @@ mod tests {
             draft_metadata: None,
             start_when_full: true,
             ranked: false,
+            booster_pack_pool: Some(vec![
+                "Cube Card".into(),
+                "Cube Card".into(),
+                "Undealt sentinel".into(),
+            ]),
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ClientMessage = serde_json::from_str(&json).unwrap();
@@ -1596,6 +1610,7 @@ mod tests {
                 player_count,
                 match_config,
                 room_name,
+                booster_pack_pool,
                 ..
             } => {
                 assert_eq!(display_name, "Alice");
@@ -1605,6 +1620,14 @@ mod tests {
                 assert_eq!(player_count, 4);
                 assert_eq!(match_config, MatchConfig::default());
                 assert_eq!(room_name, Some("Friday Night Commander".to_string()));
+                assert_eq!(
+                    booster_pack_pool,
+                    Some(vec![
+                        "Cube Card".into(),
+                        "Cube Card".into(),
+                        "Undealt sentinel".into()
+                    ])
+                );
             }
             _ => panic!("wrong variant"),
         }
@@ -2130,6 +2153,7 @@ mod tests {
             draft_metadata: None,
             start_when_full: true,
             ranked: false,
+            booster_pack_pool: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ClientMessage = serde_json::from_str(&json).unwrap();
@@ -2492,6 +2516,7 @@ mod tests {
             draft_metadata: None,
             start_when_full: true,
             ranked: false,
+            booster_pack_pool: None,
         };
         let json = serde_json::to_string(&msg).unwrap();
         let parsed: ClientMessage = serde_json::from_str(&json).unwrap();
@@ -2868,6 +2893,9 @@ mod tests {
                 },
             },
             launch_capability: DraftLaunchCapability::None,
+            // Read off the same procedure the kind above names, so the fixture
+            // stays a view the engine could actually have built.
+            distribution: DraftKind::Sealed.procedure().distribution,
             commanders_required: 0,
             current_pack_number: 0,
             pick_number: 2,
@@ -2901,6 +2929,13 @@ mod tests {
             pod_policy: PodPolicy::Competitive,
             pairings: Vec::new(),
             match_config: DraftKind::Sealed.match_config(),
+            // Sealed has no shared stack and no Winston play/draw election, so
+            // both are `None` -- which makes this round trip a free
+            // byte-compatibility assertion: with `skip_serializing_if` on both
+            // fields, this message's JSON is byte-identical to the pre-Winston
+            // wire shape.
+            shared_stack: None,
+            play_first_chooser: None,
         };
         let msg = ServerMessage::DraftStateUpdate { view: view.clone() };
         let json = serde_json::to_string(&msg).unwrap();
@@ -3196,6 +3231,9 @@ mod tests {
             match_config: DraftKind::Premier.match_config(),
             pools: None,
             current_packs: None,
+            // Premier has no shared stack; `skip_serializing_if` keeps this
+            // frame byte-identical to the pre-Winston wire shape.
+            shared_stack: None,
         };
         let msg = ServerMessage::DraftSpectatorView { view };
         let json = serde_json::to_string(&msg).unwrap();
@@ -3210,18 +3248,20 @@ mod tests {
         }
     }
 
-    /// The bump this number is at: `GameEvent` gained the tagged variant
-    /// `ExtraTurnCreated { player_id, anchor }`. `StateUpdate.events` and
-    /// `GameStarted.events` can now carry that tag, so a v68 peer must be
-    /// refused before it receives an event it cannot deserialize.
+    /// `CastingVariantChoiceOption` now serializes a required `face`; the
+    /// resumed `ModalFaceChoice` also preserves an added paid-cast cost. The
+    /// cleanup, its delayed-trigger receipts, and receipt-eligible origins now
+    /// carry the producer-issued paid-offer owner; a v74 peer cannot preserve
+    /// that cross-offer isolation through a paused offer, so it must be refused
+    /// before it receives v75 state.
     ///
     /// The name embeds the numeral deliberately: `assert_eq!(PROTOCOL_VERSION,
     /// <n>)` under a function named for `<n-1>` is green, so
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_69_for_extra_turn_created_event() {
-        assert_eq!(PROTOCOL_VERSION, 69);
+    fn protocol_version_is_75_for_resolution_cast_offer_owners() {
+        assert_eq!(PROTOCOL_VERSION, 75);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3232,7 +3272,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_69_for_extra_turn_created_event` stays
+    /// `protocol_version_is_75_for_resolution_cast_offer_owners` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {

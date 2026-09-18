@@ -1883,7 +1883,12 @@ pub fn fallback_action(
             ..
         } => Some(GameAction::ChooseAdventureFace { creature: true }),
         WaitingFor::ModalFaceChoice { .. } => {
-            Some(GameAction::ChooseModalFace { back_face: false })
+            issued(|action| matches!(action, GameAction::ChooseModalFace { back_face: false }))
+                .or_else(|| {
+                    issued(|action| {
+                        matches!(action, GameAction::ChooseModalFace { back_face: true })
+                    })
+                })
         }
         // CR 118.9: Default to the printed mana cost (Normal). Each keyword
         // resolves through its own post-payment handler in the engine; the
@@ -11135,6 +11140,7 @@ mod tests {
             candidate_objects: engine::im::Vector::new(),
             outcome_template: None,
             visibility: engine::types::ability::VoteVisibility::Open,
+            chain_root_targets: Vec::new(),
         }
     }
 
@@ -11499,6 +11505,7 @@ mod tests {
             candidate_objects: engine::im::Vector::new(),
             outcome_template: None,
             visibility: engine::types::ability::VoteVisibility::Open,
+            chain_root_targets: Vec::new(),
         };
         let action = fallback_action_default(&state).expect("fallback returns an action");
         assert!(

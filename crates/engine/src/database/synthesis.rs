@@ -3070,13 +3070,16 @@ pub fn synthesize_madness_intrinsics(face: &mut CardFace) {
 /// replacement whose execute mills N then returns this card from the graveyard
 /// to hand.
 ///
-/// The replacement functions while the card is in the graveyard. Two pieces make
-/// that work: (1) the draw-replacement default player-scope follows the dredge
-/// card's effective source player (CR 109.4 + CR 108.4a), so a graveyard card
-/// applies on its owner's draw — no `valid_player`/`valid_card` needed (and
+/// CR 113.6b: the replacement functions from the graveyard and ONLY from the
+/// graveyard, which the definition states via `active_zones = [Graveyard]` —
+/// without it the card would keep offering dredge from the battlefield, where
+/// CR 702.52a says the ability doesn't function. Two more pieces complete it:
+/// (1) the draw-replacement default player-scope follows the dredge card's
+/// effective source player (CR 109.4 + CR 108.4a), so a graveyard card applies
+/// on its owner's draw — no `valid_player`/`valid_card` needed (and
 /// `valid_card: SelfRef` would not match a `Draw`, which has no affected object);
-/// (2) `find_applicable_replacements` includes graveyard dredge cards on that
-/// player's draw, gated on library size >= N (CR 702.52b enforced at offer time).
+/// (2) `find_applicable_replacements` gates the offer on library size >= N
+/// (CR 702.52b), the one half that depends on live game state.
 pub fn synthesize_dredge(face: &mut CardFace) {
     let Some(n) = face.keywords.iter().find_map(|k| match k {
         Keyword::Dredge(n) => Some(*n),
@@ -3121,9 +3124,14 @@ pub fn synthesize_dredge(face: &mut CardFace) {
     mill.sub_ability = Some(Box::new(return_to_hand));
 
     // CR 702.52a + CR 121.6b: Dredge replaces a single individual card draw
-    // ("if you would draw a card, you may instead mill N"), not the instruction count.
+    // ("if you would draw a card, you may instead mill N"), not the instruction
+    // count — and CR 702.52a + CR 113.6b, it "functions only while the card with
+    // dredge is in a player's graveyard." Declaring that zone on the definition
+    // is what keeps a dredge creature on the BATTLEFIELD, where the ability does
+    // not function, from offering its dredge on your draws.
     let mut replacement = ReplacementDefinition::new(ReplacementEvent::Draw)
-        .draw_scope(crate::types::ability::DrawReplacementScope::IndividualDraw);
+        .draw_scope(crate::types::ability::DrawReplacementScope::IndividualDraw)
+        .active_zones(vec![Zone::Graveyard]);
     replacement.mode = crate::types::ability::ReplacementMode::Optional { decline: None };
     replacement.description = Some(
         "CR 702.52a: Dredge — instead of drawing, you may mill N cards and return this \
@@ -3864,7 +3872,9 @@ pub(crate) fn entry_replacement_for_grant_static(
 fn build_absorb_replacement(n: u32) -> ReplacementDefinition {
     ReplacementDefinition::new(ReplacementEvent::DamageDone)
         .valid_card(TargetFilter::SelfRef)
-        .damage_modification(DamageModification::PreventionMinus { value: n })
+        .damage_modification(DamageModification::PreventionMinus {
+            value: crate::types::ability::PreventionFormula::fixed(n),
+        })
         .description(format!(
             "CR 702.64a: Absorb {n} — if a source would deal damage to this creature, \
              prevent {n} of that damage."
@@ -3880,7 +3890,9 @@ fn is_absorb_replacement(r: &ReplacementDefinition, n: u32) -> bool {
         && matches!(r.valid_card, Some(TargetFilter::SelfRef))
         && matches!(
             r.damage_modification,
-            Some(DamageModification::PreventionMinus { value }) if value == n
+            Some(DamageModification::PreventionMinus {
+                value: crate::types::ability::PreventionFormula::Fixed(value),
+            }) if value == n
         )
 }
 
@@ -6701,6 +6713,8 @@ fn build_suspend_last_counter_cast_trigger() -> TriggerDefinition {
             // sorcery-speed timing bypass for an upkeep recast (issue #1520).
             driver: CastFromZoneDriver::DuringResolution,
             mana_spend_permission: None,
+            additional_cost: None,
+            cast_cost_modifier: None,
         },
     )
     .optional();
@@ -9964,6 +9978,8 @@ pub fn synthesize_siege_intrinsics(face: &mut CardFace) {
                 // the explicit discriminator preserves that.)
                 driver: CastFromZoneDriver::DuringResolution,
                 mana_spend_permission: None,
+                additional_cost: None,
+                cast_cost_modifier: None,
             },
         )
         .optional();
@@ -11844,6 +11860,14 @@ mod madness_synthesis_tests {
             }
         ));
         assert!(is_dredge_draw_replacement(repl));
+        // CR 702.52a + CR 113.6b: dredge "functions only while the card with
+        // dredge is in a player's graveyard" — the definition must SAY so, or
+        // the pipeline's default battlefield/command scan offers it in play.
+        assert_eq!(
+            repl.active_zones,
+            vec![Zone::Graveyard],
+            "dredge must declare graveyard-only zone of function"
+        );
     }
 
     #[test]
@@ -13768,8 +13792,8 @@ mod undying_persist_runtime_tests {
     /// the `ObjectId` across the zone change). When the second trigger
     /// resolves, its `Effect::ChangeZone` evaluates `from_zone =
     /// Zone::Battlefield`, which fails the `expected_origin ==
-    /// Some(Zone::Graveyard)` guard at `change_zone.rs:501-505` and the
-    /// move silently no-ops. `enter_with_counters` runs only on a successful
+    /// Some(Zone::Graveyard)` guard in `change_zone::process_one_zone_move_with_terminal`
+    /// and the move silently no-ops. `enter_with_counters` runs only on a successful
     /// move, so the second trigger places no counter either.
     ///
     /// Post-condition pinned by this test: exactly one battlefield object
@@ -13817,7 +13841,7 @@ mod undying_persist_runtime_tests {
             count_in_battlefield, 1,
             "dual-keyword permanent must not be double-returned"
         );
-        // The origin guard at change_zone.rs:501-505 prevents the
+        // The origin guard in `change_zone::process_one_zone_move_with_terminal` prevents the
         // second-to-resolve trigger from executing its move, so its
         // `enter_with_counters` never runs. Exactly one counter ends up on
         // the returned permanent (polarity = whichever trigger resolved
@@ -16005,6 +16029,7 @@ mod annihilator_runtime_tests {
             attacker_ids: vec![attacker_id],
             defending_player,
             attacks: vec![(attacker_id, AttackTarget::Player(defending_player))],
+            declaration_records: Vec::new(),
         }
     }
 
@@ -26050,7 +26075,9 @@ mod absorb_synthesis_tests {
         assert!(
             matches!(
                 r.damage_modification,
-                Some(DamageModification::PreventionMinus { value: 2 })
+                Some(DamageModification::PreventionMinus {
+                    value: crate::types::ability::PreventionFormula::Fixed(2),
+                })
             ),
             "CR 702.64a: prevent N (=2) of the damage (prevention provenance)"
         );

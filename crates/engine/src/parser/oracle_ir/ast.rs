@@ -7,11 +7,11 @@ use crate::types::ability::{
     CastingPermission, ChosenCounterCountCondition, ContinuousModification, ControlWindow,
     ControllerRef, CopyRetargetPermission, CounterAdjustment, CounterKindChooser,
     CounterKindDomain, CounterSourceRider, DigRestOrder, DoorLockOp, Duration, Effect, EffectScope,
-    FaceDownProfile, ForceBlockAttackerRef, LibraryPosition, ManaProduction, ManaSpendRestriction,
-    ManaTargetRole, ModalSelectionConstraint, OutsideGameSourcePool, PlayerFilter, PtStat, PtValue,
-    QuantityExpr, SearchDestinationSplit, SearchSelectionConstraint,
+    FaceDownProfile, ForceBlockAttackerRef, GuardReading, LibraryPosition, ManaProduction,
+    ManaSpendRestriction, ManaTargetRole, ModalSelectionConstraint, OutsideGameSourcePool,
+    PlayerFilter, PtStat, PtValue, QuantityExpr, SearchDestinationSplit, SearchSelectionConstraint,
     SpellStackToGraveyardReplacement, StaticCondition, StaticDefinition, SubAbilityLink,
-    TargetFilter, ThisWayCause,
+    TargetFilter, ThisWayCause, UnloweredGuard,
 };
 use crate::types::card_type::Supertype;
 use crate::types::counter::CounterType;
@@ -60,6 +60,11 @@ pub(crate) struct ParsedEffectClause {
     /// resolution-time runtime owns the payment choice via the unified
     /// `unless_pay` pipeline (rather than a per-effect bespoke path).
     pub(crate) unless_pay: Option<crate::types::ability::UnlessPayModifier>,
+    /// CR 608.2c + CR 614.1a: set when this clause's leading guard did not lower and its
+    /// body is an ownership candidate. Copied onto the assembled `AbilityDefinition` and
+    /// resolved after line routing; see [`crate::types::ability::UnloweredGuard`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) unlowered_guard: Option<UnloweredGuard>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -175,10 +180,30 @@ pub(crate) enum ClauseAst {
         predicate: Box<PredicateAst>,
     },
     Conditional {
-        /// CR 608.2c: Parsed leading "if" guard, when recognized by the condition pipeline.
-        condition: Option<AbilityCondition>,
+        /// CR 608.2c: the leading "if" guard's lowering outcome.
+        guard: ConditionalGuard,
+        /// The byte-unchanged "if <guard>, <body>" clause the gap is recorded over.
+        clause_text: String,
         clause: Box<ClauseAst>,
     },
+}
+
+/// CR 608.2c: the outcome of lowering a clause's leading `"if <guard>,"` gate.
+///
+/// Replaces an `Option<AbilityCondition>` whose `None` conflated "no guard" (impossible
+/// in this variant — it exists only because the splitter fired) with "the condition
+/// authority refused the guard". Making the second representable is what lets
+/// `lower_clause_ast` stop emitting an unguarded body.
+///
+/// `Lowered` boxes its payload, as `AbilityCondition::ConditionInstead` does for the same
+/// type. Unboxed, `AbilityCondition` is ~200 bytes and `ClauseAst::Conditional` — which
+/// also gained `clause_text: String` — crossed clippy's `large_enum_variant` threshold
+/// (232-byte largest vs 24-byte second largest, limit 200), making `ClauseAst` 232 bytes
+/// at every node of a recursive tree whose other variants hold only pointers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) enum ConditionalGuard {
+    Lowered(Box<AbilityCondition>),
+    Unlowered(GuardReading),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1556,6 +1581,22 @@ pub(crate) enum ChooseImperativeAst {
         domain: CounterKindDomain,
         chooser: CounterKindChooser,
     },
+    /// CR 115.1 + CR 608.2d: A standalone, NON-target battlefield-object choice
+    /// ("choose a creature an opponent controls"). The chooser is the ability's
+    /// controller; the pick is made while the effect resolves (CR 608.2d), not
+    /// as a declared target. Parser IR only — it lowers onto the existing
+    /// `Effect::ChooseObjectsIntoTrackedSet`, which publishes the pick into the
+    /// resolution chain's tracked set so a linked "the chosen ‹object›" reader
+    /// (CR 607.2d) can consume it.
+    ///
+    /// `min`/`max` carry the printed quantifier ("a"/"an"/"another" → `(1, Some(1))`,
+    /// "up to N" → `(0, Some(N))` with a dynamic N collapsing to `None`,
+    /// "any number of" → `(0, None)`).
+    BattlefieldObject {
+        filter: TargetFilter,
+        min: u32,
+        max: Option<u32>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1964,6 +2005,7 @@ pub(crate) fn parsed_clause(effect: Effect) -> ParsedEffectClause {
         condition: None,
         optional: false,
         unless_pay: None,
+        unlowered_guard: None,
     }
 }
 
@@ -2085,6 +2127,86 @@ pub(crate) fn cast_bound_lost_to_duration_gap(
     )
 }
 
+/// CR 601.2b + CR 611.2a: a `CastFromZone` on the lingering-permission
+/// mechanism that still carries an `additional_cost` would drop that cost at
+/// resolution (the permission has no slot for it), so the clause becomes the
+/// `ADDITIONAL_COST_ON_LINGERING_CAST_GAP` instead. Called at every seam that
+/// can leave a cast grant on that mechanism: the Branch-2 producer in
+/// `oracle_effect::try_parse_cast_effect`, the alt-cost fold
+/// (`oracle_effect::attach_alt_cost_to_prior_cast_from_zone`), and the three
+/// duration seams that degrade a during-resolution driver
+/// (`apply_duration_to_effect`, `reconcile_coordinated_cast`, the
+/// trailing-duration peel in `oracle_effect::parse_effect_clause`). Zero
+/// printed carriers today.
+pub(crate) fn refuse_additional_cost_on_lingering_cast(effect: &mut Effect) {
+    let Effect::CastFromZone {
+        driver,
+        additional_cost: Some(cost),
+        ..
+    } = effect
+    else {
+        return;
+    };
+    if *driver == crate::types::ability::CastFromZoneDriver::DuringResolution {
+        return;
+    }
+    *effect = Effect::unimplemented(
+        crate::types::ability::ADDITIONAL_COST_ON_LINGERING_CAST_GAP,
+        format!("additional cost the lingering permission cannot carry: {cost:?}"),
+    );
+}
+
+/// CR 601.2f + CR 608.2c: the honest gap a "cast this way" cost rider becomes
+/// when no preceding grant can carry it.
+///
+/// Both refusal sites below build it here, so the no-host shape and the
+/// unsupported-driver shape name one gap rather than two that can drift. The
+/// description records the MODIFIER that was about to be lost rather than the
+/// Oracle fragment: the driver seam runs after lowering and no longer holds the
+/// source text, and the modifier is the load-bearing fact for anyone auditing
+/// the gap.
+pub(crate) fn cast_cost_modifier_without_host_gap(
+    modifier: &crate::types::ability::CastCostModifier,
+) -> Effect {
+    Effect::unimplemented(
+        crate::types::ability::CAST_COST_MODIFIER_WITHOUT_HOST_GAP,
+        format!("\"cast this way\" cost rider no preceding grant can carry: {modifier:?}"),
+    )
+}
+
+/// CR 601.2f + CR 608.2c: a `CastFromZone` that still carries a
+/// `cast_cost_modifier` on a driver OTHER than `LingeringPermission` would drop
+/// that rider at resolution, so the clause becomes the
+/// `CAST_COST_MODIFIER_WITHOUT_HOST_GAP` instead.
+///
+/// Twin of [`refuse_additional_cost_on_lingering_cast`], inverted on the driver
+/// axis because the two riders ride opposite mechanisms:
+/// `record_lingering_permissions` is the one site that stamps a cost modifier
+/// onto the permissions the grant creates, so `LingeringPermission` is the only
+/// driver with a slot — while an additional cost is charged only by the
+/// during-resolution cast.
+///
+/// Called at the one seam that can DEGRADE an already-stamped grant off the
+/// lingering mechanism (`attach_alt_cost_to_prior_cast_from_zone`, beside its
+/// twin); the absorption site refuses a non-`LingeringPermission` host up front
+/// (`attach_cast_cost_modifier_to_prior_cast_from_zone`), so that path never
+/// stamps one for this to find. Zero printed carriers today.
+pub(crate) fn refuse_cast_cost_modifier_on_unsupported_driver(effect: &mut Effect) {
+    let Effect::CastFromZone {
+        driver,
+        cast_cost_modifier: Some(modifier),
+        ..
+    } = effect
+    else {
+        return;
+    };
+    if *driver == crate::types::ability::CastFromZoneDriver::LingeringPermission {
+        return;
+    }
+    let gap = cast_cost_modifier_without_host_gap(modifier);
+    *effect = gap;
+}
+
 /// CR 611.2a + CR 608.2g + CR 608.2c: Carry a sentence's LEADING duration onto a
 /// later coordinated clause of that same sentence.
 ///
@@ -2177,8 +2299,10 @@ fn reconcile_coordinated_cast(
         None => {
             let bounds = driver.window_bounds().unwrap_or_default();
             *effect = cast_bound_lost_to_duration_gap(bounds);
+            return;
         }
     }
+    refuse_additional_cost_on_lingering_cast(effect);
 }
 
 pub(crate) fn with_clause_duration(
@@ -2365,6 +2489,7 @@ fn apply_duration_to_effect(effect: &mut Effect, duration: &Duration) {
             ref alt_ability_cost,
             ref constraint,
             ref mana_spend_permission,
+            ref additional_cost,
             ..
         } => {
             // CR 601.2b + CR 118.9 + CR 611.2a: "Until end of turn, you may cast
@@ -2429,6 +2554,7 @@ fn apply_duration_to_effect(effect: &mut Effect, duration: &Duration) {
                 && alt_ability_cost.is_none()
                 && constraint.is_none()
                 && mana_spend_permission.is_none()
+                && additional_cost.is_none()
                 && duration_is_unset_sentinel(effect_duration)
                 && matches!(target, TargetFilter::Typed(_))
                 && target.extract_zones() == vec![crate::types::zones::Zone::Hand]
@@ -2548,6 +2674,9 @@ fn apply_duration_to_effect(effect: &mut Effect, duration: &Duration) {
             end_cost: None,
         };
     }
+    // CR 601.2b: a grant the stated lifetime just moved onto the lingering
+    // mechanism cannot keep an additional cost.
+    refuse_additional_cost_on_lingering_cast(effect);
 }
 
 /// CR 611.2b + CR 301.5: does this `BecomeCopy` recipient anaphorically name the
@@ -3169,7 +3298,7 @@ mod duration_distribution_tests_7923 {
             card_filter: None,
             single_use_group: None,
             single_use: false,
-            cast_cost_raise: None,
+            cast_cost_modifier: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             // #7948: a self-standing play permission with full cast authority,
             // which is what this duration fixture models — NOT the
@@ -3197,6 +3326,8 @@ mod duration_distribution_tests_7923 {
             duration,
             driver: CastFromZoneDriver::LingeringPermission,
             mana_spend_permission: None,
+            additional_cost: None,
+            cast_cost_modifier: None,
         }
     }
 
@@ -3215,6 +3346,7 @@ mod duration_distribution_tests_7923 {
                 constraint,
                 duration,
                 mana_spend_permission,
+                additional_cost,
                 ..
             } => Effect::CastFromZone {
                 target,
@@ -3226,6 +3358,8 @@ mod duration_distribution_tests_7923 {
                 duration,
                 driver,
                 mana_spend_permission,
+                additional_cost,
+                cast_cost_modifier: None,
             },
             other => other,
         }

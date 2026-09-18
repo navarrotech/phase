@@ -22,6 +22,10 @@ const mocks = vi.hoisted(() => ({
   // reason.
   multiplayerConfig: {
     hostingServer: "wss://phase.example/ws" as string | null,
+    // `adoptSavedDisplayName` reads the saved identity off this store, so the
+    // mock carries the field under its real name. Empty is the real store's
+    // own initial value, which keeps it out of the way of every other suite.
+    displayName: "",
     userLobbySources: [],
     sourceStatus: new Map(),
   },
@@ -105,6 +109,7 @@ describe("draftPodStore", () => {
     mocks.multiplayerState.hostDraft = vi.fn<(config: unknown) => Promise<boolean>>(async () => true);
     mocks.multiplayerState.joinDraft = vi.fn<(config: unknown) => Promise<boolean>>(async () => true);
     mocks.multiplayerConfig.hostingServer = "wss://phase.example/ws";
+    mocks.multiplayerConfig.displayName = "";
     mocks.inspectActiveDraftPod.mockReturnValue({
       type: "absent",
     });
@@ -192,6 +197,118 @@ describe("draftPodStore", () => {
       expect(state.config.kind).toBe("CommanderDraft");
       expect(state.config.podSize).toBe(before);
       expect(state.configError).toBe("wasm unavailable");
+    });
+
+    it("drops a chaos selection when the entered kind shares one stack", async () => {
+      // The host arranged a Chaos pod under a pick-and-pass kind, then changed
+      // the kind. Nothing in the UI can reach `setSetDraftMode` again on the
+      // way through, so publication is where the stale intent has to go.
+      // A contract that ADMITS Chaos has to be in place first: an absent one
+      // normalizes the selection away, which is the point of the rows below.
+      useDraftPodStore.setState({ allowedSetLayouts: ["UniformByRound", "Chaos"] });
+      useDraftPodStore.getState().setSetDraftMode("chaos");
+      expect(useDraftPodStore.getState().setDraftMode).toBe("chaos");
+      mocks.draftProcedure.mockResolvedValue({
+        ...procedure(2),
+        min_pod_size: 2,
+        max_pod_size: 4,
+        allowed_pod_sizes: [2, 3, 4],
+        distribution: { SharedStackPiles: { pile_count: 3 } },
+        // The CAPABILITY is what the store reads, not the distribution. Spread
+        // over the fixture, so it has to be narrowed here exactly as
+        // `DraftProcedure::allowed_set_layouts` narrows it for a shared stack.
+        allowed_set_layouts: ["UniformByRound"],
+      });
+
+      await useDraftPodStore.getState().enterKind("Winston");
+
+      expect(useDraftPodStore.getState().config.kind).toBe("Winston");
+      expect(useDraftPodStore.getState().setDraftMode).toBe("uniform");
+    });
+
+    /**
+     * THE PUBLISHED LIST DECIDES, NOT THE DISTRIBUTION.
+     *
+     * Every other row here supplies a procedure whose `distribution` and
+     * `allowed_set_layouts` AGREE, because the fixture derives one from the
+     * other. That makes them all blind to the change this pair exists for:
+     * restore `setDraftModeFor(prev.packDistribution, ...)` and they stay green,
+     * because the two inputs give the same answer on every consistent fixture.
+     *
+     * So these two SKEW them on purpose. Neither procedure is one the engine
+     * would publish -- that is the point: they isolate which input the store
+     * actually reads. Both legs red if the store goes back to asking the
+     * distribution.
+     */
+    /**
+     * AN ABSENT CONTRACT IS NOT PERMISSION.
+     *
+     * `allowedSetLayouts` is `null` until a procedure has been published for the
+     * current selection. This used to keep the host's request through that
+     * window, on the reasoning that the engine refuses at `StartDraft` anyway --
+     * but "it will be refused later" is not a reason to hold a selection the
+     * engine may never honour, and it is how a stale Chaos intent survived a
+     * kind change to reach a control that could not be satisfied.
+     */
+    it("normalizes a chaos selection while no layout contract has been published", () => {
+      useDraftPodStore.setState({ allowedSetLayouts: ["UniformByRound", "Chaos"] });
+      useDraftPodStore.getState().setSetDraftMode("chaos");
+      // Reach guard: with a permitting contract the selection really does stick,
+      // so the normalization below is the ABSENCE doing it and not the action.
+      expect(useDraftPodStore.getState().setDraftMode).toBe("chaos");
+
+      useDraftPodStore.setState({ allowedSetLayouts: null });
+      useDraftPodStore.getState().setSetDraftMode("chaos");
+
+      expect(useDraftPodStore.getState().setDraftMode).toBe("uniform");
+    });
+
+    it("keeps chaos when the published list allows it, whatever the distribution says", async () => {
+      // A contract that ADMITS Chaos has to be in place first: an absent one
+      // normalizes the selection away, which is the point of the rows below.
+      useDraftPodStore.setState({ allowedSetLayouts: ["UniformByRound", "Chaos"] });
+      useDraftPodStore.getState().setSetDraftMode("chaos");
+      mocks.draftProcedure.mockResolvedValue({
+        ...procedure(2),
+        allowed_pod_sizes: [2, 3, 4],
+        distribution: { SharedStackPiles: { pile_count: 3 } },
+        allowed_set_layouts: ["UniformByRound", "Chaos"],
+      });
+
+      await useDraftPodStore.getState().enterKind("Winston");
+
+      expect(useDraftPodStore.getState().setDraftMode).toBe("chaos");
+    });
+
+    it("drops chaos when the published list omits it, whatever the distribution says", async () => {
+      // A contract that ADMITS Chaos has to be in place first: an absent one
+      // normalizes the selection away, which is the point of the rows below.
+      useDraftPodStore.setState({ allowedSetLayouts: ["UniformByRound", "Chaos"] });
+      useDraftPodStore.getState().setSetDraftMode("chaos");
+      mocks.draftProcedure.mockResolvedValue({
+        ...procedure(2),
+        allowed_pod_sizes: [2, 3, 4],
+        distribution: "PickAndPass",
+        allowed_set_layouts: ["UniformByRound"],
+      });
+
+      await useDraftPodStore.getState().enterKind("Premier");
+
+      expect(useDraftPodStore.getState().setDraftMode).toBe("uniform");
+    });
+
+    it("keeps a chaos selection for a kind that passes packs", async () => {
+      // The paired positive for the row above, through the SAME entry point:
+      // publication normalizes on the distribution, not on every entry.
+      // A contract that ADMITS Chaos has to be in place first: an absent one
+      // normalizes the selection away, which is the point of the rows below.
+      useDraftPodStore.setState({ allowedSetLayouts: ["UniformByRound", "Chaos"] });
+      useDraftPodStore.getState().setSetDraftMode("chaos");
+      mocks.draftProcedure.mockResolvedValue(procedure(8));
+
+      await useDraftPodStore.getState().enterKind("Premier");
+
+      expect(useDraftPodStore.getState().setDraftMode).toBe("chaos");
     });
 
     it("uses the procedure distribution to select a set pool", async () => {
@@ -360,6 +477,37 @@ describe("draftPodStore", () => {
       useDraftPodStore.getState().setPoolMode("cube");
 
       expect(useDraftPodStore.getState().poolMode).toBe("set");
+    });
+
+    it("does not allow a chaos selection when the procedure shares one stack", () => {
+      // Paired positive FIRST, on the same action and the same store: a
+      // pick-and-pass distribution keeps the host's chaos intent, so the
+      // refusal below is the distribution's doing and not the action's.
+      useDraftPodStore.setState({
+        packDistribution: "PickAndPass",
+        allowedSetLayouts: ["UniformByRound", "Chaos"],
+        setDraftMode: "uniform",
+      });
+      useDraftPodStore.getState().setSetDraftMode("chaos");
+      expect(useDraftPodStore.getState().setDraftMode).toBe("chaos");
+
+      // A shared stack shuffles every booster together before the first
+      // decision, so a per-(seat, round) set assignment describes nothing the
+      // players can observe — and `DraftProcedure::validate_source` refuses
+      // the pair outright. The engine's pile count is carried through rather
+      // than invented: this is the tagged member, not a kind name.
+      // The store reads the engine's published capability now, not the
+      // distribution -- the distribution is carried alongside it only because
+      // other selectors still read it.
+      useDraftPodStore.setState({
+        packDistribution: { SharedStackPiles: { pile_count: 3 } },
+        allowedSetLayouts: ["UniformByRound"],
+        setDraftMode: "uniform",
+      });
+
+      useDraftPodStore.getState().setSetDraftMode("chaos");
+
+      expect(useDraftPodStore.getState().setDraftMode).toBe("uniform");
     });
   });
 
@@ -1592,6 +1740,128 @@ describe("draftPodStore", () => {
         configError: "offline.startUnavailable",
       });
       expect(mocks.multiplayerState.hostDraft).not.toHaveBeenCalled();
+    });
+  });
+
+  // ── Saved-identity seeding ───────────────────────────────────────────────
+  //
+  // Every assertion here is REVERT-FAILING as a group: BASE has no
+  // `adoptSavedDisplayName`, so the call is a TypeError rather than a wrong
+  // value. The per-test notes below say what each one discriminates BEYOND
+  // that — i.e. what a present-but-wrong implementation would fail on.
+  describe("adoptSavedDisplayName", () => {
+    it("seeds both pod name fields from the saved identity", () => {
+      mocks.multiplayerConfig.displayName = "Alice";
+
+      useDraftPodStore.getState().adoptSavedDisplayName();
+
+      expect(useDraftPodStore.getState()).toMatchObject({
+        hostDisplayName: "Alice",
+        guestDisplayName: "Alice",
+      });
+    });
+
+    it.each([
+      ["host", "hostDisplayName", () => useDraftPodStore.getState().setHostDisplayName("Bea")],
+      ["guest", "guestDisplayName", () => useDraftPodStore.getState().setGuestDisplayName("Bea")],
+    ])("leaves a name the %s already typed alone", (_seat, field, type) => {
+      mocks.multiplayerConfig.displayName = "Alice";
+      type();
+
+      useDraftPodStore.getState().adoptSavedDisplayName();
+
+      // Discriminates an unconditional `set`: that would overwrite "Bea" here.
+      expect(useDraftPodStore.getState()[field as "hostDisplayName" | "guestDisplayName"]).toBe("Bea");
+    });
+
+    it("leaves an already-populated host field alone", () => {
+      // `setState` is the shortcut, so this measures the guard on a non-empty
+      // `hostDisplayName` — NOT a production ordering. The ordering the page
+      // really produces is the test below.
+      useDraftPodStore.setState({ hostDisplayName: "Restored Host" });
+      mocks.multiplayerConfig.displayName = "Alice";
+
+      useDraftPodStore.getState().adoptSavedDisplayName();
+
+      expect(useDraftPodStore.getState().hostDisplayName).toBe("Restored Host");
+      // The guest field was empty, so the same call still seeds it — this is
+      // one action over two independent fields, not an all-or-nothing gate.
+      expect(useDraftPodStore.getState().guestDisplayName).toBe("Alice");
+    });
+
+    it.each([
+      ["never set", ""],
+      ["whitespace only", "   "],
+    ])("leaves both fields empty when the saved identity is %s", (_label, saved) => {
+      mocks.multiplayerConfig.displayName = saved;
+
+      useDraftPodStore.getState().adoptSavedDisplayName();
+
+      // Discriminates a seed that skips the emptiness check: "   " would land
+      // in both fields and read as filled while `createPod`/`joinPod` still
+      // reject it, since both trim before validating.
+      expect(useDraftPodStore.getState()).toMatchObject({
+        hostDisplayName: "",
+        guestDisplayName: "",
+      });
+    });
+
+    it("skips a persisted identity that is not a string", () => {
+      // `multiplayerStore`'s persist `merge` normalizes `lastHostConfig`,
+      // `userLobbySources`, `disabledDirectorySources`, `hostingServer` and
+      // `connectionMode` under the comment "Persisted state is external
+      // input", but spreads `displayName` through unvalidated — so a corrupt
+      // or hand-edited localStorage blob really can hydrate a non-string here.
+      // The cast is how this suite reaches that state; the store's own type
+      // says it cannot happen.
+      (mocks.multiplayerConfig as { displayName: unknown }).displayName = 42;
+
+      // Seeding is cosmetic, so it must not be able to take the page down.
+      // `PodSetup` calls this from a mount effect, and `App.tsx` wraps every
+      // route in `ErrorBoundary` — so an unguarded throw here replaces the
+      // Draft Pod screen with that boundary's fallback. Measured with the guard
+      // removed and `displayName` set to 42: rendering the page bare throws a
+      // TypeError out of the `.trim()`.
+      expect(() => useDraftPodStore.getState().adoptSavedDisplayName()).not.toThrow();
+      expect(useDraftPodStore.getState()).toMatchObject({
+        hostDisplayName: "",
+        guestDisplayName: "",
+      });
+    });
+
+    it("yields to a host session restored after it", async () => {
+      // The ordering the page actually produces: `PodSetup`'s mount effect
+      // seeds first, and `resumeHostedPod` — whose `set` sits behind an
+      // `await` — lands after it. The restored name wins because that path
+      // assigns `hostDisplayName` unconditionally, NOT because of the
+      // empty-field guard, which by then has nothing left to protect.
+      mocks.multiplayerConfig.displayName = "Alice";
+      mocks.inspectActiveDraftPod.mockReturnValue({
+        type: "present",
+        meta: activeMeta,
+        capture: { id: activeMeta.id, roomCode: activeMeta.roomCode, updatedAt: activeMeta.updatedAt },
+      });
+      mocks.loadDraftHostSession.mockResolvedValue(persistedSession);
+
+      useDraftPodStore.getState().adoptSavedDisplayName();
+      // Reach guard: the seed really did land, so the assertion after the
+      // resume is measuring an overwrite rather than a seed that never ran.
+      expect(useDraftPodStore.getState().hostDisplayName).toBe("Alice");
+
+      await expect(useDraftPodStore.getState().resumeHostedPod()).resolves.toBe("resumed");
+
+      expect(useDraftPodStore.getState().hostDisplayName).toBe(persistedSession.hostDisplayName);
+    });
+
+    it("reads the identity at call time, not at store creation", () => {
+      // The name is editable — `PlayerIdentityBanner`, and Preferences →
+      // Multiplayer — long after this module is evaluated. Discriminates a
+      // seed captured into `initialState`.
+      mocks.multiplayerConfig.displayName = "Renamed After Load";
+
+      useDraftPodStore.getState().adoptSavedDisplayName();
+
+      expect(useDraftPodStore.getState().hostDisplayName).toBe("Renamed After Load");
     });
   });
 });

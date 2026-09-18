@@ -516,6 +516,8 @@ pub struct GameSession {
     pub start_when_full: bool,
     /// Ranked rooms apply rating updates when a match completes.
     pub ranked: bool,
+    /// Host-private Cube source supplied only by native Full-server creation.
+    pub booster_pack_pool: Option<Vec<String>>,
     /// Engine events produced by `start_game` (the d20 first-player contest's
     /// `StartingPlayerContest` event). Captured here so the INITIAL post-start
     /// broadcast can surface them to clients; cleared after that broadcast so
@@ -1172,6 +1174,7 @@ impl GameSession {
         load_and_hydrate_decks(
             &mut self.state,
             &DeckPayload {
+                booster_pack_pool: self.booster_pack_pool.clone(),
                 player: player_deck,
                 opponent: opponent_deck,
                 ai_decks,
@@ -1390,6 +1393,7 @@ impl GameSession {
             game_started: self.game_started,
             start_when_full: self.start_when_full,
             ranked: self.ranked,
+            booster_pack_pool: self.booster_pack_pool.clone(),
             lobby_meta: self.lobby_meta.clone(),
         }
     }
@@ -1561,6 +1565,7 @@ impl GameSession {
             game_started: ps.game_started,
             start_when_full: ps.start_when_full,
             ranked: ps.ranked,
+            booster_pack_pool: ps.booster_pack_pool,
             start_events: Vec::new(),
             pending_takeback: None,
             // Neither ring is persisted: a rollback offer is a live-session
@@ -1779,6 +1784,7 @@ impl SessionManager {
             game_started: false,
             start_when_full: true,
             ranked: false,
+            booster_pack_pool: None,
             start_events: Vec::new(),
             pending_takeback: None,
             takeback_history: VecDeque::new(),
@@ -1964,6 +1970,36 @@ impl SessionManager {
         format_config: Option<FormatConfig>,
         db: &Arc<CardDatabase>,
     ) -> Result<(String, String), String> {
+        self.create_game_with_ai_with_booster_pack_pool(
+            host_deck,
+            host_choice,
+            display_name,
+            timer_seconds,
+            match_config,
+            ai_requests,
+            card_names,
+            format_config,
+            None,
+            db,
+        )
+    }
+
+    /// Creates and immediately starts an AI game, retaining the native Cube
+    /// source privately until `start_game` can pass it to the engine.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_game_with_ai_with_booster_pack_pool(
+        &mut self,
+        host_deck: PlayerDeckPayload,
+        host_choice: DeckChoice,
+        display_name: String,
+        timer_seconds: Option<u32>,
+        match_config: MatchConfig,
+        ai_requests: Vec<AiSeatSetup>,
+        card_names: Vec<String>,
+        format_config: Option<FormatConfig>,
+        booster_pack_pool: Option<Vec<String>>,
+        db: &Arc<CardDatabase>,
+    ) -> Result<(String, String), String> {
         let total_players = 1 + ai_requests.len() as u8;
         let (game_code, player_token) = self.create_game_n_players(
             host_deck,
@@ -1976,6 +2012,7 @@ impl SessionManager {
         )?;
 
         let session = self.sessions.get_mut(&game_code).unwrap();
+        session.booster_pack_pool = booster_pack_pool;
         for setup in ai_requests {
             session.seat_ai(setup);
         }
@@ -2236,6 +2273,7 @@ impl SessionManager {
                 attach_to,
                 run_etb,
                 nonlegendary,
+                creation_kind,
                 ..
             }) => {
                 let result = create_debug_cards_with_rejection(
@@ -2250,6 +2288,7 @@ impl SessionManager {
                         attach_to,
                         run_etb,
                         nonlegendary,
+                        creation_kind,
                     },
                 )
                 .map_err(SessionActionError::Rejected)?;
@@ -2649,7 +2688,8 @@ mod tests {
     use engine::game::scenario_db::GameScenarioDbExt;
     use engine::types::ability::{Effect, ResolvedAbility, TargetRef};
     use engine::types::actions::{
-        PrecastCopyShortcutResponse, ResolveAllConsentDecision, ResolveAllScope,
+        DebugCardCreationKind, PrecastCopyShortcutResponse, ResolveAllConsentDecision,
+        ResolveAllScope,
     };
     use engine::types::card::CardFace;
     use engine::types::card_type::CardType;
@@ -5376,6 +5416,7 @@ mod tests {
                     attach_to: None,
                     run_etb: true,
                     nonlegendary: false,
+                    creation_kind: DebugCardCreationKind::Token,
                 }),
                 Some(&*db),
             )
@@ -5412,6 +5453,7 @@ mod tests {
                     object.name == "Server Debug Creature"
                         && object.owner == PlayerId(1)
                         && object.zone == Zone::Battlefield
+                        && object.is_token
                 })
                 .count(),
             2
@@ -5442,6 +5484,7 @@ mod tests {
                     attach_to: None,
                     run_etb: true,
                     nonlegendary: false,
+                    creation_kind: DebugCardCreationKind::Card,
                 }),
             ),
             (
@@ -5504,6 +5547,7 @@ mod tests {
                     attach_to: None,
                     run_etb: true,
                     nonlegendary: false,
+                    creation_kind: DebugCardCreationKind::Card,
                 }),
             )
             .expect_err("an invalid owner must fail before database lookup");
@@ -5530,6 +5574,7 @@ mod tests {
                     attach_to: None,
                     run_etb: true,
                     nonlegendary: false,
+                    creation_kind: DebugCardCreationKind::Card,
                 }),
             )
             .expect_err("a valid nonzero request requires a database");
@@ -5557,6 +5602,7 @@ mod tests {
                     attach_to: None,
                     run_etb: true,
                     nonlegendary: false,
+                    creation_kind: DebugCardCreationKind::Card,
                 }),
             )
             .expect_err("a real entry off Priority must fail before database lookup");
@@ -5882,6 +5928,30 @@ mod tests {
         let json = serde_json::to_string(&session.to_persisted()).unwrap();
         let persisted: crate::persist::PersistedSession = serde_json::from_str(&json).unwrap();
         GameSession::from_persisted(persisted, db).expect("supported persisted format config")
+    }
+
+    #[test]
+    fn native_cube_pool_survives_start_and_disk_recovery_without_deduplication() {
+        let db = Arc::new(CardDatabase::default());
+        let mut mgr = SessionManager::new();
+        let (code, _) = mgr.create_game(make_deck(), None);
+        let pool = vec![
+            "Cube Card".to_string(),
+            "Cube Card".to_string(),
+            "Undealt sentinel".to_string(),
+        ];
+        mgr.sessions.get_mut(&code).unwrap().booster_pack_pool = Some(pool.clone());
+        mgr.join_game(&code, make_deck(), None)
+            .expect("second seat joins");
+
+        let restored = round_trip_through_disk(&mgr.sessions[&code], &db);
+        assert_eq!(restored.booster_pack_pool, Some(pool.clone()));
+
+        let (ordinary_code, _) = mgr.create_game(make_deck(), None);
+        mgr.join_game(&ordinary_code, make_deck(), None)
+            .expect("ordinary game joins");
+        let ordinary = round_trip_through_disk(&mgr.sessions[&ordinary_code], &db);
+        assert!(ordinary.booster_pack_pool.is_none());
     }
 
     #[test]
@@ -6268,6 +6338,7 @@ mod tests {
                     attach_to: None,
                     run_etb: true,
                     nonlegendary: false,
+                    creation_kind: DebugCardCreationKind::Card,
                 }),
                 None,
             )
@@ -6433,6 +6504,7 @@ mod tests {
             game_started: false,
             start_when_full: true,
             ranked: false,
+            booster_pack_pool: None,
             start_events: Vec::new(),
             pending_takeback: None,
             takeback_history: VecDeque::new(),

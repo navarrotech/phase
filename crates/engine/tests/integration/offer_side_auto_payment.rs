@@ -772,6 +772,8 @@ fn setup_face_of_boe(add_plain_red_source: bool) -> Option<(GameRunner, ObjectId
                     duration: None,
                     driver: CastFromZoneDriver::DuringResolution,
                     mana_spend_permission: None,
+                    additional_cost: None,
+                    cast_cost_modifier: None,
                 },
             )
             .cost(AbilityCost::Tap)
@@ -953,6 +955,8 @@ fn setup_free_hand_pick() -> (GameRunner, ObjectId, ObjectId) {
                     duration: None,
                     driver: CastFromZoneDriver::DuringResolution,
                     mana_spend_permission: None,
+                    additional_cost: None,
+                    cast_cost_modifier: None,
                 },
             )
             .cost(AbilityCost::Tap)
@@ -1043,6 +1047,8 @@ fn setup_direct_graveyard_free_cast(optional: bool) -> (GameRunner, ObjectId, Ob
             duration: None,
             driver: CastFromZoneDriver::DuringResolution,
             mana_spend_permission: None,
+            additional_cost: None,
+            cast_cost_modifier: None,
         },
         vec![TargetRef::Object(spell)],
         source,
@@ -1314,6 +1320,7 @@ fn exile_alt_cost_permission(
         enters_with_counter: None,
         enters_with_modifications: Vec::new(),
         mana_spend_permission: None,
+        cast_cost_modifier: None,
     }
 }
 

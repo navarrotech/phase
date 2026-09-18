@@ -78,9 +78,7 @@ pub fn resolve(
     //       transform NOTHING), and for a `Typed` filter the scan would perform
     //       a battlefield-wide mass transform the card never printed (that is
     //       `resolve_all`'s job, and it returned above).
-    let effective_targets =
-        crate::game::targeting::resolved_targets(ability, &single_target, state);
-    let subjects = super::effect_object_targets(&single_target, &effective_targets);
+    let subjects = super::resolved_effect_object_ids(state, ability, &single_target);
 
     // CR 400.7 + CR 603.7c: a delayed transform whose pinned referent became a
     // new object transforms nothing — but that guard governs ONLY a referent
@@ -247,7 +245,7 @@ fn resolve_all(
     target: &crate::types::ability::TargetFilter,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
-    let effective_filter = crate::game::effects::resolved_object_filter(ability, target);
+    let effective_filter = crate::game::effects::resolved_object_filter(state, ability, target);
 
     // CR 107.3a + CR 601.2b: ability-context filter evaluation.
     let ctx = crate::game::filter::FilterContext::from_ability(ability);
@@ -324,6 +322,7 @@ mod tests {
         obj.base_color = vec![ManaColor::Green];
         obj.back_face = Some(crate::game::game_object::BackFaceData {
             is_swap_snapshot: false,
+            trigger_printed_origins: Vec::new(),
             name: "Back Face".to_string(),
             power: Some(4),
             toughness: Some(4),
