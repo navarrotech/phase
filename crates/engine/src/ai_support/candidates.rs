@@ -5055,7 +5055,16 @@ fn attacker_actions(
     // assignment (completion collapses many illegal proposals to the same witness).
     let mut seen: HashSet<Vec<(ObjectId, AttackTarget)>> = HashSet::new();
     let mut actions = Vec::new();
-    for action in crate::game::combat::complete_attacker_proposals(state, &proposals) {
+    // CR 508.1d: candidate generation feeds the rollout / projection scorers, not
+    // the production declare-attackers seam (which bypasses candidates and calls
+    // `complete_attacker_proposal` with its own posture). A tax-free posture here
+    // keeps every generated candidate free of a payment prompt no scorer is
+    // positioned to commit to.
+    for action in crate::game::combat::complete_attacker_proposals(
+        state,
+        &proposals,
+        crate::game::combat::CombatTaxPosture::Refuse,
+    ) {
         if let GameAction::DeclareAttackers { attacks, .. } = &action {
             let mut key = attacks.clone();
             key.sort_unstable();
@@ -5132,18 +5141,23 @@ fn blocker_actions(
     }
 
     let mut seen = HashSet::new();
-    crate::game::combat::complete_blocker_proposals(state, player, &proposals)
-        .into_iter()
-        .filter_map(|action| {
-            let GameAction::DeclareBlockers { assignments } = &action else {
-                return None;
-            };
-            let mut key = assignments.clone();
-            key.sort_unstable();
-            seen.insert(key)
-                .then(|| candidate(action, TacticalClass::Block, Some(player)))
-        })
-        .collect()
+    crate::game::combat::complete_blocker_proposals(
+        state,
+        player,
+        &proposals,
+        crate::game::combat::CombatTaxPosture::Refuse,
+    )
+    .into_iter()
+    .filter_map(|action| {
+        let GameAction::DeclareBlockers { assignments } = &action else {
+            return None;
+        };
+        let mut key = assignments.clone();
+        key.sort_unstable();
+        seen.insert(key)
+            .then(|| candidate(action, TacticalClass::Block, Some(player)))
+    })
+    .collect()
 }
 
 fn select_cards_variants(

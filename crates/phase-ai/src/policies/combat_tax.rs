@@ -1,15 +1,23 @@
-//! `CombatTaxPaymentPolicy` — decide whether to pay the aggregate combat tax
-//! imposed by UnlessPay combat restrictions (Ghostly Prison, Propaganda, Sphere
-//! of Safety, Windborn Muse).
+//! Deciding whether to pay the aggregate combat tax imposed by UnlessPay combat
+//! restrictions (Ghostly Prison, Propaganda, Sphere of Safety, Windborn Muse).
 //!
-//! Fires only on `GameAction::PayCombatTax` during a `WaitingFor::CombatTaxPayment`
-//! pause. The decision is binary (`accept` vs decline); scoring biases the AI
-//! toward paying when expected damage exceeds the tax cost by a meaningful
-//! margin, scaled down by deck archetype (aggro decks push harder).
+//! The judgement is made twice for the same combat, and both readings must
+//! agree. [`plan_attack_tax`] makes it BEFORE the declaration is submitted, so
+//! the engine's completion authority knows whether to preserve taxed attackers
+//! or fall back to the tax-free witness. [`CombatTaxPaymentPolicy`] and
+//! [`should_pay_pending_tax`] make it again at the resulting
+//! `WaitingFor::CombatTaxPayment` pause. Both route through [`tax_deltas`],
+//! which is a pure function of the quote and the game state, so the AI never
+//! declines a tax it just chose to incur — declining rebuilds the identical
+//! declare prompt, and a disagreement between the two readings would loop
+//! (CR 508.1d + CR 509.1d).
 //!
-//! CR 508.1d + CR 508.1h + CR 509.1c + CR 509.1d: the taxed player may choose
-//! either branch; declining drops the taxed creatures from the declaration.
+//! Scoring biases toward paying when expected damage exceeds the tax cost by a
+//! meaningful margin, scaled by deck archetype (aggro decks push harder).
 
+use engine::game::combat::{
+    attack_tax_is_affordable, compute_attack_tax, AttackTarget, CombatTaxPosture,
+};
 use engine::types::actions::GameAction;
 use engine::types::game_state::{CombatTaxContext, GameState, WaitingFor};
 use engine::types::identifiers::ObjectId;
@@ -48,6 +56,16 @@ const BLOCKING_CONTROL_DAMP: f64 = 0.8;
 /// Bonus for paying block tax to preserve valuable blockers.
 const BLOCKER_VALUE_BONUS: f64 = 0.25;
 
+/// Extra bias toward paying when declining would drop most of the declaration.
+const COLLAPSE_BONUS: f64 = 0.15;
+
+/// Scores the two `PayCombatTax` branches during lookahead rollouts.
+///
+/// The ROOT answer is not taken here: `deterministic_combat_choice` answers a
+/// live tax prompt directly, because that answer must match the judgement that
+/// authorized the declaration (see the module docs). This policy shapes the
+/// value of taxed lines explored inside the search tree, where the same
+/// [`tax_deltas`] contract keeps the two seams consistent.
 pub struct CombatTaxPaymentPolicy;
 
 impl TacticalPolicy for CombatTaxPaymentPolicy {
@@ -94,101 +112,144 @@ impl TacticalPolicy for CombatTaxPaymentPolicy {
                 reason: PolicyReason::new("combat_tax_na"),
             };
         };
-        let TaxSnapshot {
-            context,
-            total_mana_value: total_cost_mv,
-            per_creature,
-        } = snap;
-
-        // Damage potential: sum of powers of the taxed creatures.
-        let expected_damage: i32 = per_creature
-            .iter()
-            .map(|(id, _)| {
-                ctx.state
-                    .objects
-                    .get(id)
-                    .and_then(|obj| obj.power)
-                    .unwrap_or(0)
-            })
-            .sum();
-        let tax = total_cost_mv as i32;
-
-        // Total declared attackers/blockers — used to detect "declining would
-        // collapse the declaration".
-        let total_declared = total_declared_count(&ctx.state.waiting_for);
-        let taxed = per_creature.len();
-        let collapse_fraction = if total_declared > 0 {
-            taxed as f64 / total_declared as f64
-        } else {
-            0.0
-        };
-
-        // Archetype modifier — aggro amplifies, control dampens. Pulls the AI
-        // seat's features from the per-session cache (empty DeckFeatures if the
-        // seat wasn't registered).
         let default_features = DeckFeatures::default();
-        let features = ctx
-            .context
-            .session
-            .features
-            .get(&ctx.ai_player)
-            .unwrap_or(&default_features);
-        let archetype_mod = archetype_multiplier(features, context.clone());
-
-        let base_delta = if expected_damage > tax {
-            DAMAGE_EXCEEDS_TAX_BONUS * archetype_mod
-        } else if expected_damage < tax {
-            TAX_EXCEEDS_DAMAGE_PENALTY / archetype_mod.max(0.01)
-        } else {
-            0.0
+        let quote = TaxQuote {
+            context: snap.context,
+            total_mana_value: snap.total_mana_value,
+            per_creature: &snap.per_creature,
+            total_declared: total_declared_count(&ctx.state.waiting_for),
         };
+        let deltas = tax_deltas(
+            ctx.state,
+            ctx.ai_player,
+            ctx.context
+                .session
+                .features
+                .get(&ctx.ai_player)
+                .unwrap_or(&default_features),
+            &quote,
+        );
 
-        // Mana availability penalty — if we'd tap out and lose interaction.
-        let available = count_untapped_mana_sources(ctx.state, ctx.ai_player);
-        let tap_out_penalty = if available > 0 && available.saturating_sub(total_cost_mv) == 0 {
-            TAP_OUT_PENALTY
+        let (delta, kind) = if accept {
+            (deltas.accept, "combat_tax_accept")
         } else {
-            0.0
-        };
-
-        // If declining would collapse the attack (> fraction taxed), the policy
-        // treats that as "might as well pay" and adds a modest additional bonus.
-        let collapse_bonus =
-            if collapse_fraction >= ATTACK_COLLAPSE_FRACTION && accept && expected_damage > 0 {
-                0.15
-            } else {
-                0.0
-            };
-
-        // Blocker value bonus: when blocking, add bonus for paying tax to preserve
-        // valuable blockers. This addresses issue #1541 where blockers disappear
-        // due to aggressive tax decline.
-        let blocker_value_bonus = if matches!(context, CombatTaxContext::Blocking) && accept {
-            BLOCKER_VALUE_BONUS
-        } else {
-            0.0
-        };
-
-        let delta = if accept {
-            base_delta + tap_out_penalty + collapse_bonus + blocker_value_bonus
-        } else {
-            // Decline: sign-flipped base_delta (declining is the opposite decision).
-            -base_delta
-        };
-
-        let kind = if accept {
-            "combat_tax_accept"
-        } else {
-            "combat_tax_decline"
+            (deltas.decline, "combat_tax_decline")
         };
         PolicyVerdict::Score {
             delta,
             reason: PolicyReason::new(kind)
-                .with_fact("tax_mv", tax as i64)
-                .with_fact("expected_damage", expected_damage as i64)
-                .with_fact("taxed", taxed as i64)
-                .with_fact("declared", total_declared as i64),
+                .with_fact("tax_mv", quote.total_mana_value as i64)
+                .with_fact("expected_damage", deltas.expected_damage as i64)
+                .with_fact("taxed", quote.per_creature.len() as i64)
+                .with_fact("declared", quote.total_declared as i64),
         }
+    }
+}
+
+/// A locked-in combat-tax quote, as both the prompt and a pre-declaration
+/// proposal can describe it.
+///
+/// The prompt form reads it off `WaitingFor::CombatTaxPayment`; the proposal
+/// form builds the same fields from `combat::compute_attack_tax` before the
+/// declaration is submitted. Both feed [`tax_deltas`], so the AI's answer at the
+/// prompt matches the judgement that authorized the proposal.
+pub(crate) struct TaxQuote<'a> {
+    pub context: CombatTaxContext,
+    pub total_mana_value: u32,
+    /// Per-creature breakdown — the taxed subset of the declaration.
+    pub per_creature: &'a [(ObjectId, engine::types::mana::ManaCost)],
+    /// Size of the whole declaration the quote was priced against.
+    pub total_declared: usize,
+}
+
+/// Policy-score contributions for the two `PayCombatTax` branches of one quote.
+pub(crate) struct TaxDeltas {
+    pub accept: f64,
+    pub decline: f64,
+    /// Combined power of the taxed creatures, surfaced for decision receipts.
+    pub expected_damage: i32,
+}
+
+impl TaxDeltas {
+    /// True when paying scores strictly better than declining.
+    ///
+    /// This is the single authority for "is this tax worth paying". Because it
+    /// is a pure function of the quote and the game state, the declare step and
+    /// the payment prompt reach the same answer, which is what makes a taxed
+    /// AI declaration terminate (CR 508.1d — declining rebuilds the identical
+    /// declare prompt).
+    pub fn prefers_paying(&self) -> bool {
+        self.accept > self.decline
+    }
+}
+
+/// Score the accept and decline branches of one combat-tax quote.
+///
+/// Biases toward paying when the taxed creatures' damage exceeds the quote,
+/// scaled by deck archetype, and away from it when the payment would tap the
+/// seat out of interaction.
+pub(crate) fn tax_deltas(
+    state: &GameState,
+    player: PlayerId,
+    features: &DeckFeatures,
+    quote: &TaxQuote<'_>,
+) -> TaxDeltas {
+    // Damage potential: sum of powers of the taxed creatures.
+    let expected_damage: i32 = quote
+        .per_creature
+        .iter()
+        .map(|(id, _)| state.objects.get(id).and_then(|obj| obj.power).unwrap_or(0))
+        .sum();
+    let tax = quote.total_mana_value as i32;
+
+    let collapse_fraction = if quote.total_declared > 0 {
+        quote.per_creature.len() as f64 / quote.total_declared as f64
+    } else {
+        0.0
+    };
+
+    // Archetype modifier — aggro amplifies, control dampens.
+    let archetype_mod = archetype_multiplier(features, quote.context.clone());
+
+    let base_delta = if expected_damage > tax {
+        DAMAGE_EXCEEDS_TAX_BONUS * archetype_mod
+    } else if expected_damage < tax {
+        TAX_EXCEEDS_DAMAGE_PENALTY / archetype_mod.max(0.01)
+    } else {
+        0.0
+    };
+
+    // Mana availability penalty — if we'd tap out and lose interaction.
+    let available = count_untapped_mana_sources(state, player);
+    let tap_out_penalty = if available > 0 && available.saturating_sub(quote.total_mana_value) == 0
+    {
+        TAP_OUT_PENALTY
+    } else {
+        0.0
+    };
+
+    // If declining would collapse the declaration (> fraction taxed), treat that
+    // as "might as well pay" and add a modest additional bonus.
+    let collapse_bonus = if collapse_fraction >= ATTACK_COLLAPSE_FRACTION && expected_damage > 0 {
+        COLLAPSE_BONUS
+    } else {
+        0.0
+    };
+
+    // Blocker value bonus: when blocking, add bonus for paying tax to preserve
+    // valuable blockers. This addresses issue #1541 where blockers disappear
+    // due to aggressive tax decline.
+    let blocker_value_bonus = if matches!(quote.context, CombatTaxContext::Blocking) {
+        BLOCKER_VALUE_BONUS
+    } else {
+        0.0
+    };
+
+    TaxDeltas {
+        accept: base_delta + tap_out_penalty + collapse_bonus + blocker_value_bonus,
+        // Decline: sign-flipped base_delta (declining is the opposite decision).
+        decline: -base_delta,
+        expected_damage,
     }
 }
 
@@ -274,6 +335,80 @@ fn archetype_multiplier(features: &DeckFeatures, context: CombatTaxContext) -> f
         // conserve mana, but the penalty is less severe to preserve valuable blockers.
         CombatTaxContext::Blocking => 1.0 - (1.0 - BLOCKING_CONTROL_DAMP) * control,
     }
+}
+
+/// Choose the attack declaration and tax posture the AI is prepared to honour.
+///
+/// Returns the (possibly trimmed) proposal to submit and the posture to complete
+/// it under. A tax is per attacker (CR 508.1h), so an alpha strike the AI cannot
+/// afford in full is not abandoned: the weakest taxed attacker is dropped and the
+/// smaller strike re-priced, until one is both affordable and worth its price.
+/// An empty result hands the engine's tax-free witness the final say, which is
+/// also what honours any must-attack requirement the trimming walked past.
+pub(crate) fn plan_attack_tax(
+    state: &GameState,
+    player: PlayerId,
+    features: &DeckFeatures,
+    attacks: &[(ObjectId, AttackTarget)],
+) -> (Vec<(ObjectId, AttackTarget)>, CombatTaxPosture) {
+    let mut kept = attacks.to_vec();
+    while !kept.is_empty() {
+        // No quote left means trimming removed every taxed attacker, so what
+        // remains attacks for free.
+        let Some((total_cost, per_creature)) = compute_attack_tax(state, &kept) else {
+            return (kept, CombatTaxPosture::Refuse);
+        };
+        let quote = TaxQuote {
+            context: CombatTaxContext::Attacking,
+            total_mana_value: total_cost.mana_value(),
+            per_creature: &per_creature,
+            total_declared: kept.len(),
+        };
+        if attack_tax_is_affordable(state, &kept)
+            && tax_deltas(state, player, features, &quote).prefers_paying()
+        {
+            return (kept, CombatTaxPosture::Accept);
+        }
+
+        let Some(weakest) = per_creature
+            .iter()
+            .map(|(id, _)| *id)
+            // Tie-broken by id so the trim is deterministic across runs.
+            .min_by_key(|id| (state.objects.get(id).and_then(|obj| obj.power), id.0))
+        else {
+            break;
+        };
+        kept.retain(|(id, _)| *id != weakest);
+    }
+
+    (Vec::new(), CombatTaxPosture::Refuse)
+}
+
+/// Answer a live `WaitingFor::CombatTaxPayment` pause: pay, or decline?
+///
+/// Reads the quote the engine locked in and re-runs [`tax_deltas`] against it.
+/// On the attack side the AI only reaches this prompt by having planned an
+/// `Accept` posture for this same declaration, so this returns `true` and the
+/// declaration commits. A state that carries no tax prompt declines, which is
+/// the safe answer for a prompt this seat did not author.
+pub(crate) fn should_pay_pending_tax(
+    state: &GameState,
+    player: PlayerId,
+    features: &DeckFeatures,
+) -> bool {
+    let Some(snap) = extract_tax_state(&state.waiting_for) else {
+        tracing::debug!(
+            "should_pay_pending_tax called outside a CombatTaxPayment pause; declining"
+        );
+        return false;
+    };
+    let quote = TaxQuote {
+        context: snap.context,
+        total_mana_value: snap.total_mana_value,
+        per_creature: &snap.per_creature,
+        total_declared: total_declared_count(&state.waiting_for),
+    };
+    tax_deltas(state, player, features, &quote).prefers_paying()
 }
 
 #[cfg(test)]

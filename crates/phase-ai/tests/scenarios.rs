@@ -1818,3 +1818,229 @@ fn ai_obeys_planeswalker_directed_attack_requirement() {
         "combat commits with the creature attacking Gideon"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CR 508.1d + CR 508.1h: the AI pays a Propaganda-style attack tax.
+//
+// The declare-attackers completion authority substitutes a TAX-FREE witness for
+// any proposal it will not pay for, and with no must-attack requirement on the
+// board that witness is the EMPTY declaration. So an AI that never declared a
+// tax posture could not attack into Propaganda at all, however much mana it had
+// open. These tests drive the real `choose_action` seam to prove it now does,
+// that it stops when it cannot pay, and that the taxed round trip terminates.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Propaganda's verified Oracle text.
+///
+/// Source: client/public/card-data.json (2026-05-10), matching the engine-side
+/// `add_propaganda` helper in `crates/engine/tests/integration/rules/combat.rs`.
+const PROPAGANDA_ORACLE: &str = "Creatures can't attack you unless their controller pays {2} \
+     for each creature they control that's attacking you.";
+
+/// Park P1 in `DeclareAttackers` against a P0 that controls Propaganda.
+///
+/// P1 gets `attackers` untapped 3/3s and `untapped_lands` Forests; P0's only
+/// permanent is the enchantment, so nothing can block and the AI's only reason
+/// to hold back is the tax.
+fn build_propaganda_attack_scenario(
+    attackers: usize,
+    untapped_lands: usize,
+) -> (GameRunner, Vec<ObjectId>) {
+    use engine::types::mana::ManaColor;
+
+    let mut scenario = GameScenario::new();
+    scenario.add_enchantment_from_oracle(P0, "Propaganda", PROPAGANDA_ORACLE);
+    let attacker_ids: Vec<ObjectId> = (0..attackers)
+        .map(|index| {
+            scenario
+                .add_creature(P1, &format!("Bear {index}"), 3, 3)
+                .id()
+        })
+        .collect();
+    for _ in 0..untapped_lands {
+        scenario.add_basic_land(P1, ManaColor::Green);
+    }
+
+    let mut runner = scenario.build();
+    let state = runner.state_mut();
+    state.active_player = P1;
+    state.priority_player = P1;
+    state.phase = Phase::DeclareAttackers;
+    state.turn_number = 2;
+    state.waiting_for = WaitingFor::DeclareAttackers {
+        player: P1,
+        valid_attacker_ids: attacker_ids.clone(),
+        valid_attack_targets: vec![AttackTarget::Player(P0)],
+        valid_attack_targets_by_attacker: None,
+        attacker_constraints: Default::default(),
+    };
+    (runner, attacker_ids)
+}
+
+/// The AI's chosen declaration, as attacker ids.
+fn ai_declared_attackers(runner: &GameRunner) -> (GameAction, Vec<ObjectId>) {
+    let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+    let mut rng = SmallRng::seed_from_u64(7);
+    let action = choose_action(runner.state(), P1, &config, &mut rng)
+        .expect("AI must choose a declare-attackers action");
+    let GameAction::DeclareAttackers { attacks, .. } = &action else {
+        panic!("expected DeclareAttackers, got {action:?}");
+    };
+    let ids = attacks.iter().map(|(id, _)| *id).collect();
+    (action, ids)
+}
+
+/// CR 508.1d + CR 508.1h: with the tax affordable and no blocker in sight, the
+/// AI declares the attack and pays, rather than collapsing to the empty
+/// tax-free witness.
+#[test]
+fn ai_attacks_through_propaganda_and_pays_the_tax() {
+    let (mut runner, attackers) = build_propaganda_attack_scenario(1, 4);
+
+    let (action, declared) = ai_declared_attackers(&runner);
+    assert_eq!(
+        declared, attackers,
+        "a 3/3 into an empty board must attack even though Propaganda taxes it {{2}}"
+    );
+
+    runner
+        .act(action)
+        .expect("the AI's taxed declaration must be reducer-legal");
+    let WaitingFor::CombatTaxPayment { total_cost, .. } = &runner.state().waiting_for else {
+        panic!(
+            "a taxed declaration must open the tax prompt, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    assert_eq!(
+        total_cost.mana_value(),
+        2,
+        "Propaganda taxes {{2}} per attacker"
+    );
+
+    // CR 508.1i: the AI must now answer its OWN quote with a payment — a decline
+    // would rebuild the identical declare prompt and re-propose forever.
+    let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+    let mut rng = SmallRng::seed_from_u64(7);
+    let answer = choose_action(runner.state(), P1, &config, &mut rng)
+        .expect("AI must answer the combat tax prompt");
+    assert_eq!(
+        answer,
+        GameAction::PayCombatTax { accept: true },
+        "the AI proposed this taxed attack, so it must pay for it"
+    );
+
+    runner.act(answer).expect("paying the tax must succeed");
+    let combat = runner
+        .state()
+        .combat
+        .as_ref()
+        .expect("combat commits once the tax is paid");
+    assert_eq!(
+        combat
+            .attackers
+            .iter()
+            .map(|a| a.object_id)
+            .collect::<Vec<_>>(),
+        attackers,
+        "the paid-for attacker must actually be attacking"
+    );
+}
+
+/// CR 508.1h: an unaffordable tax is not attacked into. The AI must fall back to
+/// the empty declaration WITHOUT opening a prompt it cannot answer.
+#[test]
+fn ai_holds_back_when_the_propaganda_tax_is_unaffordable() {
+    let (mut runner, _attackers) = build_propaganda_attack_scenario(1, 0);
+
+    let (action, declared) = ai_declared_attackers(&runner);
+    assert!(
+        declared.is_empty(),
+        "with no mana to pay {{2}} the AI must not declare a taxed attacker, got {declared:?}"
+    );
+
+    runner.act(action).expect("the empty declaration is legal");
+    assert!(
+        !matches!(
+            runner.state().waiting_for,
+            WaitingFor::CombatTaxPayment { .. }
+        ),
+        "an unaffordable proposal must never open a tax prompt, got {:?}",
+        runner.state().waiting_for
+    );
+}
+
+/// CR 508.1h: the tax is charged PER attacker, so an alpha strike the AI cannot
+/// fund in full is trimmed to one it can, not abandoned. Three 3/3s cost {6};
+/// with four lands open the AI attacks with two of them for {4}.
+#[test]
+fn ai_trims_the_attack_to_the_propaganda_tax_it_can_afford() {
+    let (mut runner, attackers) = build_propaganda_attack_scenario(3, 4);
+
+    let (action, declared) = ai_declared_attackers(&runner);
+    assert_eq!(
+        declared.len(),
+        2,
+        "four lands fund {{4}} of the {{6}} full strike, so two attackers must go, got {declared:?}"
+    );
+    assert!(
+        declared.iter().all(|id| attackers.contains(id)),
+        "the trimmed strike must be a subset of the available attackers"
+    );
+
+    runner
+        .act(action)
+        .expect("the trimmed declaration must be legal");
+    let WaitingFor::CombatTaxPayment { total_cost, .. } = &runner.state().waiting_for else {
+        panic!(
+            "the trimmed strike is still taxed and must prompt, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    assert_eq!(total_cost.mana_value(), 4, "two attackers at {{2}} each");
+}
+
+/// The taxed declare → pay round trip must TERMINATE under the host loop.
+///
+/// CR 508.1d: declining the tax rebuilds the identical `DeclareAttackers`
+/// prompt, so a seat whose payment answer disagreed with its declaration would
+/// spin here forever. `run_ai_actions_bounded` caps the work, and combat having
+/// advanced past the declare step is the evidence the loop converged.
+#[test]
+fn ai_taxed_attack_round_trip_terminates() {
+    let (mut runner, attackers) = build_propaganda_attack_scenario(1, 4);
+
+    let ai_players = HashSet::from([P1]);
+    let ai_configs = HashMap::from([(P1, create_config(AiDifficulty::VeryHard, Platform::Native))]);
+    let mut rng = SmallRng::seed_from_u64(7);
+    let session = phase_ai::session::AiSession::arc_from_game(runner.state());
+    let run = run_ai_actions_bounded(
+        runner.state_mut(),
+        &ai_players,
+        &ai_configs,
+        &mut rng,
+        &session,
+        32,
+    );
+
+    assert!(
+        !run.results.is_empty(),
+        "the host loop must take at least the declare + pay actions"
+    );
+    assert!(
+        !matches!(
+            runner.state().waiting_for,
+            WaitingFor::DeclareAttackers { .. } | WaitingFor::CombatTaxPayment { .. }
+        ),
+        "the declare/pay cycle must not still be pending, got {:?}",
+        runner.state().waiting_for
+    );
+    assert!(
+        runner
+            .state()
+            .combat
+            .as_ref()
+            .is_some_and(|combat| combat.attackers.iter().any(|a| a.object_id == attackers[0])),
+        "the attacker must have committed to combat rather than looping on the tax"
+    );
+}

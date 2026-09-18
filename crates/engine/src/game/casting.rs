@@ -16896,7 +16896,7 @@ pub fn can_pay_ability_mana_cost_after_auto_tap_excluding(
 /// activated-ability payments: CR 106.6 restrictions that name those categories
 /// must not become eligible for a generic "you may pay" effect during
 /// resolution.
-pub(super) fn can_pay_effect_mana_cost_after_auto_tap(
+pub fn can_pay_effect_mana_cost_after_auto_tap(
     state: &GameState,
     player: PlayerId,
     source_id: ObjectId,
