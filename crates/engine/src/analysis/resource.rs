@@ -7101,6 +7101,23 @@ fn project_out_player_consumables(p: &mut Player) {
 /// hook's fodder-class representative so the class compares in the SAME normalized form as
 /// the projected frame objects — otherwise a raw-P/T class member would fail
 /// `fodder_content_eq` against the P/T-zeroed frame and be mis-partitioned as stable-engine).
+/// CR 119.1 + CR 603.7c: projects the life-total reading out of a `LifeChanged` event
+/// pinned to compared stack content.
+///
+/// A `LifeChanged` reports the life total the change left the player on, and a trigger
+/// that fired on it carries the event as resolution context — which makes that reading
+/// part of the stack entry's compared content. The reading IS the projected resource, so a
+/// frame that zeroes `Player::life` must zero it here too: otherwise the two cycle points
+/// of a drain loop (a life-gain trigger holding its own firing event) differ by the
+/// reading alone, compare UNEQUAL, and the cycle is never certified (CR 732.2a). The
+/// change itself (`amount`) is preserved — a cycle whose amounts differ is a real
+/// difference in the period, not a resource reading.
+fn project_out_event_resource_readings(event: &mut crate::types::events::GameEvent) {
+    if let crate::types::events::GameEvent::LifeChanged { new_total, .. } = event {
+        *new_total = None;
+    }
+}
+
 pub(crate) fn project_object_for_loop(object: &mut crate::game::game_object::GameObject) {
     // CR 120: marked damage is a monotone resource (lifelink/ping loops).
     object.damage_marked = 0;
@@ -7247,6 +7264,7 @@ fn project_out_resources(state: &GameState) -> GameState {
     // id can never MANUFACTURE a false positive.
     let mut trigger_firings = std::mem::take(&mut s.stack_trigger_firings);
     for (pos, entry) in s.stack.iter_mut().enumerate() {
+        project_out_stack_entry_resource_readings(&mut entry.kind);
         let original_id = entry.id;
         let canonical_id = ObjectId(pos as u64);
         entry.id = canonical_id;
@@ -7258,7 +7276,20 @@ fn project_out_resources(state: &GameState) -> GameState {
             s.stack_trigger_firings.insert(canonical_id, firing);
         }
     }
+    if let Some(entry) = s.resolving_stack_entry.as_mut() {
+        project_out_stack_entry_resource_readings(&mut entry.kind);
+    }
     s
+}
+
+/// CR 603.7c: the compared-content half of [`project_out_event_resource_readings`] — a
+/// triggered entry is the only `StackEntryKind` that pins a firing event.
+fn project_out_stack_entry_resource_readings(kind: &mut StackEntryKind) {
+    if let StackEntryKind::TriggeredAbility { trigger_event, .. } = kind {
+        if let Some(event) = trigger_event.as_mut() {
+            project_out_event_resource_readings(event);
+        }
+    }
 }
 
 /// The controller-side raw values of the PROJECTED scalar player consumables, in a
