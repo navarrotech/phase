@@ -5052,8 +5052,9 @@ pub enum CombatTaxPosture {
 ///
 /// An untaxed proposal is trivially affordable. A taxed one is probed with the
 /// same auto-tap payment authority `handle_pay_combat_tax` spends through
-/// (`pay_unless_cost` -> `pay_effect_mana_cost`), so the answer here and the
-/// outcome of an accepted prompt cannot disagree.
+/// (`pay_unless_cost` -> `pay_effect_mana_cost`). That spend has no resumable
+/// root, so a mana source whose own cost would pause for a replacement choice
+/// counts as unaffordable here, keeping the probe and the spend in agreement.
 pub fn attack_tax_is_affordable(state: &GameState, attacks: &[(ObjectId, AttackTarget)]) -> bool {
     let Some((total_cost, _)) = compute_attack_tax(state, attacks) else {
         return true;
@@ -5063,6 +5064,7 @@ pub fn attack_tax_is_affordable(state: &GameState, attacks: &[(ObjectId, AttackT
         state.active_player,
         ObjectId(0),
         &total_cost,
+        super::casting::PausedManaPayment::Unresumable,
     )
 }
 
@@ -5077,7 +5079,13 @@ pub fn block_tax_is_affordable(
     let Some((total_cost, _)) = compute_block_tax(state, blocks) else {
         return true;
     };
-    super::casting::can_pay_effect_mana_cost_after_auto_tap(state, player, ObjectId(0), &total_cost)
+    super::casting::can_pay_effect_mana_cost_after_auto_tap(
+        state,
+        player,
+        ObjectId(0),
+        &total_cost,
+        super::casting::PausedManaPayment::Unresumable,
+    )
 }
 
 /// CR 508.1i + CR 509.1e: can the seat answering a live `CombatTaxPayment`
@@ -5095,7 +5103,13 @@ pub fn pending_combat_tax_is_affordable(state: &GameState) -> bool {
     else {
         return false;
     };
-    super::casting::can_pay_effect_mana_cost_after_auto_tap(state, *player, ObjectId(0), total_cost)
+    super::casting::can_pay_effect_mana_cost_after_auto_tap(
+        state,
+        *player,
+        ObjectId(0),
+        total_cost,
+        super::casting::PausedManaPayment::Unresumable,
+    )
 }
 
 /// CR 508.1d: whether attacking `target` with `creature` alone would incur an
@@ -11171,9 +11185,9 @@ mod tests {
         }
     }
 
-    /// CR 508.1d: `CombatTaxPosture::Refuse` keeps the historical contract — any
-    /// taxed proposal collapses to the tax-free witness, which with no
-    /// must-attack requirement on the board is the empty declaration.
+    /// CR 508.1d: under `CombatTaxPosture::Refuse` any taxed proposal collapses
+    /// to the tax-free witness, which with no must-attack requirement on the
+    /// board is the empty declaration.
     #[test]
     fn complete_attacker_proposal_refuses_taxed_attack_by_default() {
         let mut state = setup();
@@ -11193,8 +11207,8 @@ mod tests {
     }
 
     /// CR 508.1d + CR 508.1h: `Accept` preserves a taxed proposal whose quote the
-    /// attacking player can actually cover. Without this, a Ghostly Prison or
-    /// Propaganda made the AI's attack step unconditionally empty.
+    /// attacking player can actually cover, so a seat facing a Ghostly Prison
+    /// or Propaganda can still attack by paying.
     #[test]
     fn complete_attacker_proposal_accepts_affordable_taxed_attack() {
         let mut state = setup();
@@ -11251,6 +11265,99 @@ mod tests {
                 "untaxed attack changed under {posture:?}"
             );
         }
+    }
+
+    /// P0 attacks P1 with a 3/3 carrying Archangel of Tithes' verified block
+    /// tax ({1} per blocker); P1 has one 2/2 that can block it. Returns the
+    /// attacker and the would-be blocker.
+    fn block_tax_scenario() -> (GameState, ObjectId, ObjectId) {
+        let mut state = setup();
+        let attacker = create_creature(&mut state, PlayerId(0), "Taxing Raider", 3, 3);
+        let block_tax = parse_static_line(
+            "As long as this creature is attacking, creatures can't block unless their \
+             controller pays {1} for each of those creatures.",
+        )
+        .expect("the block-tax static should parse");
+        state
+            .objects
+            .get_mut(&attacker)
+            .unwrap()
+            .static_definitions
+            .push(block_tax);
+        let blocker = create_creature(&mut state, PlayerId(1), "Wall", 2, 2);
+        state.combat = Some(CombatState {
+            attackers: vec![AttackerInfo::attacking_player(attacker, PlayerId(1))],
+            ..Default::default()
+        });
+        assert!(
+            compute_block_tax(&state, &[(blocker, attacker)]).is_some(),
+            "premise: the block must be taxed"
+        );
+        (state, attacker, blocker)
+    }
+
+    /// CR 509.1c: under `Refuse` a taxed block collapses to the tax-free
+    /// witness, which drops the taxed blocker.
+    #[test]
+    fn complete_blocker_proposal_refuses_taxed_block() {
+        let (mut state, attacker, blocker) = block_tax_scenario();
+        float_mana(&mut state, PlayerId(1), 1);
+
+        let crate::types::actions::GameAction::DeclareBlockers { assignments } =
+            complete_blocker_proposal(
+                &state,
+                PlayerId(1),
+                &[(blocker, attacker)],
+                CombatTaxPosture::Refuse,
+            )
+        else {
+            panic!("expected DeclareBlockers");
+        };
+        assert!(
+            assignments.is_empty(),
+            "a refusing caller must not keep a taxed blocker, got {assignments:?}"
+        );
+    }
+
+    /// CR 509.1c + CR 509.1d: `Accept` preserves a taxed block whose quote the
+    /// defending player can cover.
+    #[test]
+    fn complete_blocker_proposal_accepts_affordable_taxed_block() {
+        let (mut state, attacker, blocker) = block_tax_scenario();
+        float_mana(&mut state, PlayerId(1), 1);
+        let proposal = vec![(blocker, attacker)];
+
+        let crate::types::actions::GameAction::DeclareBlockers { assignments } =
+            complete_blocker_proposal(&state, PlayerId(1), &proposal, CombatTaxPosture::Accept)
+        else {
+            panic!("expected DeclareBlockers");
+        };
+        assert_eq!(
+            assignments, proposal,
+            "an affordable {{1}} block tax must not cost the blocker its block"
+        );
+    }
+
+    /// CR 509.1d: `Accept` does not override affordability. A quote the
+    /// defender cannot pay still falls back to the tax-free witness.
+    #[test]
+    fn complete_blocker_proposal_rejects_unaffordable_taxed_block() {
+        let (state, attacker, blocker) = block_tax_scenario();
+
+        let crate::types::actions::GameAction::DeclareBlockers { assignments } =
+            complete_blocker_proposal(
+                &state,
+                PlayerId(1),
+                &[(blocker, attacker)],
+                CombatTaxPosture::Accept,
+            )
+        else {
+            panic!("expected DeclareBlockers");
+        };
+        assert!(
+            assignments.is_empty(),
+            "an empty mana pool cannot fund {{1}}, so the witness must stand, got {assignments:?}"
+        );
     }
 
     /// CR 702.22b/c: Bands are only assigned when explicitly declared.

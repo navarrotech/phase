@@ -20,22 +20,22 @@ The decision to pay is made exactly once, before the declaration is submitted:
 
 The engine opens a tax prompt only for a declaration completed under `CombatTaxPosture::Accept`, and `Accept` is only honoured when the quote is affordable. So the prompt's answer is simply "pay if affordable": it is the payment the declaration was made for, and it is independent of deck features, policies, or determinized samples. Nothing can outvote it, so the round trip terminates.
 
-`deterministic_combat_choice` answers the prompt inside `score_candidates_core`'s combat bypass, which always returns an action. The deadlock-safe `fallback_action` gives the same engine-owned answer.
+`deterministic_combat_choice` answers the prompt inside `score_candidates_core`'s combat bypass, which always returns an action. `deterministic_choice`, which drives lookahead rollouts, gives the same engine-owned answer, so a rollout that plans a taxed attack commits it. The deadlock-safe `fallback_action` does the same.
 
 ## The engine side
 
 `CombatTaxPosture` (`game/combat.rs`) is what a caller tells the completion authority:
 
 - `Refuse`: any taxed proposal collapses to the deterministic tax-free witness (`best_free_declaration`). With no must-attack requirement on the board that witness is the **empty** declaration, so a refusing seat simply does not attack into a Propaganda.
-- `Accept`: the taxed proposal survives, but only while `attack_tax_is_affordable` / `block_tax_is_affordable` says the paying player can cover the quote. Those probe through `casting::can_pay_effect_mana_cost_after_auto_tap`, the same payment path `handle_pay_combat_tax` spends through, so the preview and the spend cannot disagree.
+- `Accept`: the taxed proposal survives, but only while `attack_tax_is_affordable` / `block_tax_is_affordable` says the paying player can cover the quote. Those probe through `casting::can_pay_effect_mana_cost_after_auto_tap`, the same payment path `handle_pay_combat_tax` spends through, with `PausedManaPayment::Unresumable`: that spend cannot suspend, so a mana source whose own cost would pause for a replacement choice counts as unaffordable. The preview and the spend therefore agree.
 
 Hard legality (CR 508.1a–e) and the CR 508.1d maximum-requirement bar gate the proposal before the posture is consulted, and the engine remains the single legality authority. A posture is a request, not an override.
 
-Engine candidate generation (`ai_support::candidates`) passes `Refuse`. It feeds rollout and projection scorers, not the production declare seam, so no search line ever contains a tax prompt.
+Engine candidate generation (`ai_support::candidates`) passes `Refuse`: its enumerated proposals carry no plan to pay, so they complete tax-free.
 
 ## Trimming
 
-The tax is charged per attacker (CR 508.1h), so `plan_attack_tax` does not treat an unaffordable alpha strike as a reason to stay home. It drops the weakest taxed attacker and re-prices, until the remaining strike is both worth its cost and affordable. The cheap judgement runs before the affordability probe, which clones the state to simulate auto-tapping. An empty result hands the engine's tax-free witness the final say, which is also what honours any must-attack requirement the trimming walked past.
+Most taxes in this class scale with the number of taxed creatures (Propaganda's "{2} for each creature"), and CR 508.1h totals those per-creature costs into one locked-in quote, so `plan_attack_tax` does not treat an unaffordable alpha strike as a reason to stay home. It drops the weakest taxed attacker and re-prices, until the remaining strike is both worth its cost and affordable. The cheap judgement runs before the affordability probe, which clones the state to simulate auto-tapping. An empty result hands the engine's tax-free witness the final say, which is also what honours any must-attack requirement the trimming walked past.
 
 Block proposals are posture-only. They are not trimmed.
 

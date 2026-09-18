@@ -378,7 +378,13 @@ fn resolution_mana_x_max(
     loop {
         let mut concrete = cost.clone();
         concrete.concretize_x(max);
-        if casting::can_pay_effect_mana_cost_after_auto_tap(state, payer, source_id, &concrete) {
+        if casting::can_pay_effect_mana_cost_after_auto_tap(
+            state,
+            payer,
+            source_id,
+            &concrete,
+            casting::PausedManaPayment::Resumable,
+        ) {
             return Some(max);
         }
         if max == 0 {

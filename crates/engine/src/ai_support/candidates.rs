@@ -5107,11 +5107,10 @@ fn attacker_actions(
     // assignment (completion collapses many illegal proposals to the same witness).
     let mut seen: HashSet<Vec<(ObjectId, AttackTarget)>> = HashSet::new();
     let mut actions = Vec::new();
-    // CR 508.1d: candidate generation feeds the rollout / projection scorers, not
-    // the production declare-attackers seam (which bypasses candidates and calls
-    // `complete_attacker_proposal` with its own posture). A tax-free posture here
-    // keeps every generated candidate free of a payment prompt no scorer is
-    // positioned to commit to.
+    // CR 508.1d: the combat AI completes its own declaration with the tax
+    // posture it planned, at the root and in rollouts alike. These enumerated
+    // proposals carry no such plan, so they complete tax-free: no scorer here is
+    // positioned to commit to paying for an arbitrary proposal.
     for action in crate::game::combat::complete_attacker_proposals(
         state,
         &proposals,

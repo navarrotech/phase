@@ -61,7 +61,9 @@ const COLLAPSE_BONUS: f64 = 0.15;
 /// Choose the attack declaration and tax posture the AI is prepared to honour.
 ///
 /// Returns the (possibly trimmed) proposal to submit and the posture to complete
-/// it under. A tax is charged per attacker (CR 508.1h), so an alpha strike the AI
+/// it under. Most taxes in this class price each taxed attacker (Propaganda's
+/// "{2} for each creature"), and CR 508.1h totals those prices into one
+/// locked-in quote, so an alpha strike the AI
 /// cannot afford in full is not abandoned: the weakest taxed attacker is dropped
 /// and the smaller strike re-priced, until one is both worth its price and
 /// affordable. An empty result hands the engine's tax-free witness the final say,

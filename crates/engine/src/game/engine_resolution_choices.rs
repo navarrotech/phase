@@ -3354,7 +3354,11 @@ pub(super) fn handle_resolution_choice(
                     let mut cost = base_cost.clone();
                     cost.concretize_x(amount);
                     if !casting::can_pay_effect_mana_cost_after_auto_tap(
-                        state, player, source_id, &cost,
+                        state,
+                        player,
+                        source_id,
+                        &cost,
+                        casting::PausedManaPayment::Resumable,
                     ) {
                         return Err(EngineError::InvalidAction(format!(
                             "Player {:?} cannot pay {}",

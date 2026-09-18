@@ -1824,10 +1824,10 @@ fn ai_obeys_planeswalker_directed_attack_requirement() {
 //
 // The declare-attackers completion authority substitutes a TAX-FREE witness for
 // any proposal it will not pay for, and with no must-attack requirement on the
-// board that witness is the EMPTY declaration. So an AI that never declared a
-// tax posture could not attack into Propaganda at all, however much mana it had
-// open. These tests drive the real `choose_action` seam to prove it now does,
-// that it stops when it cannot pay, and that the taxed round trip terminates.
+// board that witness is the EMPTY declaration. The AI must therefore plan to pay
+// before it declares. These tests drive the real `choose_action` seam to prove
+// it attacks when paying is worth it, stops when it cannot pay, and that the
+// taxed round trip terminates.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Propaganda's verified Oracle text.
@@ -1970,9 +1970,10 @@ fn ai_holds_back_when_the_propaganda_tax_is_unaffordable() {
     );
 }
 
-/// CR 508.1h: the tax is charged PER attacker, so an alpha strike the AI cannot
-/// fund in full is trimmed to one it can, not abandoned. Three 3/3s cost {6};
-/// with four lands open the AI attacks with two of them for {4}.
+/// CR 508.1h: Propaganda prices each attacker, and the locked-in total is their
+/// sum, so an alpha strike the AI cannot fund in full is trimmed to one it can,
+/// not abandoned. Three 3/3s cost {6}; with four lands open the AI attacks with
+/// two of them for {4}.
 #[test]
 fn ai_trims_the_attack_to_the_propaganda_tax_it_can_afford() {
     let (mut runner, attackers) = build_propaganda_attack_scenario(3, 4);
@@ -2091,9 +2092,9 @@ fn ai_taxed_attack_round_trip_terminates_for_a_control_seat() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CR 509.1c + CR 509.1d: the block-side twin. A block tax used to strip every
-// taxed blocker from the AI's declaration the same way the attack tax stripped
-// every attacker.
+// CR 509.1c + CR 509.1d: the block-side twin. The blocker completion authority
+// substitutes the same kind of tax-free witness, so the AI must plan to pay for
+// a taxed block before it declares one.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Archangel of Tithes' verified block-tax static.

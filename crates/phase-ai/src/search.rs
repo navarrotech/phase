@@ -4146,6 +4146,17 @@ pub(crate) fn deterministic_choice(
     }
 
     // Combat decisions: delegate to specialized combat AI
+
+    // CR 508.1i + CR 509.1e: the declarations below may be completed under
+    // `CombatTaxPosture::Accept`, so a rollout reaches the tax prompt that
+    // follows. Answer it the same way the root does, or quiesce would stall on
+    // an uncommitted attack with no mana spent.
+    if matches!(state.waiting_for, WaitingFor::CombatTaxPayment { .. }) {
+        return Some(GameAction::PayCombatTax {
+            accept: engine::game::combat::pending_combat_tax_is_affordable(state),
+        });
+    }
+
     if let WaitingFor::DeclareAttackers {
         valid_attacker_ids,
         valid_attack_targets,
