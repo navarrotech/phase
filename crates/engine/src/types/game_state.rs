@@ -32434,6 +32434,7 @@ mod tests {
         let event = GameEvent::LifeChanged {
             player_id: PlayerId(1),
             amount: -2,
+            new_total: None,
         };
         state.current_trigger_events = vec![event.clone()];
 

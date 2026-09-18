@@ -999,7 +999,9 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
             segments
         }
 
-        GameEvent::LifeChanged { player_id, amount } => {
+        GameEvent::LifeChanged {
+            player_id, amount, ..
+        } => {
             if *amount >= 0 {
                 vec![
                     player_seg(state, *player_id),
@@ -2389,6 +2391,7 @@ mod tests {
             &GameEvent::LifeChanged {
                 player_id: PlayerId(0),
                 amount: 3,
+                new_total: None,
             },
             &state,
         );
@@ -2404,6 +2407,7 @@ mod tests {
             &GameEvent::LifeChanged {
                 player_id: PlayerId(0),
                 amount: -3,
+                new_total: None,
             },
             &state,
         );
@@ -2547,10 +2551,12 @@ mod tests {
                 GameEvent::LifeChanged {
                     player_id: PlayerId(0),
                     amount: 3,
+                    new_total: None,
                 },
                 GameEvent::LifeChanged {
                     player_id: PlayerId(1),
                     amount: -3,
+                    new_total: None,
                 },
                 GameEvent::TappedForMana {
                     source_id: ObjectId(1),
@@ -2588,6 +2594,7 @@ mod tests {
                 GameEvent::LifeChanged {
                     player_id: PlayerId(0),
                     amount: 1,
+                    new_total: None,
                 },
                 LogImportance::Essential,
                 LogTone::Positive,

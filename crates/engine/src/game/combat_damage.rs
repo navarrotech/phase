@@ -2943,11 +2943,9 @@ mod tests {
         let gains: Vec<i32> = events
             .iter()
             .filter_map(|e| match e {
-                GameEvent::LifeChanged { player_id, amount }
-                    if *player_id == PlayerId(0) && *amount > 0 =>
-                {
-                    Some(*amount)
-                }
+                GameEvent::LifeChanged {
+                    player_id, amount, ..
+                } if *player_id == PlayerId(0) && *amount > 0 => Some(*amount),
                 _ => None,
             })
             .collect();
@@ -3141,7 +3139,7 @@ mod tests {
         let gain = events
             .iter()
             .position(|e| {
-                matches!(e, GameEvent::LifeChanged { player_id, amount }
+                matches!(e, GameEvent::LifeChanged { player_id, amount, .. }
                     if *player_id == PlayerId(0) && *amount > 0)
             })
             .expect("the lifelink gain is emitted");

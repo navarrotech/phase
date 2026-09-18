@@ -16758,6 +16758,7 @@ mod tests {
         state.current_trigger_event = Some(GameEvent::LifeChanged {
             player_id: PlayerId(1),
             amount: -1,
+            new_total: None,
         });
         assert!(ability_with_event_context_targets(&state, &ability)
             .targets

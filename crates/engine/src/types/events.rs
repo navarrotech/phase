@@ -878,6 +878,16 @@ pub enum GameEvent {
     LifeChanged {
         player_id: PlayerId,
         amount: i32,
+        /// CR 119.1 + CR 119.3: the player's own life total once this change has
+        /// been applied. Emitted so a presentation layer animating a run of life
+        /// changes can show each intermediate total without re-deriving it by
+        /// summing `amount`s — summing cannot reproduce the real sequence once a
+        /// replacement effect alters an amount mid-run.
+        ///
+        /// `None` only on an event from a peer or a recording written before this
+        /// field existed; consumers fall back to the accompanying state snapshot.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        new_total: Option<i32>,
     },
     ManaAdded {
         player_id: PlayerId,

@@ -32262,7 +32262,8 @@ fn escape_phyrexian_cost_deducts_life_after_exile() {
             e,
             GameEvent::LifeChanged {
                 player_id,
-                amount: -2
+                amount: -2,
+                ..
             } if *player_id == PlayerId(0)
         )),
         "must emit LifeChanged -2 for Phyrexian life payment"
@@ -33941,7 +33942,7 @@ fn composite_activated_pay_life_cost_deducts_life() {
     assert!(
             events
                 .iter()
-                .any(|e| matches!(e, GameEvent::LifeChanged { player_id, amount: -1 } if *player_id == PlayerId(0))),
+                .any(|e| matches!(e, GameEvent::LifeChanged { player_id, amount: -1, .. } if *player_id == PlayerId(0))),
             "pay-life cost must emit the life-loss event"
         );
 }
@@ -34028,7 +34029,7 @@ fn phyrexian_cast_with_life_deducts_life() {
             result
                 .events
                 .iter()
-                .any(|e| matches!(e, GameEvent::LifeChanged { player_id, amount: -2 } if *player_id == PlayerId(0))),
+                .any(|e| matches!(e, GameEvent::LifeChanged { player_id, amount: -2, .. } if *player_id == PlayerId(0))),
             "CR 119.4: pay-life must emit a LifeChanged event with amount -2"
         );
 }

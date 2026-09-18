@@ -7374,10 +7374,12 @@ mod tests {
             GameEvent::LifeChanged {
                 player_id: PlayerId(0),
                 amount: 1,
+                new_total: None,
             },
             GameEvent::LifeChanged {
                 player_id: PlayerId(1),
                 amount: 1,
+                new_total: None,
             },
         ]
         .into_iter()
@@ -8690,7 +8692,11 @@ mod tests {
         }
 
         fn life_event(player_id: PlayerId, amount: i32) -> GameEvent {
-            GameEvent::LifeChanged { player_id, amount }
+            GameEvent::LifeChanged {
+                player_id,
+                amount,
+                new_total: None,
+            }
         }
 
         /// Drive resolution to empty via the BATCH path (`resolve_next`), running
