@@ -1,6 +1,6 @@
 use crate::game::combat::AttackTarget;
 use crate::types::ability::{AbilityTag, TargetRef};
-use crate::types::events::GameEvent;
+use crate::types::events::{GameEvent, PlayerActionKind};
 use crate::types::game_state::GameState;
 use crate::types::identifiers::ObjectId;
 use crate::types::log::{
@@ -137,6 +137,7 @@ fn importance(event: &GameEvent) -> LogImportance {
         GameEvent::DamagePrevented { .. } | GameEvent::SpellCountered { .. } => {
             LogImportance::Context
         }
+        GameEvent::PlayerPerformedAction { action, .. } => player_action_importance(*action),
         // The remaining variants are deliberately listed rather than covered by a
         // wildcard. Adding a GameEvent must require an explicit presentation policy.
         // CR 701.17a + CR 400.2: the mill's library departure is hidden
@@ -232,11 +233,41 @@ fn importance(event: &GameEvent) -> LogImportance {
         | GameEvent::EnergyChanged { .. }
         | GameEvent::PlayerCounterChanged { .. }
         | GameEvent::ManaExpended { .. }
-        | GameEvent::PlayerPerformedAction { .. }
         | GameEvent::Specialized { .. }
         | GameEvent::Clash { .. }
         | GameEvent::VoteCast { .. }
         | GameEvent::VoteResolved { .. } => LogImportance::Detail,
+    }
+}
+
+/// Presentation tier for each `PlayerPerformedAction` kind.
+///
+/// Most kinds are internal ledger signals whose player-visible consequence is
+/// narrated by another event (a `Draw` action accompanies `CardsDrawn`, a
+/// `Forage` accompanies the exiles it pays for), so they stay `Detail`.
+///
+/// CR 701.23a + CR 701.24a: searching and shuffling are the exception. Both are
+/// public actions a player chose, and neither leaves any other trace in the log
+/// — a search that finds nothing raises no `SearchChoice`, and a shuffle changes
+/// only hidden library order. Without a `Context` entry the timeline shows
+/// nothing at all for an accepted "may search", which reads as if the choice did
+/// nothing.
+///
+/// Exhaustive rather than wildcarded: a new `PlayerActionKind` must state its
+/// presentation policy here, matching the convention in [`importance`].
+fn player_action_importance(action: PlayerActionKind) -> LogImportance {
+    match action {
+        PlayerActionKind::SearchedLibrary | PlayerActionKind::ShuffledLibrary => {
+            LogImportance::Context
+        }
+        PlayerActionKind::AcceptedOptionalEffect
+        | PlayerActionKind::Scry
+        | PlayerActionKind::Surveil
+        | PlayerActionKind::CollectEvidence
+        | PlayerActionKind::Proliferate
+        | PlayerActionKind::Investigate
+        | PlayerActionKind::Forage
+        | PlayerActionKind::Draw => LogImportance::Detail,
     }
 }
 
@@ -738,6 +769,24 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
             text(" on top and "),
             num(*scry_bottom_count as i32),
             text(" on bottom"),
+        ],
+        // CR 701.23a: `player_id` is the SEARCHER, not the library's owner — an
+        // asymmetric search (Bribery, Praetor's Grasp) has the caster looking
+        // through someone else's library — so the phrasing stays owner-neutral.
+        GameEvent::PlayerPerformedAction {
+            player_id,
+            action: PlayerActionKind::SearchedLibrary,
+            ..
+        } => vec![player_seg(state, *player_id), text(" searches a library")],
+        // CR 701.24a: `player_id` is the library's owner (every emitter passes the
+        // shuffling player), so the possessive is accurate here.
+        GameEvent::PlayerPerformedAction {
+            player_id,
+            action: PlayerActionKind::ShuffledLibrary,
+            ..
+        } => vec![
+            player_seg(state, *player_id),
+            text(" shuffles their library"),
         ],
         GameEvent::PlayerPerformedAction {
             player_id, action, ..
@@ -2269,6 +2318,77 @@ mod tests {
             1,
             "Non-Draw player actions must remain visible in the log"
         );
+    }
+
+    /// CR 701.23a + CR 701.24a: an accepted "may search" whose
+    /// search finds nothing leaves no other trace — no `SearchChoice` opens and
+    /// the shuffle only reorders a hidden zone — so these two actions are the
+    /// player's only feedback that accepting did anything. They must be narrated
+    /// and must reach the client's default timeline view, which renders only
+    /// `Essential` and `Context`.
+    #[test]
+    fn library_search_and_shuffle_are_narrated_in_the_timeline() {
+        use crate::types::events::PlayerActionKind;
+
+        let state = GameState::new_two_player(42);
+        let action_event = |action| GameEvent::PlayerPerformedAction {
+            player_id: PlayerId(0),
+            action,
+            look_count: None,
+            scry_bottom_count: None,
+            scry_top_count: None,
+        };
+
+        let entries = resolve_log_entries(
+            &[
+                action_event(PlayerActionKind::SearchedLibrary),
+                action_event(PlayerActionKind::ShuffledLibrary),
+            ],
+            &state,
+            &state,
+        );
+
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(
+            entries[0].segments.as_slice(),
+            [LogSegment::PlayerName { player_id, .. }, LogSegment::Text(text)]
+                if *player_id == PlayerId(0) && text == " searches a library"
+        ));
+        assert!(matches!(
+            entries[1].segments.as_slice(),
+            [LogSegment::PlayerName { player_id, .. }, LogSegment::Text(text)]
+                if *player_id == PlayerId(0) && text == " shuffles their library"
+        ));
+        for entry in &entries {
+            assert_eq!(
+                entry.presentation.importance,
+                LogImportance::Context,
+                "a search/shuffle filtered to Detail never reaches the default timeline view"
+            );
+        }
+    }
+
+    /// Reach-guard for the split above: the remaining action kinds are ledger
+    /// signals narrated by the events they accompany, so they stay `Detail`.
+    #[test]
+    fn other_player_actions_stay_detail() {
+        use crate::types::events::PlayerActionKind;
+
+        let state = GameState::new_two_player(42);
+        let entries = resolve_log_entries(
+            &[GameEvent::PlayerPerformedAction {
+                player_id: PlayerId(0),
+                action: PlayerActionKind::Proliferate,
+                look_count: None,
+                scry_bottom_count: None,
+                scry_top_count: None,
+            }],
+            &state,
+            &state,
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].presentation.importance, LogImportance::Detail);
     }
 
     #[test]
