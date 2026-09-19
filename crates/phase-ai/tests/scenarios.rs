@@ -1918,7 +1918,7 @@ fn ai_attacks_through_propaganda_and_pays_the_tax() {
         "Propaganda taxes {{2}} per attacker"
     );
 
-    // CR 508.1i: the AI must now answer its OWN quote with a payment — a decline
+    // CR 508.1j: the AI must now answer its OWN quote with a payment — a decline
     // would rebuild the identical declare prompt and re-propose forever.
     let config = create_config(AiDifficulty::VeryHard, Platform::Native);
     let mut rng = SmallRng::seed_from_u64(7);
@@ -1999,6 +1999,62 @@ fn ai_trims_the_attack_to_the_propaganda_tax_it_can_afford() {
         );
     };
     assert_eq!(total_cost.mana_value(), 4, "two attackers at {{2}} each");
+}
+
+/// CR 508.1d: paying is optional, and a tax that costs more than the attack is
+/// worth is declined. A 1/1 into Propaganda's {2} is affordable with six lands
+/// open but not worth it, so the AI keeps it home and never opens the prompt.
+#[test]
+fn ai_declines_a_propaganda_tax_that_outprices_the_attack() {
+    use engine::types::mana::ManaColor;
+
+    let mut scenario = GameScenario::new();
+    scenario.add_enchantment_from_oracle(P0, "Propaganda", PROPAGANDA_ORACLE);
+    let attacker = scenario.add_creature(P1, "Squire", 1, 1).id();
+    for _ in 0..6 {
+        scenario.add_basic_land(P1, ManaColor::Green);
+    }
+    let mut runner = scenario.build();
+    let state = runner.state_mut();
+    state.active_player = P1;
+    state.priority_player = P1;
+    state.phase = Phase::DeclareAttackers;
+    state.turn_number = 2;
+    state.waiting_for = WaitingFor::DeclareAttackers {
+        player: P1,
+        valid_attacker_ids: vec![attacker],
+        valid_attack_targets: vec![AttackTarget::Player(P0)],
+        valid_attack_targets_by_attacker: None,
+        attacker_constraints: Default::default(),
+    };
+
+    // Reach-guards: the raw heuristic wants this attack, and the tax is
+    // affordable, so only the worth-paying judgement can keep the 1/1 home.
+    let raw = phase_ai::combat_ai::choose_attackers_with_targets(runner.state(), P1);
+    assert_eq!(
+        raw,
+        vec![(attacker, AttackTarget::Player(P0))],
+        "premise: the untaxed heuristic attacks an empty board with the 1/1"
+    );
+    assert!(
+        engine::game::combat::attack_tax_is_affordable(runner.state(), &raw),
+        "premise: six lands cover the {{2}} tax"
+    );
+
+    let (action, declared) = ai_declared_attackers(&runner);
+    assert!(
+        declared.is_empty(),
+        "one damage is not worth {{2}}, so the 1/1 must stay home, got {declared:?}"
+    );
+    runner.act(action).expect("the empty declaration is legal");
+    assert!(
+        !matches!(
+            runner.state().waiting_for,
+            WaitingFor::CombatTaxPayment { .. }
+        ),
+        "a declined tax must never open the prompt, got {:?}",
+        runner.state().waiting_for
+    );
 }
 
 /// The taxed declare → pay round trip must TERMINATE under the host loop.
