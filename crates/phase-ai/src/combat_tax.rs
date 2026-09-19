@@ -22,9 +22,7 @@ use engine::game::combat::{
     AttackTarget, CombatTaxPosture,
 };
 use engine::game::combat_damage::lethal_damage_needed;
-use engine::game::mana_abilities::{
-    can_activate_mana_ability_now_gated, is_mana_ability, ManaActivationGates,
-};
+use engine::game::mana_sources::activatable_mana_options;
 use engine::types::game_state::{CombatTaxContext, GameState};
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
@@ -160,8 +158,8 @@ pub(crate) fn plan_block_tax(
 /// - CR 509.1h + CR 510.1c: an attacker that keeps an untaxed blocker stays
 ///   blocked either way, so its taxed blockers are worth the damage they add
 ///   toward killing it (their own power, each blocker counted once).
-/// - An attacker whose every blocker is taxed becomes unblocked if they drop
-///   out, so its damage gets through. CR 702.19b: a trampler already carries
+/// - CR 509.1h + CR 510.1b: an attacker whose every blocker is taxed becomes
+///   unblocked if they drop out, so its damage gets through. CR 702.19b: a trampler already carries
 ///   its excess past its blockers, so for it only the lethal damage those
 ///   blockers were absorbing is at stake.
 fn block_tax_stake(
@@ -177,7 +175,15 @@ fn block_tax_stake(
             .push(*blocker);
     }
 
-    let power_of = |id: &ObjectId| state.objects.get(id).and_then(|obj| obj.power).unwrap_or(0);
+    // CR 510.1a: a creature with 0 or less power assigns no combat damage.
+    let power_of = |id: &ObjectId| {
+        state
+            .objects
+            .get(id)
+            .and_then(|obj| obj.power)
+            .unwrap_or(0)
+            .max(0)
+    };
     let mut counted_blockers: HashSet<ObjectId> = HashSet::new();
     let mut stake = 0;
     for (attacker, blockers) in &blockers_by_attacker {
@@ -278,26 +284,16 @@ fn is_worth_paying(
 
 /// Count the mana sources the seat could tap for mana right now.
 ///
-/// A source counts only when the engine says one of its mana abilities can be
-/// activated now. That covers lands too: layers give a basic-typed land its
-/// intrinsic "{T}: Add" ability (CR 305.6), so a land with no mana ability does
-/// not count, and neither does a summoning-sick creature whose ability costs
-/// {T} (CR 302.6).
+/// Delegates to `activatable_mana_options`, the engine authority auto-pay's
+/// affordability checks use. It already excludes tapped sources, sources the
+/// seat does not control, lands without a mana ability, and summoning-sick
+/// creatures whose ability costs {T} (CR 302.6); layers give a basic-typed land
+/// its intrinsic mana ability (CR 305.6).
 fn count_untapped_mana_sources(state: &GameState, player: PlayerId) -> u32 {
-    let gates = ManaActivationGates::compute(state);
     state
         .battlefield
         .iter()
-        .filter_map(|id| state.objects.get(id))
-        .filter(|obj| obj.controller == player && !obj.tapped)
-        .filter(|obj| {
-            obj.abilities.iter().enumerate().any(|(index, ability)| {
-                is_mana_ability(ability)
-                    && can_activate_mana_ability_now_gated(
-                        state, player, obj.id, index, ability, &gates,
-                    )
-            })
-        })
+        .filter(|&&id| !activatable_mana_options(state, id, player).is_empty())
         .count() as u32
 }
 
@@ -397,7 +393,7 @@ mod tests {
         block_tax_stake(state, assignments, &taxed)
     }
 
-    /// CR 509.1h + CR 510.1c: an attacker whose only blocker is taxed gets
+    /// CR 509.1h + CR 510.1b: an attacker whose only blocker is taxed gets
     /// through if that blocker drops out, so its full power is at stake.
     #[test]
     fn block_stake_is_the_power_that_gets_through() {
@@ -458,6 +454,74 @@ mod tests {
         assert_eq!(
             stake_for(runner.state(), &[(chump, deadly_trampler)], &[]),
             1
+        );
+    }
+
+    /// CR 702.19b: a trampler too weak to get past its blocker is stopped
+    /// entirely, so its whole power (not the blocker's toughness) is at stake.
+    #[test]
+    fn block_stake_for_a_weak_trampler_is_capped_at_its_power() {
+        use engine::game::scenario::{GameScenario, P0, P1};
+
+        let mut scenario = GameScenario::new();
+        let trampler = scenario
+            .add_creature(P0, "Small Stomper", 2, 2)
+            .with_keyword(Keyword::Trample)
+            .id();
+        let wall = scenario.add_creature(P1, "Wall", 0, 4).id();
+        let runner = scenario.build();
+
+        assert_eq!(stake_for(runner.state(), &[(wall, trampler)], &[]), 2);
+    }
+
+    /// A taxed blocker assigned to two attackers that each keep an untaxed
+    /// blocker adds its power once, not once per attacker.
+    #[test]
+    fn block_stake_counts_a_taxed_blocker_once_across_attackers() {
+        use engine::game::scenario::{GameScenario, P0, P1};
+
+        let mut scenario = GameScenario::new();
+        let first = scenario.add_creature(P0, "First Brute", 4, 4).id();
+        let second = scenario.add_creature(P0, "Second Brute", 4, 4).id();
+        let taxed = scenario.add_creature(P1, "Taxed Guard", 3, 3).id();
+        let free_first = scenario.add_creature(P1, "Free Guard A", 2, 2).id();
+        let free_second = scenario.add_creature(P1, "Free Guard B", 2, 2).id();
+        let runner = scenario.build();
+
+        let assignments = [
+            (taxed, first),
+            (taxed, second),
+            (free_first, first),
+            (free_second, second),
+        ];
+        assert_eq!(
+            stake_for(runner.state(), &assignments, &[free_first, free_second]),
+            3
+        );
+    }
+
+    /// A declaration mixing both cases sums them: the fully taxed attacker's
+    /// power gets through, and the kept attacker's taxed blocker adds its own.
+    #[test]
+    fn block_stake_sums_a_mixed_declaration() {
+        use engine::game::scenario::{GameScenario, P0, P1};
+
+        let mut scenario = GameScenario::new();
+        let exposed = scenario.add_creature(P0, "Exposed Raider", 5, 5).id();
+        let held = scenario.add_creature(P0, "Held Raider", 4, 4).id();
+        let lone_guard = scenario.add_creature(P1, "Lone Guard", 1, 1).id();
+        let taxed_helper = scenario.add_creature(P1, "Taxed Helper", 2, 2).id();
+        let free_guard = scenario.add_creature(P1, "Free Guard", 2, 2).id();
+        let runner = scenario.build();
+
+        let assignments = [
+            (lone_guard, exposed),
+            (taxed_helper, held),
+            (free_guard, held),
+        ];
+        assert_eq!(
+            stake_for(runner.state(), &assignments, &[free_guard]),
+            5 + 2
         );
     }
 

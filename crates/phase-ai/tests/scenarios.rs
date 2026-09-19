@@ -2305,7 +2305,7 @@ fn ai_pays_a_block_tax_to_keep_a_profitable_block() {
     );
 }
 
-/// CR 509.1h + CR 510.1c: a block tax is valued by the damage the block stops,
+/// CR 509.1h + CR 510.1b: a block tax is valued by the damage the block stops,
 /// not by the blocker's own power. A 0/4 wall that holds off a 3/3 is worth
 /// {1}, so the AI keeps the block and pays.
 #[test]
