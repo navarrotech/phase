@@ -18457,8 +18457,9 @@ pub fn can_pay_ability_mana_cost_after_auto_tap_excluding(
 pub(super) enum PausedManaPayment {
     /// The live payment carries a resumable root and will surface the choice.
     Resumable,
-    /// The live payment cannot suspend (`pay_unless_cost`, which a combat tax
-    /// pays through), so a pause means the payment cannot complete.
+    /// The live payment cannot suspend (`pay_unless_cost`, which combat taxes
+    /// and resolution-time "pay {X}" amounts pay through), so a pause means the
+    /// payment cannot complete.
     Unresumable,
 }
 

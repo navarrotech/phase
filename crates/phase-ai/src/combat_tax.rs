@@ -21,12 +21,13 @@ use engine::game::combat::{
     attack_tax_is_affordable, block_tax_is_affordable, compute_attack_tax, compute_block_tax,
     AttackTarget, CombatTaxPosture,
 };
+use engine::game::combat_damage::lethal_damage_needed;
 use engine::game::mana_abilities::{
     can_activate_mana_ability_now_gated, is_mana_ability, ManaActivationGates,
 };
-use engine::types::card_type::CoreType;
 use engine::types::game_state::{CombatTaxContext, GameState};
 use engine::types::identifiers::ObjectId;
+use engine::types::keywords::Keyword;
 use engine::types::mana::ManaCost;
 use engine::types::player::PlayerId;
 
@@ -136,28 +137,8 @@ pub(crate) fn plan_block_tax(
     let Some((total_cost, per_creature)) = compute_block_tax(state, assignments) else {
         return CombatTaxPosture::Refuse;
     };
-    // The stake of a block tax is the damage that gets through if the taxed
-    // blockers drop out: the power of every attacker all of whose blockers are
-    // taxed. An attacker that keeps an untaxed blocker stays blocked either way.
     let taxed: HashSet<ObjectId> = per_creature.iter().map(|(blocker, _)| *blocker).collect();
-    let mut attacker_keeps_untaxed_blocker: HashMap<ObjectId, bool> = HashMap::new();
-    for (blocker, attacker) in assignments {
-        let keeps = attacker_keeps_untaxed_blocker
-            .entry(*attacker)
-            .or_insert(false);
-        *keeps |= !taxed.contains(blocker);
-    }
-    let damage_at_stake = attacker_keeps_untaxed_blocker
-        .iter()
-        .filter(|(_, keeps_untaxed_blocker)| !**keeps_untaxed_blocker)
-        .map(|(attacker, _)| {
-            state
-                .objects
-                .get(attacker)
-                .and_then(|obj| obj.power)
-                .unwrap_or(0)
-        })
-        .sum();
+    let damage_at_stake = block_tax_stake(state, assignments, &taxed);
     let quote = TaxQuote {
         context: CombatTaxContext::Blocking,
         total_cost: &total_cost,
@@ -171,6 +152,61 @@ pub(crate) fn plan_block_tax(
         return CombatTaxPosture::Accept;
     }
     CombatTaxPosture::Refuse
+}
+
+/// Damage a block tax decides: what changes if the taxed blockers drop out.
+///
+/// Each attacker is judged by the blockers it would keep:
+/// - CR 509.1h + CR 510.1c: an attacker that keeps an untaxed blocker stays
+///   blocked either way, so its taxed blockers are worth the damage they add
+///   toward killing it (their own power, each blocker counted once).
+/// - An attacker whose every blocker is taxed becomes unblocked if they drop
+///   out, so its damage gets through. CR 702.19b: a trampler already carries
+///   its excess past its blockers, so for it only the lethal damage those
+///   blockers were absorbing is at stake.
+fn block_tax_stake(
+    state: &GameState,
+    assignments: &[(ObjectId, ObjectId)],
+    taxed: &HashSet<ObjectId>,
+) -> i32 {
+    let mut blockers_by_attacker: HashMap<ObjectId, Vec<ObjectId>> = HashMap::new();
+    for (blocker, attacker) in assignments {
+        blockers_by_attacker
+            .entry(*attacker)
+            .or_default()
+            .push(*blocker);
+    }
+
+    let power_of = |id: &ObjectId| state.objects.get(id).and_then(|obj| obj.power).unwrap_or(0);
+    let mut counted_blockers: HashSet<ObjectId> = HashSet::new();
+    let mut stake = 0;
+    for (attacker, blockers) in &blockers_by_attacker {
+        let keeps_untaxed_blocker = blockers.iter().any(|blocker| !taxed.contains(blocker));
+        if keeps_untaxed_blocker {
+            for blocker in blockers {
+                if taxed.contains(blocker) && counted_blockers.insert(*blocker) {
+                    stake += power_of(blocker);
+                }
+            }
+            continue;
+        }
+
+        let attacker_power = power_of(attacker);
+        let attacker_object = state.objects.get(attacker);
+        let tramples = attacker_object.is_some_and(|obj| obj.has_keyword(&Keyword::Trample));
+        if !tramples {
+            stake += attacker_power;
+            continue;
+        }
+        // CR 702.2c: any nonzero damage from a deathtouch source is lethal.
+        let deathtouch = attacker_object.is_some_and(|obj| obj.has_keyword(&Keyword::Deathtouch));
+        let absorbed: i32 = blockers
+            .iter()
+            .map(|blocker| lethal_damage_needed(state, *blocker, deathtouch) as i32)
+            .sum();
+        stake += attacker_power.min(absorbed);
+    }
+    stake
 }
 
 /// A combat-tax quote for one proposed declaration.
@@ -242,9 +278,11 @@ fn is_worth_paying(
 
 /// Count the mana sources the seat could tap for mana right now.
 ///
-/// An untapped land counts outright. Any other source counts only when the
-/// engine says one of its mana abilities can be activated now, which excludes,
-/// for example, a summoning-sick creature whose ability costs {T} (CR 302.6).
+/// A source counts only when the engine says one of its mana abilities can be
+/// activated now. That covers lands too: layers give a basic-typed land its
+/// intrinsic "{T}: Add" ability (CR 305.6), so a land with no mana ability does
+/// not count, and neither does a summoning-sick creature whose ability costs
+/// {T} (CR 302.6).
 fn count_untapped_mana_sources(state: &GameState, player: PlayerId) -> u32 {
     let gates = ManaActivationGates::compute(state);
     state
@@ -253,13 +291,12 @@ fn count_untapped_mana_sources(state: &GameState, player: PlayerId) -> u32 {
         .filter_map(|id| state.objects.get(id))
         .filter(|obj| obj.controller == player && !obj.tapped)
         .filter(|obj| {
-            obj.card_types.core_types.contains(&CoreType::Land)
-                || obj.abilities.iter().enumerate().any(|(index, ability)| {
-                    is_mana_ability(ability)
-                        && can_activate_mana_ability_now_gated(
-                            state, player, obj.id, index, ability, &gates,
-                        )
-                })
+            obj.abilities.iter().enumerate().any(|(index, ability)| {
+                is_mana_ability(ability)
+                    && can_activate_mana_ability_now_gated(
+                        state, player, obj.id, index, ability, &gates,
+                    )
+            })
         })
         .count() as u32
 }
@@ -291,11 +328,11 @@ mod tests {
         features
     }
 
-    /// CR 302.6: a summoning-sick creature cannot pay a {T} cost, so its mana
-    /// ability does not count toward the mana the seat could tap right now. An
-    /// untapped land still counts.
+    /// CR 302.6 + CR 305.6: only sources that can actually be tapped for mana
+    /// count. A summoning-sick creature cannot pay a {T} cost, and a land with no
+    /// mana ability produces nothing; an untapped Forest counts.
     #[test]
-    fn summoning_sick_mana_creature_is_not_an_available_source() {
+    fn only_activatable_mana_sources_are_available() {
         use engine::game::scenario::{GameScenario, P0};
         use engine::types::ability::{
             AbilityCost, AbilityDefinition, AbilityKind, Effect, ManaContribution, ManaProduction,
@@ -304,6 +341,8 @@ mod tests {
 
         let mut scenario = GameScenario::new();
         scenario.add_basic_land(P0, ManaColor::Green);
+        // A land with no rules text has no mana ability to activate.
+        scenario.add_land_from_oracle(P0, "Blank Land", "");
         let elf = scenario
             .add_creature(P0, "Mana Elf", 1, 1)
             .with_ability_definition(
@@ -328,7 +367,7 @@ mod tests {
         assert_eq!(
             count_untapped_mana_sources(runner.state(), P0),
             2,
-            "premise: a creature that has been under control since the turn began taps for mana"
+            "the Forest and the elf count; the blank land does not"
         );
         runner
             .state_mut()
@@ -339,7 +378,86 @@ mod tests {
         assert_eq!(
             count_untapped_mana_sources(runner.state(), P0),
             1,
-            "only the land counts while the elf is summoning sick"
+            "only the Forest counts while the elf is summoning sick"
+        );
+    }
+
+    /// The stake of each `block_tax_stake` case, with every blocker taxed
+    /// unless it is listed in `untaxed`.
+    fn stake_for(
+        state: &GameState,
+        assignments: &[(ObjectId, ObjectId)],
+        untaxed: &[ObjectId],
+    ) -> i32 {
+        let taxed: HashSet<ObjectId> = assignments
+            .iter()
+            .map(|(blocker, _)| *blocker)
+            .filter(|blocker| !untaxed.contains(blocker))
+            .collect();
+        block_tax_stake(state, assignments, &taxed)
+    }
+
+    /// CR 509.1h + CR 510.1c: an attacker whose only blocker is taxed gets
+    /// through if that blocker drops out, so its full power is at stake.
+    #[test]
+    fn block_stake_is_the_power_that_gets_through() {
+        use engine::game::scenario::{GameScenario, P0, P1};
+
+        let mut scenario = GameScenario::new();
+        let attacker = scenario.add_creature(P0, "Raider", 5, 5).id();
+        let wall = scenario.add_creature(P1, "Wall", 0, 4).id();
+        let runner = scenario.build();
+
+        assert_eq!(stake_for(runner.state(), &[(wall, attacker)], &[]), 5);
+    }
+
+    /// CR 509.1h: an attacker that keeps an untaxed blocker stays blocked, so
+    /// the taxed blocker is worth the damage it adds toward killing it.
+    #[test]
+    fn block_stake_for_a_gang_block_counts_the_taxed_blockers_power() {
+        use engine::game::scenario::{GameScenario, P0, P1};
+
+        let mut scenario = GameScenario::new();
+        let attacker = scenario.add_creature(P0, "Brute", 4, 4).id();
+        let taxed_bear = scenario.add_creature(P1, "Taxed Bear", 2, 2).id();
+        let free_bear = scenario.add_creature(P1, "Free Bear", 2, 2).id();
+        let runner = scenario.build();
+
+        assert_eq!(
+            stake_for(
+                runner.state(),
+                &[(taxed_bear, attacker), (free_bear, attacker)],
+                &[free_bear],
+            ),
+            2
+        );
+    }
+
+    /// CR 702.19b + CR 702.2c: a trampler's excess reaches the player whether
+    /// or not the chump blocks, so only the lethal damage the blocker absorbs
+    /// is at stake; with deathtouch, that is a single point.
+    #[test]
+    fn block_stake_for_a_trampler_is_the_lethal_damage_absorbed() {
+        use engine::game::scenario::{GameScenario, P0, P1};
+
+        let mut scenario = GameScenario::new();
+        let trampler = scenario
+            .add_creature(P0, "Stomper", 6, 6)
+            .with_keyword(Keyword::Trample)
+            .id();
+        let deadly_trampler = {
+            let mut builder = scenario.add_creature(P0, "Deadly Stomper", 6, 6);
+            builder.with_keyword(Keyword::Trample);
+            builder.with_keyword(Keyword::Deathtouch);
+            builder.id()
+        };
+        let chump = scenario.add_creature(P1, "Chump", 0, 3).id();
+        let runner = scenario.build();
+
+        assert_eq!(stake_for(runner.state(), &[(chump, trampler)], &[]), 3);
+        assert_eq!(
+            stake_for(runner.state(), &[(chump, deadly_trampler)], &[]),
+            1
         );
     }
 
