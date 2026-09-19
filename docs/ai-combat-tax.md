@@ -41,7 +41,7 @@ Block proposals are posture-only. They are not trimmed.
 
 ## Scoring
 
-`is_worth_paying` compares paying against declining. Paying earns a damage bias when the taxed creatures' combined power exceeds the quote (scaled by deck archetype: aggro amplifies, control dampens, and blocking dampens control less so a control seat keeps its blockers), minus a penalty for tapping out of interaction, plus bonuses when declining would collapse most of the declaration and for keeping blockers. Declining earns the opposite of the damage bias. The constants live at the top of `crates/phase-ai/src/combat_tax.rs`.
+`is_worth_paying` compares paying against declining. Each planner supplies the damage at stake: for an attack, the taxed attackers' combined power; for a block, the power of every attacker all of whose blockers are taxed, since those attackers get through if the taxed blockers drop out. Paying earns a damage bias when that damage exceeds the quote (scaled by deck archetype: aggro amplifies, control dampens, and blocking dampens control less so a control seat keeps its blockers), minus a penalty for tapping out of interaction (counting only sources the engine says can be activated now, so a summoning-sick mana creature does not count), plus bonuses when declining would collapse most of the declaration and for keeping blockers. Declining earns the opposite of the damage bias. The constants live at the top of `crates/phase-ai/src/combat_tax.rs`.
 
 ## Roadmap
 

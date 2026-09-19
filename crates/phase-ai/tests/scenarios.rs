@@ -1951,7 +1951,14 @@ fn ai_attacks_through_propaganda_and_pays_the_tax() {
 /// the empty declaration WITHOUT opening a prompt it cannot answer.
 #[test]
 fn ai_holds_back_when_the_propaganda_tax_is_unaffordable() {
-    let (mut runner, _attackers) = build_propaganda_attack_scenario(1, 0);
+    let (mut runner, attackers) = build_propaganda_attack_scenario(1, 0);
+    assert!(
+        !engine::game::combat::attack_tax_is_affordable(
+            runner.state(),
+            &[(attackers[0], AttackTarget::Player(P0))],
+        ),
+        "premise: with no mana open the {{2}} tax is unaffordable"
+    );
 
     let (action, declared) = ai_declared_attackers(&runner);
     assert!(
@@ -2178,19 +2185,47 @@ const BLOCK_TAX_ORACLE: &str = "As long as this creature is attacking, creatures
 /// that blocks the 3/3 profitably, plus `untapped_lands` Forests. The runner is
 /// left at P1's `DeclareBlockers` prompt.
 fn build_block_tax_scenario(untapped_lands: usize) -> (GameRunner, ObjectId, ObjectId) {
+    build_block_scenario(BlockFixture {
+        blocker_power: 4,
+        blocker_toughness: 4,
+        block_tax: true,
+        untapped_lands,
+    })
+}
+
+/// The board `build_block_scenario` lays out: P0's 3/3 attacker, optionally
+/// carrying the {1} block tax, against one P1 blocker and some Forests.
+struct BlockFixture {
+    blocker_power: i32,
+    blocker_toughness: i32,
+    block_tax: bool,
+    untapped_lands: usize,
+}
+
+fn build_block_scenario(fixture: BlockFixture) -> (GameRunner, ObjectId, ObjectId) {
     use engine::parser::oracle_static::parse_static_line;
     use engine::types::mana::ManaColor;
 
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
-    let block_tax = parse_static_line(BLOCK_TAX_ORACLE).expect("block-tax static should parse");
     let attacker = {
         let mut builder = scenario.add_creature(P0, "Taxing Raider", 3, 3);
-        builder.with_static_definition(block_tax);
+        if fixture.block_tax {
+            let block_tax =
+                parse_static_line(BLOCK_TAX_ORACLE).expect("block-tax static should parse");
+            builder.with_static_definition(block_tax);
+        }
         builder.id()
     };
-    let blocker = scenario.add_creature(P1, "Stout Wall", 4, 4).id();
-    for _ in 0..untapped_lands {
+    let blocker = scenario
+        .add_creature(
+            P1,
+            "Stout Wall",
+            fixture.blocker_power,
+            fixture.blocker_toughness,
+        )
+        .id();
+    for _ in 0..fixture.untapped_lands {
         scenario.add_basic_land(P1, ManaColor::Green);
     }
 
@@ -2270,11 +2305,54 @@ fn ai_pays_a_block_tax_to_keep_a_profitable_block() {
     );
 }
 
+/// CR 509.1c + CR 509.1f: a block tax is valued by the damage the block stops,
+/// not by the blocker's own power. A 0/4 wall that holds off a 3/3 is worth
+/// {1}, so the AI keeps the block and pays.
+#[test]
+fn ai_pays_a_block_tax_for_a_wall_that_stops_the_damage() {
+    let wall = |block_tax| BlockFixture {
+        blocker_power: 0,
+        blocker_toughness: 4,
+        block_tax,
+        untapped_lands: 3,
+    };
+    let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+
+    // Control leg: untaxed, the AI blocks the 3/3 with its 0/4 wall.
+    let (control, attacker, blocker) = build_block_scenario(wall(false));
+    let mut rng = SmallRng::seed_from_u64(7);
+    let control_action = choose_action(control.state(), P1, &config, &mut rng)
+        .expect("AI must choose a blocker declaration");
+    assert_eq!(
+        control_action,
+        GameAction::DeclareBlockers {
+            assignments: vec![(blocker, attacker)]
+        },
+        "premise: untaxed, the wall blocks the 3/3"
+    );
+
+    let (runner, attacker, blocker) = build_block_scenario(wall(true));
+    let mut rng = SmallRng::seed_from_u64(7);
+    let action = choose_action(runner.state(), P1, &config, &mut rng)
+        .expect("AI must choose a blocker declaration");
+    assert_eq!(
+        action,
+        GameAction::DeclareBlockers {
+            assignments: vec![(blocker, attacker)]
+        },
+        "three damage stopped is worth {{1}}, so the wall must keep its block"
+    );
+}
+
 /// CR 509.1f: with no mana open the block tax is unaffordable, so the AI must
 /// fall back to the tax-free declaration without opening a prompt it cannot pay.
 #[test]
 fn ai_drops_a_block_it_cannot_pay_the_tax_for() {
-    let (mut runner, _attacker, _blocker) = build_block_tax_scenario(0);
+    let (mut runner, attacker, blocker) = build_block_tax_scenario(0);
+    assert!(
+        !engine::game::combat::block_tax_is_affordable(runner.state(), P1, &[(blocker, attacker)]),
+        "premise: with no mana open the {{1}} block tax is unaffordable"
+    );
 
     let config = create_config(AiDifficulty::VeryHard, Platform::Native);
     let mut rng = SmallRng::seed_from_u64(7);

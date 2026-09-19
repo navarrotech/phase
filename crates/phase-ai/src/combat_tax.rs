@@ -15,10 +15,16 @@
 //! could disagree with the posture which opened it would loop. Keeping the
 //! judgement in exactly one place is what makes the round trip terminate.
 
+use std::collections::{HashMap, HashSet};
+
 use engine::game::combat::{
     attack_tax_is_affordable, block_tax_is_affordable, compute_attack_tax, compute_block_tax,
     AttackTarget, CombatTaxPosture,
 };
+use engine::game::mana_abilities::{
+    can_activate_mana_ability_now_gated, is_mana_ability, ManaActivationGates,
+};
+use engine::types::card_type::CoreType;
 use engine::types::game_state::{CombatTaxContext, GameState};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::ManaCost;
@@ -81,10 +87,16 @@ pub(crate) fn plan_attack_tax(
         let Some((total_cost, per_creature)) = compute_attack_tax(state, &kept) else {
             return (kept, CombatTaxPosture::Refuse);
         };
+        // An attacker's stake is the damage it threatens to deal.
+        let damage_at_stake = per_creature
+            .iter()
+            .map(|(id, _)| state.objects.get(id).and_then(|obj| obj.power).unwrap_or(0))
+            .sum();
         let quote = TaxQuote {
             context: CombatTaxContext::Attacking,
             total_cost: &total_cost,
-            per_creature: &per_creature,
+            damage_at_stake,
+            taxed_count: per_creature.len(),
             total_declared: kept.len(),
         };
         // The judgement is cheap; the affordability probe clones the state to
@@ -124,10 +136,33 @@ pub(crate) fn plan_block_tax(
     let Some((total_cost, per_creature)) = compute_block_tax(state, assignments) else {
         return CombatTaxPosture::Refuse;
     };
+    // The stake of a block tax is the damage that gets through if the taxed
+    // blockers drop out: the power of every attacker all of whose blockers are
+    // taxed. An attacker that keeps an untaxed blocker stays blocked either way.
+    let taxed: HashSet<ObjectId> = per_creature.iter().map(|(blocker, _)| *blocker).collect();
+    let mut attacker_keeps_untaxed_blocker: HashMap<ObjectId, bool> = HashMap::new();
+    for (blocker, attacker) in assignments {
+        let keeps = attacker_keeps_untaxed_blocker
+            .entry(*attacker)
+            .or_insert(false);
+        *keeps |= !taxed.contains(blocker);
+    }
+    let damage_at_stake = attacker_keeps_untaxed_blocker
+        .iter()
+        .filter(|(_, keeps_untaxed_blocker)| !**keeps_untaxed_blocker)
+        .map(|(attacker, _)| {
+            state
+                .objects
+                .get(attacker)
+                .and_then(|obj| obj.power)
+                .unwrap_or(0)
+        })
+        .sum();
     let quote = TaxQuote {
         context: CombatTaxContext::Blocking,
         total_cost: &total_cost,
-        per_creature: &per_creature,
+        damage_at_stake,
+        taxed_count: per_creature.len(),
         total_declared: assignments.len(),
     };
     if is_worth_paying(state, player, features, &quote)
@@ -142,18 +177,21 @@ pub(crate) fn plan_block_tax(
 struct TaxQuote<'a> {
     context: CombatTaxContext,
     total_cost: &'a ManaCost,
-    /// Per-creature breakdown: the taxed subset of the declaration.
-    per_creature: &'a [(ObjectId, ManaCost)],
+    /// Damage the taxed creatures decide: dealt by taxed attackers, or stopped
+    /// by taxed blockers. Each planner computes it for its side of combat.
+    damage_at_stake: i32,
+    /// How many creatures in the declaration the quote taxes.
+    taxed_count: usize,
     /// Size of the whole declaration the quote was priced against.
     total_declared: usize,
 }
 
 /// Does paying this quote beat letting its creatures drop out of combat?
 ///
-/// Paying earns the damage bias (scaled by deck archetype), minus a penalty for
-/// tapping out of interaction, plus bonuses for keeping a declaration from
-/// collapsing and for keeping blockers. Declining earns the opposite of the
-/// damage bias.
+/// Paying earns a bias from comparing the damage at stake to the tax (scaled by
+/// deck archetype), minus a penalty for tapping out of interaction, plus
+/// bonuses for keeping a declaration from collapsing and for keeping blockers.
+/// Declining earns the opposite of the damage bias.
 fn is_worth_paying(
     state: &GameState,
     player: PlayerId,
@@ -161,13 +199,7 @@ fn is_worth_paying(
     quote: &TaxQuote<'_>,
 ) -> bool {
     let tax_mana_value = quote.total_cost.mana_value();
-
-    // Damage potential: sum of powers of the taxed creatures.
-    let expected_damage: i32 = quote
-        .per_creature
-        .iter()
-        .map(|(id, _)| state.objects.get(id).and_then(|obj| obj.power).unwrap_or(0))
-        .sum();
+    let expected_damage = quote.damage_at_stake;
     let tax = tax_mana_value as i32;
 
     let archetype_mod = archetype_multiplier(features, quote.context.clone());
@@ -187,7 +219,7 @@ fn is_worth_paying(
     };
 
     let collapse_fraction = if quote.total_declared > 0 {
-        quote.per_creature.len() as f64 / quote.total_declared as f64
+        quote.taxed_count as f64 / quote.total_declared as f64
     } else {
         0.0
     };
@@ -208,27 +240,25 @@ fn is_worth_paying(
     pay_value > decline_value
 }
 
-/// Count untapped mana sources (lands + mana rocks) the seat controls. Mirrors
-/// the helper used by `HoldManaUpForInteractionPolicy`.
+/// Count the mana sources the seat could tap for mana right now.
+///
+/// An untapped land counts outright. Any other source counts only when the
+/// engine says one of its mana abilities can be activated now, which excludes,
+/// for example, a summoning-sick creature whose ability costs {T} (CR 302.6).
 fn count_untapped_mana_sources(state: &GameState, player: PlayerId) -> u32 {
+    let gates = ManaActivationGates::compute(state);
     state
         .battlefield
         .iter()
-        .filter(|&&id| {
-            let Some(obj) = state.objects.get(&id) else {
-                return false;
-            };
-            if obj.controller != player || obj.tapped {
-                return false;
-            }
-            // Heuristic: lands + artifacts with a mana ability produce mana.
-            obj.card_types
-                .core_types
-                .iter()
-                .any(|core_type| matches!(core_type, engine::types::card_type::CoreType::Land))
-                || obj.abilities.iter().any(|ability| {
-                    matches!(ability.kind, engine::types::ability::AbilityKind::Activated)
-                        && matches!(*ability.effect, engine::types::ability::Effect::Mana { .. })
+        .filter_map(|id| state.objects.get(id))
+        .filter(|obj| obj.controller == player && !obj.tapped)
+        .filter(|obj| {
+            obj.card_types.core_types.contains(&CoreType::Land)
+                || obj.abilities.iter().enumerate().any(|(index, ability)| {
+                    is_mana_ability(ability)
+                        && can_activate_mana_ability_now_gated(
+                            state, player, obj.id, index, ability, &gates,
+                        )
                 })
         })
         .count() as u32
@@ -259,6 +289,58 @@ mod tests {
         features.aggro_pressure.commitment = aggro;
         features.control.commitment = control;
         features
+    }
+
+    /// CR 302.6: a summoning-sick creature cannot pay a {T} cost, so its mana
+    /// ability does not count toward the mana the seat could tap right now. An
+    /// untapped land still counts.
+    #[test]
+    fn summoning_sick_mana_creature_is_not_an_available_source() {
+        use engine::game::scenario::{GameScenario, P0};
+        use engine::types::ability::{
+            AbilityCost, AbilityDefinition, AbilityKind, Effect, ManaContribution, ManaProduction,
+        };
+        use engine::types::mana::ManaColor;
+
+        let mut scenario = GameScenario::new();
+        scenario.add_basic_land(P0, ManaColor::Green);
+        let elf = scenario
+            .add_creature(P0, "Mana Elf", 1, 1)
+            .with_ability_definition(
+                AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::Mana {
+                        produced: ManaProduction::Fixed {
+                            colors: vec![ManaColor::Green],
+                            contribution: ManaContribution::Base,
+                        },
+                        restrictions: vec![],
+                        grants: vec![],
+                        expiry: None,
+                        target: None,
+                    },
+                )
+                .cost(AbilityCost::Tap),
+            )
+            .id();
+        let mut runner = scenario.build();
+
+        assert_eq!(
+            count_untapped_mana_sources(runner.state(), P0),
+            2,
+            "premise: a creature that has been under control since the turn began taps for mana"
+        );
+        runner
+            .state_mut()
+            .objects
+            .get_mut(&elf)
+            .unwrap()
+            .summoning_sick = true;
+        assert_eq!(
+            count_untapped_mana_sources(runner.state(), P0),
+            1,
+            "only the land counts while the elf is summoning sick"
+        );
     }
 
     #[test]
