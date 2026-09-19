@@ -2001,15 +2001,15 @@ fn ai_trims_the_attack_to_the_propaganda_tax_it_can_afford() {
     assert_eq!(total_cost.mana_value(), 4, "two attackers at {{2}} each");
 }
 
-/// CR 508.1d: paying is optional, and a tax that costs more than the attack is
-/// worth is declined. A 1/1 into Propaganda's {2} is affordable with six lands
-/// open but not worth it, so the AI keeps it home and never opens the prompt.
-#[test]
-fn ai_declines_a_propaganda_tax_that_outprices_the_attack() {
+/// P1 has a lone 1/1 and six Forests; P0 controls Propaganda only when
+/// `with_propaganda`. The runner is parked at P1's `DeclareAttackers`.
+fn build_squire_attack_scenario(with_propaganda: bool) -> (GameRunner, ObjectId) {
     use engine::types::mana::ManaColor;
 
     let mut scenario = GameScenario::new();
-    scenario.add_enchantment_from_oracle(P0, "Propaganda", PROPAGANDA_ORACLE);
+    if with_propaganda {
+        scenario.add_enchantment_from_oracle(P0, "Propaganda", PROPAGANDA_ORACLE);
+    }
     let attacker = scenario.add_creature(P1, "Squire", 1, 1).id();
     for _ in 0..6 {
         scenario.add_basic_land(P1, ManaColor::Green);
@@ -2027,18 +2027,31 @@ fn ai_declines_a_propaganda_tax_that_outprices_the_attack() {
         valid_attack_targets_by_attacker: None,
         attacker_constraints: Default::default(),
     };
+    (runner, attacker)
+}
 
-    // Reach-guards: the raw heuristic wants this attack, and the tax is
-    // affordable, so only the worth-paying judgement can keep the 1/1 home.
-    let raw = phase_ai::combat_ai::choose_attackers_with_targets(runner.state(), P1);
+/// CR 508.1d: paying is optional, and a tax that costs more than the attack is
+/// worth is declined. A 1/1 into Propaganda's {2} is affordable with six lands
+/// open but not worth it, so the AI keeps it home and never opens the prompt.
+#[test]
+fn ai_declines_a_propaganda_tax_that_outprices_the_attack() {
+    // Control leg: on the same board without Propaganda, the real
+    // `choose_action` path attacks with the 1/1. Only the tax differs below.
+    let (control, attacker) = build_squire_attack_scenario(false);
+    let (_, control_declared) = ai_declared_attackers(&control);
     assert_eq!(
-        raw,
-        vec![(attacker, AttackTarget::Player(P0))],
-        "premise: the untaxed heuristic attacks an empty board with the 1/1"
+        control_declared,
+        vec![attacker],
+        "premise: untaxed, the AI attacks an empty board with the 1/1"
     );
+
+    let (mut runner, attacker) = build_squire_attack_scenario(true);
     assert!(
-        engine::game::combat::attack_tax_is_affordable(runner.state(), &raw),
-        "premise: six lands cover the {{2}} tax"
+        engine::game::combat::attack_tax_is_affordable(
+            runner.state(),
+            &[(attacker, AttackTarget::Player(P0))],
+        ),
+        "premise: six lands cover the {{2}} tax, so affordability cannot explain a hold-back"
     );
 
     let (action, declared) = ai_declared_attackers(&runner);
