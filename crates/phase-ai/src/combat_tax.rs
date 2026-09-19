@@ -159,9 +159,9 @@ pub(crate) fn plan_block_tax(
 ///   blocked either way, so its taxed blockers are worth the damage they add
 ///   toward killing it (their own power, each blocker counted once).
 /// - CR 509.1h + CR 510.1b: an attacker whose every blocker is taxed becomes
-///   unblocked if they drop out, so its damage gets through. CR 702.19b: a trampler already carries
-///   its excess past its blockers, so for it only the lethal damage those
-///   blockers were absorbing is at stake.
+///   unblocked if they drop out, so its damage gets through. CR 702.19b: a
+///   trampler already carries its excess past its blockers, so for it only the
+///   lethal damage those blockers were absorbing is at stake.
 fn block_tax_stake(
     state: &GameState,
     assignments: &[(ObjectId, ObjectId)],
@@ -284,11 +284,11 @@ fn is_worth_paying(
 
 /// Count the mana sources the seat could tap for mana right now.
 ///
-/// Delegates to `activatable_mana_options`, the engine authority auto-pay's
-/// affordability checks use. It already excludes tapped sources, sources the
-/// seat does not control, lands without a mana ability, and summoning-sick
-/// creatures whose ability costs {T} (CR 302.6); layers give a basic-typed land
-/// its intrinsic mana ability (CR 305.6).
+/// Delegates to `activatable_mana_options`, the engine's readiness check for
+/// tapping a source for mana now. It excludes tapped sources, sources the seat
+/// does not control, lands without a mana ability, and summoning-sick
+/// creatures (CR 302.6); layers give a basic-typed land its intrinsic mana
+/// ability (CR 305.6).
 fn count_untapped_mana_sources(state: &GameState, player: PlayerId) -> u32 {
     state
         .battlefield
@@ -472,6 +472,21 @@ mod tests {
         let runner = scenario.build();
 
         assert_eq!(stake_for(runner.state(), &[(wall, trampler)], &[]), 2);
+    }
+
+    /// CR 510.1a: an attacker with 0 or less power assigns no combat damage, so
+    /// a negative-power attacker puts nothing at stake rather than a negative.
+    #[test]
+    fn block_stake_treats_negative_power_as_no_damage() {
+        use engine::game::scenario::{GameScenario, P0, P1};
+
+        let mut scenario = GameScenario::new();
+        let shrunk = scenario.add_creature(P0, "Shrunk Raider", 0, 4).id();
+        let guard = scenario.add_creature(P1, "Guard", 1, 1).id();
+        let mut runner = scenario.build();
+        runner.state_mut().objects.get_mut(&shrunk).unwrap().power = Some(-2);
+
+        assert_eq!(stake_for(runner.state(), &[(guard, shrunk)], &[]), 0);
     }
 
     /// A taxed blocker assigned to two attackers that each keep an untaxed
