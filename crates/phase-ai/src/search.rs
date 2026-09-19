@@ -1645,11 +1645,11 @@ pub fn fallback_action(
             choice: engine::types::actions::UnlessCostBranch::Decline,
         }),
 
-        // CR 508.1i + CR 509.1e: combat tax. The prompt only opens for a
-        // declaration completed under `CombatTaxPosture::Accept`, so paying
-        // whenever the quote is affordable is the answer that declaration was
-        // made for. A flat decline would discard it and re-open the identical
-        // declare prompt.
+        // CR 508.1j + CR 509.1f: combat tax. A declaration this AI completes only
+        // reaches the prompt under `CombatTaxPosture::Accept`, so paying whenever
+        // the quote is affordable is the answer that declaration was made for.
+        // A flat decline would discard it and re-open the identical declare
+        // prompt.
         WaitingFor::CombatTaxPayment { .. } => Some(GameAction::PayCombatTax {
             accept: engine::game::combat::pending_combat_tax_is_affordable(state),
         }),
@@ -3227,7 +3227,7 @@ fn score_candidates_core(
         state.waiting_for,
         WaitingFor::DeclareAttackers { .. }
             | WaitingFor::DeclareBlockers { .. }
-            // CR 508.1i + CR 509.1e: the combat-tax answer is bound to the
+            // CR 508.1j + CR 509.1f: the combat-tax answer is bound to the
             // declaration that incurred it, so it bypasses candidate scoring for
             // the same reason the declarations themselves do.
             | WaitingFor::CombatTaxPayment { .. }
@@ -4147,7 +4147,7 @@ pub(crate) fn deterministic_choice(
 
     // Combat decisions: delegate to specialized combat AI
 
-    // CR 508.1i + CR 509.1e: the declarations below may be completed under
+    // CR 508.1j + CR 509.1f: the declarations below may be completed under
     // `CombatTaxPosture::Accept`, so a rollout reaches the tax prompt that
     // follows. Answer it the same way the root does, or quiesce would stall on
     // an uncommitted attack with no mana spent.
@@ -4181,7 +4181,7 @@ pub(crate) fn deterministic_choice(
         return Some(validated_declare_attackers(
             state,
             ai_player,
-            context.map(|c| c.session.as_ref()),
+            context.map(|context| context.session.as_ref()),
             attacks,
         ));
     }
@@ -4210,7 +4210,7 @@ pub(crate) fn deterministic_choice(
                 &config.profile,
                 Some(valid_block_targets),
             );
-            // CR 509.1c + CR 509.1d: a block tax is an offer the defender may
+            // CR 509.1c: a block tax is an offer the defender may
             // take. Accepting keeps the taxed blockers; refusing lets the engine
             // substitute its tax-free witness, which drops every one of them.
             let default_features = crate::features::DeckFeatures::default();
@@ -4245,7 +4245,7 @@ fn deterministic_combat_choice(
     opponent_threat: Option<&ThreatProfile>,
     comparison_deadline: Option<engine::util::Deadline>,
 ) -> Option<GameAction> {
-    // CR 508.1i + CR 509.1e: the tax prompt belongs to the declaration that
+    // CR 508.1j + CR 509.1f: the tax prompt belongs to the declaration that
     // opened it, and that declaration was only completed under
     // `CombatTaxPosture::Accept` because the AI chose to pay. Answering from the
     // engine's affordability check, rather than re-scoring the tax against
@@ -4303,7 +4303,7 @@ fn deterministic_combat_choice(
                 profile,
                 Some(valid_block_targets),
             );
-            // CR 509.1c + CR 509.1d: a block tax is an offer the defender may
+            // CR 509.1c: a block tax is an offer the defender may
             // take. Accepting keeps the taxed blockers; refusing lets the engine
             // substitute its tax-free witness, which drops every one of them.
             let default_features = crate::features::DeckFeatures::default();
@@ -5432,6 +5432,81 @@ mod tests {
             "reach guard: the no-other-home equip activation must be a hard Reject \
              from EquipmentPriorityPolicy; got {equip_verdict:?}"
         );
+    }
+
+    /// P0 attacks P1 through Propaganda (verified Oracle text,
+    /// client/public/card-data.json 2026-05-10) with `lands` Forests open, and the
+    /// runner is left at the resulting `CombatTaxPayment` prompt. The engine
+    /// quotes a taxed declaration whether or not it is affordable, so both cases
+    /// reach the prompt.
+    fn propaganda_tax_prompt(lands: usize) -> GameRunner {
+        let mut scenario = GameScenario::new();
+        scenario.add_enchantment_from_oracle(
+            P1,
+            "Propaganda",
+            "Creatures can't attack you unless their controller pays {2} for each creature \
+             they control that's attacking you.",
+        );
+        let attacker = scenario.add_creature(P0, "Bear", 3, 3).id();
+        for _ in 0..lands {
+            scenario.add_basic_land(P0, ManaColor::Green);
+        }
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        state.active_player = P0;
+        state.priority_player = P0;
+        state.phase = Phase::DeclareAttackers;
+        state.turn_number = 2;
+        state.waiting_for = WaitingFor::DeclareAttackers {
+            player: P0,
+            valid_attacker_ids: vec![attacker],
+            valid_attack_targets: vec![engine::game::combat::AttackTarget::Player(P1)],
+            valid_attack_targets_by_attacker: None,
+            attacker_constraints: Default::default(),
+        };
+        runner
+            .act(GameAction::DeclareAttackers {
+                attacks: vec![(attacker, engine::game::combat::AttackTarget::Player(P1))],
+                bands: vec![],
+            })
+            .expect("a taxed attack is legal to declare");
+        assert!(
+            matches!(
+                runner.state().waiting_for,
+                WaitingFor::CombatTaxPayment { .. }
+            ),
+            "premise: the taxed declaration must open the prompt, got {:?}",
+            runner.state().waiting_for
+        );
+        runner
+    }
+
+    /// CR 508.1j: the rollout driver (`deterministic_choice`) and the deadlock-safe
+    /// `fallback_action` both answer a live combat-tax prompt from the engine's
+    /// affordability check. Without the rollout arm a lookahead that planned a
+    /// taxed attack would stall at the prompt with the attack uncommitted.
+    #[test]
+    fn combat_tax_prompt_is_answered_by_rollouts_and_the_fallback() {
+        let config = create_config(AiDifficulty::VeryHard, Platform::Native);
+        for (lands, expected_accept) in [(2, true), (0, false)] {
+            let runner = propaganda_tax_prompt(lands);
+            let state = runner.state();
+            let expected = Some(GameAction::PayCombatTax {
+                accept: expected_accept,
+            });
+
+            assert_eq!(
+                deterministic_choice(state, P0, &config, &[], None),
+                expected,
+                "rollout answer with {lands} lands open"
+            );
+            let contract = AiDecisionContract::issue(state, P0);
+            assert_eq!(
+                fallback_action(state, &config, &contract),
+                expected,
+                "fallback answer with {lands} lands open"
+            );
+        }
     }
 
     /// T8 — the combat production wiring at `deterministic_choice`'s combat

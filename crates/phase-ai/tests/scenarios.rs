@@ -1890,7 +1890,7 @@ fn ai_declared_attackers(runner: &GameRunner) -> (GameAction, Vec<ObjectId>) {
     (action, ids)
 }
 
-/// CR 508.1d + CR 508.1h: with the tax affordable and no blocker in sight, the
+/// CR 508.1d + CR 508.1j: with the tax affordable and no blocker in sight, the
 /// AI declares the attack and pays, rather than collapsing to the empty
 /// tax-free witness.
 #[test]
@@ -1940,14 +1940,14 @@ fn ai_attacks_through_propaganda_and_pays_the_tax() {
         combat
             .attackers
             .iter()
-            .map(|a| a.object_id)
+            .map(|attacker| attacker.object_id)
             .collect::<Vec<_>>(),
         attackers,
         "the paid-for attacker must actually be attacking"
     );
 }
 
-/// CR 508.1h: an unaffordable tax is not attacked into. The AI must fall back to
+/// CR 508.1j: an unaffordable tax is not attacked into. The AI must fall back to
 /// the empty declaration WITHOUT opening a prompt it cannot answer.
 #[test]
 fn ai_holds_back_when_the_propaganda_tax_is_unaffordable() {
@@ -2037,11 +2037,10 @@ fn ai_taxed_attack_round_trip_terminates() {
         runner.state().waiting_for
     );
     assert!(
-        runner
-            .state()
-            .combat
-            .as_ref()
-            .is_some_and(|combat| combat.attackers.iter().any(|a| a.object_id == attackers[0])),
+        runner.state().combat.as_ref().is_some_and(|combat| combat
+            .attackers
+            .iter()
+            .any(|attacker| attacker.object_id == attackers[0])),
         "the attacker must have committed to combat rather than looping on the tax"
     );
 }
@@ -2151,7 +2150,7 @@ fn build_block_tax_scenario(untapped_lands: usize) -> (GameRunner, ObjectId, Obj
     (runner, attacker, blocker)
 }
 
-/// CR 509.1c + CR 509.1d: with {1} open, the AI keeps its profitable block and
+/// CR 509.1c + CR 509.1f: with {1} open, the AI keeps its profitable block and
 /// pays for it rather than letting the engine's tax-free witness drop it.
 #[test]
 fn ai_pays_a_block_tax_to_keep_a_profitable_block() {
@@ -2202,7 +2201,7 @@ fn ai_pays_a_block_tax_to_keep_a_profitable_block() {
     );
 }
 
-/// CR 509.1d: with no mana open the block tax is unaffordable, so the AI must
+/// CR 509.1f: with no mana open the block tax is unaffordable, so the AI must
 /// fall back to the tax-free declaration without opening a prompt it cannot pay.
 #[test]
 fn ai_drops_a_block_it_cannot_pay_the_tax_for() {

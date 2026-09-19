@@ -111,9 +111,9 @@ pub(crate) fn plan_attack_tax(
 
 /// Choose the posture to complete a blocker proposal under.
 ///
-/// CR 509.1d: `Accept` only when paying is worth it and the defending seat can
-/// cover the quote, so the completion never opens a payment prompt this seat
-/// would then be unable to answer with a payment. Blocks are not trimmed: an
+/// CR 509.1c + CR 509.1f: `Accept` only when paying is worth it and the
+/// defending seat can cover the quote, so the completion never opens a payment
+/// prompt this seat would then be unable to answer with a payment. Blocks are not trimmed: an
 /// unaccepted proposal falls back to the engine's tax-free witness whole.
 pub(crate) fn plan_block_tax(
     state: &GameState,

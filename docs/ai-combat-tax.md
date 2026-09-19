@@ -18,7 +18,7 @@ The decision to pay is made exactly once, before the declaration is submitted:
 | `plan_block_tax` | `crates/phase-ai/src/combat_tax.rs` | Pick the block posture. |
 | `pending_combat_tax_is_affordable` | `crates/engine/src/game/combat.rs` | Answer the live `CombatTaxPayment` prompt. |
 
-The engine opens a tax prompt only for a declaration completed under `CombatTaxPosture::Accept`, and `Accept` is only honoured when the quote is affordable. So the prompt's answer is simply "pay if affordable": it is the payment the declaration was made for, and it is independent of deck features, policies, or determinized samples. Nothing can outvote it, so the round trip terminates.
+A declaration this AI completes reaches a tax prompt only under `CombatTaxPosture::Accept`, and `Accept` is only honoured when the quote is affordable. So the prompt's answer is simply "pay if affordable": it is the payment the declaration was made for, and it is independent of deck features, policies, or determinized samples. Nothing can outvote it, so the round trip terminates.
 
 `deterministic_combat_choice` answers the prompt inside `score_candidates_core`'s combat bypass, which always returns an action. `deterministic_choice`, which drives lookahead rollouts, gives the same engine-owned answer, so a rollout that plans a taxed attack commits it. The deadlock-safe `fallback_action` does the same.
 

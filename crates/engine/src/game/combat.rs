@@ -2380,7 +2380,7 @@ pub fn complete_blocker_proposal(
     crate::types::actions::GameAction::DeclareBlockers { assignments }
 }
 
-/// CR 509.1d: does this proposal's block tax disqualify it under `posture`?
+/// CR 509.1c + CR 509.1f: does this proposal's block tax disqualify it under `posture`?
 ///
 /// Under `Refuse` any quote does. Under `Accept` only a quote the defending
 /// player cannot cover does, so an accepted completion never opens a prompt the
@@ -5048,7 +5048,7 @@ pub enum CombatTaxPosture {
     Accept,
 }
 
-/// CR 508.1h + CR 508.1i: can the attacking player cover this proposal's tax?
+/// CR 508.1i + CR 508.1j: can the attacking player cover this proposal's tax?
 ///
 /// An untaxed proposal is trivially affordable. A taxed one is probed with the
 /// same auto-tap payment authority `handle_pay_combat_tax` spends through
@@ -5068,7 +5068,7 @@ pub fn attack_tax_is_affordable(state: &GameState, attacks: &[(ObjectId, AttackT
     )
 }
 
-/// CR 509.1d + CR 509.1e: can `player` cover this block proposal's tax?
+/// CR 509.1e + CR 509.1f: can `player` cover this block proposal's tax?
 ///
 /// Block-side twin of [`attack_tax_is_affordable`]; the defending player pays.
 pub fn block_tax_is_affordable(
@@ -5088,7 +5088,7 @@ pub fn block_tax_is_affordable(
     )
 }
 
-/// CR 508.1i + CR 509.1e: can the seat answering a live `CombatTaxPayment`
+/// CR 508.1j + CR 509.1f: can the seat answering a live `CombatTaxPayment`
 /// prompt cover its locked-in quote?
 ///
 /// A completion only opens that prompt for a proposal made under
@@ -5685,7 +5685,7 @@ fn complete_one(
     )
     .is_ok();
     let proposal_score = score_declaration(constraints, proposed_attacks);
-    // CR 508.1h: the per-pair probe is the cheap gate — only a proposal that is
+    // CR 508.1d: the per-pair probe is the cheap gate — only a proposal that is
     // actually taxed pays for the full quote + auto-tap affordability probe.
     let proposal_taxed = proposed_attacks
         .iter()
@@ -11177,7 +11177,7 @@ mod tests {
         let pool = &mut state
             .players
             .iter_mut()
-            .find(|p| p.id == player)
+            .find(|candidate| candidate.id == player)
             .expect("player exists")
             .mana_pool;
         for _ in 0..amount {
@@ -11206,7 +11206,7 @@ mod tests {
         );
     }
 
-    /// CR 508.1d + CR 508.1h: `Accept` preserves a taxed proposal whose quote the
+    /// CR 508.1d + CR 508.1j: `Accept` preserves a taxed proposal whose quote the
     /// attacking player can actually cover, so a seat facing a Ghostly Prison
     /// or Propaganda can still attack by paying.
     #[test]
@@ -11227,7 +11227,7 @@ mod tests {
         );
     }
 
-    /// CR 508.1h: `Accept` is not a promise the engine will honour blindly — a
+    /// CR 508.1j: `Accept` is not a promise the engine will honour blindly — a
     /// quote the player cannot pay still falls back to the tax-free witness, so
     /// the completion never opens a prompt whose only answer is a decline.
     #[test]
@@ -11319,7 +11319,7 @@ mod tests {
         );
     }
 
-    /// CR 509.1c + CR 509.1d: `Accept` preserves a taxed block whose quote the
+    /// CR 509.1c + CR 509.1f: `Accept` preserves a taxed block whose quote the
     /// defending player can cover.
     #[test]
     fn complete_blocker_proposal_accepts_affordable_taxed_block() {
@@ -11338,7 +11338,7 @@ mod tests {
         );
     }
 
-    /// CR 509.1d: `Accept` does not override affordability. A quote the
+    /// CR 509.1f: `Accept` does not override affordability. A quote the
     /// defender cannot pay still falls back to the tax-free witness.
     #[test]
     fn complete_blocker_proposal_rejects_unaffordable_taxed_block() {

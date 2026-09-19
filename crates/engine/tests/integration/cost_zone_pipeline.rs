@@ -2193,6 +2193,92 @@ fn self_sacrifice_mana_cost_waits_for_replacement_before_producing_mana() {
     );
 }
 
+/// P0's only mana source sacrifices itself for {G}; P1 has an untapped Archangel
+/// of Tithes-style {1} attack tax (verified Oracle text, client/public/card-data.json
+/// 2026-05-10). With `competing_redirects`, two replacements race for the
+/// sacrifice, so auto-tapping the source pauses for a replacement choice.
+fn self_sacrifice_mana_vs_attack_tax(competing_redirects: bool) -> (GameState, ObjectId) {
+    use engine::parser::oracle_static::parse_static_line;
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    {
+        let mut source = scenario.add_creature(P0, "Self-Sacrifice Mana Source", 0, 1);
+        source.with_ability_definition(
+            AbilityDefinition::new(
+                AbilityKind::Activated,
+                Effect::Mana {
+                    produced: ManaProduction::Fixed {
+                        colors: vec![ManaColor::Green],
+                        contribution: ManaContribution::Base,
+                    },
+                    restrictions: vec![],
+                    grants: vec![],
+                    expiry: None,
+                    target: None,
+                },
+            )
+            .cost(AbilityCost::Sacrifice(SacrificeCost::count(
+                TargetFilter::SelfRef,
+                1,
+            ))),
+        );
+        if competing_redirects {
+            source
+                .with_replacement_definition(redirect_self_moved_to(Zone::Graveyard, Zone::Exile))
+                .with_replacement_definition(redirect_self_moved_to(Zone::Graveyard, Zone::Hand));
+        }
+    }
+    let attacker = scenario.add_creature(P0, "Bear", 2, 2).id();
+    let attack_tax = parse_static_line(
+        "As long as this creature is untapped, creatures can't attack you or planeswalkers you \
+         control unless their controller pays {1} for each of those creatures.",
+    )
+    .expect("the attack-tax static should parse");
+    scenario
+        .add_creature(P1, "Tithe Collector", 3, 5)
+        .with_static_definition(attack_tax);
+    let runner = scenario.build();
+    (runner.state().clone(), attacker)
+}
+
+/// CR 508.1j + CR 605.3b + CR 616.1: a combat tax pays through a payment with no
+/// resumable root, so a mana source whose own cost would pause for a replacement
+/// choice cannot fund it. The AI's affordability probe must say so, or it
+/// completes a taxed attack whose accepted prompt the reducer then rejects.
+#[test]
+fn paused_mana_source_cannot_fund_a_combat_tax() {
+    use engine::game::combat::{
+        attack_tax_is_affordable, complete_attacker_proposal, AttackTarget, CombatTaxPosture,
+    };
+
+    // Reach-guard: with no competing replacement the sacrifice never pauses,
+    // and auto-tap does fund the {1} tax from this very source.
+    let (unpaused, attacker) = self_sacrifice_mana_vs_attack_tax(false);
+    let attacks = vec![(attacker, AttackTarget::Player(P1))];
+    assert!(
+        attack_tax_is_affordable(&unpaused, &attacks),
+        "premise: auto-tap reaches the self-sacrificing source when nothing pauses"
+    );
+
+    let (paused, attacker) = self_sacrifice_mana_vs_attack_tax(true);
+    let attacks = vec![(attacker, AttackTarget::Player(P1))];
+    assert!(
+        !attack_tax_is_affordable(&paused, &attacks),
+        "a payment that would pause for a replacement choice cannot fund a combat tax"
+    );
+    let GameAction::DeclareAttackers {
+        attacks: completed, ..
+    } = complete_attacker_proposal(&paused, &attacks, &[], CombatTaxPosture::Accept)
+    else {
+        panic!("expected DeclareAttackers");
+    };
+    assert!(
+        completed.is_empty(),
+        "Accept must fall back to the tax-free witness, got {completed:?}"
+    );
+}
+
 #[test]
 fn selected_sacrifice_mana_cost_resumes_without_repaying_its_prefix() {
     let mut scenario = GameScenario::new();
