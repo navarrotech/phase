@@ -409,7 +409,7 @@ fn priority_land_play_omits_an_exile_land_blocked_by_a_play_restriction() {
                 card_filter: None,
                 single_use_group: None,
                 single_use: false,
-                cast_cost_raise: None,
+                cast_cost_modifier: None,
                 alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
@@ -1918,7 +1918,7 @@ fn spell_auto_tap_honors_exile_any_color_permission() {
                 card_filter: None,
                 single_use_group: None,
                 single_use: false,
-                cast_cost_raise: None,
+                cast_cost_modifier: None,
                 alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
@@ -1981,7 +1981,7 @@ fn add_play_from_exile_test_spell(
             card_filter: None,
             single_use_group: None,
             single_use: false,
-            cast_cost_raise: None,
+            cast_cost_modifier: None,
             alt_ability_cost: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
         });
@@ -2273,7 +2273,7 @@ fn cast_permanent_from_granted_permission_enters_under_caster_control() {
                 card_filter: None,
                 single_use_group: None,
                 single_use: false,
-                cast_cost_raise: None,
+                cast_cost_modifier: None,
                 alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
@@ -2326,7 +2326,7 @@ fn play_land_from_granted_permission_enters_under_player_control() {
                 card_filter: None,
                 single_use_group: None,
                 single_use: false,
-                cast_cost_raise: None,
+                cast_cost_modifier: None,
                 alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
@@ -3268,6 +3268,7 @@ fn foretell_cast_does_not_inherit_sibling_alt_cost_or_spend_rider() {
                 mana_spend_permission: Some(ManaSpendPermission::AnyColor),
                 enters_with_counter: None,
                 enters_with_modifications: Vec::new(),
+                cast_cost_modifier: None,
             });
     }
 
@@ -3593,6 +3594,7 @@ fn visions_of_ruin_flashback_commander_mv_reduces_flashback_cost() {
                 )
                 .expect("statically valid property aggregate"),
             )),
+            reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
         })
         .affected(TargetFilter::SelfRef)
         .condition(StaticCondition::CastingAsVariant {
@@ -3655,6 +3657,7 @@ fn avenge_cost_reduction_gated_on_attacked_you_last_turn() {
                 amount: ManaCost::generic(2),
                 spell_filter: None,
                 dynamic_count: None,
+                reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
             })
             .affected(TargetFilter::SelfRef)
             .condition(StaticCondition::AnyPlayerAttackedYouLastTurn);
@@ -3941,6 +3944,7 @@ fn exile_with_alt_cost_zero_uses_no_cost_path() {
             mana_spend_permission: None,
             enters_with_counter: None,
             enters_with_modifications: Vec::new(),
+            cast_cost_modifier: None,
         });
     let prepared = prepare_spell_cast(&state, PlayerId(0), exiled).unwrap();
     assert!(matches!(prepared.mana_cost, ManaCost::NoCost));
@@ -10870,6 +10874,7 @@ fn jhoira_granted_suspend_last_counter_cast_tags_suspend_variant() {
             mana_spend_permission: None,
             additional_cost: None,
             driver: crate::types::ability::CastFromZoneDriver::DuringResolution,
+            cast_cost_modifier: None,
         },
         vec![TargetRef::Object(suspended)],
         suspended,
@@ -10999,6 +11004,7 @@ fn jhoira_granted_suspend_creature_cast_gains_haste() {
             mana_spend_permission: None,
             additional_cost: None,
             driver: crate::types::ability::CastFromZoneDriver::DuringResolution,
+            cast_cost_modifier: None,
         },
         vec![TargetRef::Object(suspended)],
         suspended,
@@ -11227,6 +11233,7 @@ fn tolarian_terror_self_cost_reduction_applies_from_hand() {
                 filter: None,
                 scope: CountScope::Controller,
             }),
+            reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
         })
         .affected(TargetFilter::SelfRef);
         def.active_zones = crate::types::zones::self_spell_cost_mod_active_zones();
@@ -11861,7 +11868,10 @@ fn undaunted_no_op_without_keyword() {
     );
 }
 
-fn play_from_exile_raise(granted_to: PlayerId, raise: Option<ManaCost>) -> CastingPermission {
+fn play_from_exile_raise(
+    granted_to: PlayerId,
+    modifier: Option<CastCostModifier>,
+) -> CastingPermission {
     CastingPermission::PlayFromExile {
         provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
         mode: crate::types::ability::CardPlayMode::Play,
@@ -11875,19 +11885,19 @@ fn play_from_exile_raise(granted_to: PlayerId, raise: Option<ManaCost>) -> Casti
         card_filter: None,
         single_use_group: None,
         single_use: false,
-        cast_cost_raise: raise,
+        cast_cost_modifier: modifier,
         alt_ability_cost: None,
         land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
     }
 }
 
 /// CR 601.2f: A spell cast via a `PlayFromExile` grant carrying
-/// `cast_cost_raise: Some({1})` (Lightstall Inquisitor: "Each spell cast this
+/// `cast_cost_modifier: Some({1})` (Lightstall Inquisitor: "Each spell cast this
 /// way costs {1} more to cast.") has its total cost raised by {1}: {6}{B}
 /// becomes {7}{B}. Reverting the `apply_non_floor_cost_modifiers` raise leaves
 /// generic at 6 and flips this assertion.
 #[test]
-fn play_from_exile_cast_cost_raise_increases_generic() {
+fn play_from_exile_cast_cost_modifier_increases_generic() {
     let mut state = setup_game_at_main_phase();
     let obj_id =
         create_black_sorcery_with_keywords(&mut state, 16012, "Exile-Play Spell", 6, Vec::new());
@@ -11895,10 +11905,10 @@ fn play_from_exile_cast_cost_raise_increases_generic() {
     obj.zone = Zone::Exile;
     obj.casting_permissions.push(play_from_exile_raise(
         PlayerId(0),
-        Some(ManaCost::Cost {
+        Some(CastCostModifier::raise(ManaCost::Cost {
             shards: vec![],
             generic: 1,
-        }),
+        })),
     ));
 
     let mut mana_cost = state.objects.get(&obj_id).unwrap().mana_cost.clone();
@@ -11916,7 +11926,7 @@ fn play_from_exile_cast_cost_raise_increases_generic() {
             shards: vec![ManaCostShard::Black],
             generic: 7,
         },
-        "the exile-play cast_cost_raise of {{1}} must raise {{6}}{{B}} to {{7}}{{B}}",
+        "the exile-play cast_cost_modifier of {{1}} must raise {{6}}{{B}} to {{7}}{{B}}",
     );
 }
 
@@ -11934,10 +11944,10 @@ fn gobakhan_play_from_exile_cost_raise_adds_two_generic() {
     obj.zone = Zone::Exile;
     obj.casting_permissions.push(play_from_exile_raise(
         PlayerId(0),
-        Some(ManaCost::Cost {
+        Some(CastCostModifier::raise(ManaCost::Cost {
             shards: vec![],
             generic: 2,
-        }),
+        })),
     ));
 
     let mut mana_cost = state.objects.get(&obj_id).unwrap().mana_cost.clone();
@@ -11961,7 +11971,7 @@ fn gobakhan_play_from_exile_cost_raise_adds_two_generic() {
 /// CR 601.2f + CR 611.2a: The raise is scoped to the grantee — a permission
 /// granted to a different player must not tax P0's cast.
 #[test]
-fn play_from_exile_cast_cost_raise_only_applies_to_grantee() {
+fn play_from_exile_cast_cost_modifier_only_applies_to_grantee() {
     let mut state = setup_game_at_main_phase();
     let obj_id =
         create_black_sorcery_with_keywords(&mut state, 16013, "Other-Grantee Spell", 6, Vec::new());
@@ -11969,10 +11979,10 @@ fn play_from_exile_cast_cost_raise_only_applies_to_grantee() {
     obj.zone = Zone::Exile;
     obj.casting_permissions.push(play_from_exile_raise(
         PlayerId(1),
-        Some(ManaCost::Cost {
+        Some(CastCostModifier::raise(ManaCost::Cost {
             shards: vec![],
             generic: 1,
-        }),
+        })),
     ));
 
     let mut mana_cost = state.objects.get(&obj_id).unwrap().mana_cost.clone();
@@ -12006,7 +12016,10 @@ fn elected_plain_play_from_exile_does_not_inherit_later_cost_raise() {
     obj.zone = Zone::Exile;
     obj.casting_permissions = vec![
         play_from_exile_raise(PlayerId(0), None),
-        play_from_exile_raise(PlayerId(0), Some(ManaCost::generic(3))),
+        play_from_exile_raise(
+            PlayerId(0),
+            Some(CastCostModifier::raise(ManaCost::generic(3))),
+        ),
     ];
 
     let prepared = prepare_spell_cast(&state, PlayerId(0), obj_id)
@@ -12239,6 +12252,7 @@ fn self_cost_reduction_applies_from_command_zone() {
                 )
                 .expect("statically valid property aggregate"),
             )),
+            reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
         })
         .affected(TargetFilter::SelfRef);
         def.active_zones = crate::types::zones::self_spell_cost_mod_active_zones();
@@ -12320,6 +12334,7 @@ fn self_cost_reduction_applies_from_graveyard() {
                 scope: CountScope::Controller,
                 filter: Some(instant_sorcery_filter),
             }),
+            reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
         })
         .affected(TargetFilter::SelfRef);
         def.active_zones = crate::types::zones::self_spell_cost_mod_active_zones();
@@ -12414,6 +12429,13 @@ fn morophon_reduces_colored_mana_for_chosen_creature_type() {
                     TypedFilter::card().properties(vec![FilterProp::IsChosenCreatureType]),
                 )),
                 dynamic_count: None,
+                // CR 118.7b/c/d: the printed card carries "This effect reduces
+                // only the amount of colored mana you pay", so this fixture must
+                // mirror what the parser now emits for Morophon. Every pip in
+                // the spell below matches, so the assertion itself is
+                // reach-independent — the discriminating coverage lives in
+                // tests/integration/issue_8432_morophon_colored_only_reduction.rs.
+                reach: crate::types::statics::CostReductionReach::ColoredManaOnly,
             })
             .affected(TargetFilter::Typed(
                 TypedFilter::card().controller(ControllerRef::You),
@@ -12454,6 +12476,73 @@ fn morophon_reduces_colored_mana_for_chosen_creature_type() {
             shards: vec![],
         }
     );
+}
+
+/// CR 601.2f: "If multiple cost reductions apply, the player may apply them in
+/// any order." Once reaches are mixed those reductions stop commuting, so the
+/// order the engine happens to collect them in must not be what decides the
+/// cost.
+///
+/// On {1}{W} with a {W} `ColoredManaOnly` reducer and a {W} `SpillsToGeneric`
+/// reducer, the colored-only-first order gives {0} (the colored-only unit takes
+/// the pip; the spillover unit falls through to generic), while the reverse
+/// gives {1} (the spillover unit takes the pip; the colored-only unit has
+/// nothing to match and is discarded). The caster is entitled to the {0}, so
+/// BOTH collection orders must produce it.
+///
+/// Reach guard: the second permutation is the one that was wrong before this
+/// fix — it returned {1} when the reductions were applied in collection order.
+#[test]
+fn mixed_reach_reductions_do_not_let_collection_order_decide_the_cost() {
+    fn reducer(reach: CostReductionReach, ordinal: u8) -> CostModification {
+        CostModification {
+            is_raise: false,
+            amount: ManaCost::Cost {
+                generic: 0,
+                shards: vec![ManaCostShard::White],
+            },
+            multiplier: 1,
+            reach,
+            provenance: crate::types::casting_costs::ReductionProvenance::Static {
+                source: ObjectId(900),
+                ordinal,
+            },
+            display_name: "Test reducer".to_string(),
+        }
+    }
+
+    for (label, collected) in [
+        (
+            "colored-only collected first",
+            vec![
+                reducer(CostReductionReach::ColoredManaOnly, 0),
+                reducer(CostReductionReach::SpillsToGeneric, 1),
+            ],
+        ),
+        (
+            "spillover collected first",
+            vec![
+                reducer(CostReductionReach::SpillsToGeneric, 0),
+                reducer(CostReductionReach::ColoredManaOnly, 1),
+            ],
+        ),
+    ] {
+        let mut mana_cost = ManaCost::Cost {
+            generic: 1,
+            shards: vec![ManaCostShard::White],
+        };
+        apply_cost_modifications_in_order(&mut mana_cost, &collected);
+
+        assert_eq!(
+            mana_cost,
+            ManaCost::Cost {
+                generic: 0,
+                shards: vec![],
+            },
+            "{label}: CR 601.2f entitles the caster to the cheapest ordering, so \
+             collection order must not change the result"
+        );
+    }
 }
 
 /// CR 601.2f + CR 102.2/102.3: Heliod, the Warped Eclipse, in a 3-player
@@ -12502,6 +12591,7 @@ fn heliod_warped_eclipse_reduces_by_sum_of_opponents_draws() {
                         aggregate: AggregateFunction::Sum,
                     },
                 }),
+                reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
             })
             .affected(TargetFilter::Typed(
                 TypedFilter::card().controller(ControllerRef::You),
@@ -13186,6 +13276,7 @@ fn target_gated_self_cost_reduction_applies_after_target_selection() {
                 },
             ]))),
             dynamic_count: None,
+            reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
         })
         .affected(TargetFilter::SelfRef);
         def.active_zones = crate::types::zones::self_spell_cost_mod_active_zones();
@@ -13315,6 +13406,7 @@ fn nested_stack_target_self_cost_reduction_matches_stack_entry_targets() {
                 },
             ]))),
             dynamic_count: None,
+            reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
         })
         .affected(TargetFilter::SelfRef);
         def.active_zones = crate::types::zones::self_spell_cost_mod_active_zones();
@@ -18427,6 +18519,7 @@ fn defiler_auto_cast_remains_offered_and_reaches_defiler_payment() {
                 shards: vec![ManaCostShard::Green],
                 generic: 0,
             },
+            reach: crate::types::statics::CostReductionReach::ColoredManaOnly,
         }));
     let action = GameAction::CastSpell {
         object_id: spell,
@@ -19244,7 +19337,7 @@ fn cast_with_keyword_convoke_honors_from_exile_filter() {
                 card_filter: None,
                 single_use_group: None,
                 single_use: false,
-                cast_cost_raise: None,
+                cast_cost_modifier: None,
                 alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
@@ -19348,7 +19441,7 @@ fn convoke_from_exile_stacks_with_red_spell_cost_reduction_on_hybrid_cost() {
                 card_filter: None,
                 single_use_group: None,
                 single_use: false,
-                cast_cost_raise: None,
+                cast_cost_modifier: None,
                 alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
@@ -19523,7 +19616,7 @@ fn play_from_exile_grant_binds_to_grantee_and_carries_any_mana_permission() {
                 card_filter: None,
                 single_use_group: None,
                 single_use: false,
-                cast_cost_raise: None,
+                cast_cost_modifier: None,
                 alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
@@ -19583,6 +19676,7 @@ fn cast_from_zone_exile_rider_exiles_graveyard_cast_on_resolution() {
             mana_spend_permission: None,
             additional_cost: None,
             driver: CastFromZoneDriver::LingeringPermission,
+            cast_cost_modifier: None,
         },
         vec![TargetRef::Object(instant)],
         ObjectId(9001),
@@ -19726,6 +19820,7 @@ fn cast_from_exile_library_bottom_rider_bottoms_resolved_spell() {
             mana_spend_permission: None,
             additional_cost: None,
             driver: CastFromZoneDriver::LingeringPermission,
+            cast_cost_modifier: None,
         },
         vec![TargetRef::Object(spell)],
         kylox,
@@ -19839,6 +19934,7 @@ fn graveyard_timed_alt_cost_grant_is_castable_in_place() {
             mana_spend_permission: None,
             additional_cost: None,
             driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+            cast_cost_modifier: None,
         },
         vec![TargetRef::Object(bauble)],
         ObjectId(9001),
@@ -19897,7 +19993,7 @@ fn graveyard_timed_alt_cost_grant_omits_an_artifact_land_but_keeps_its_land_play
                 card_filter: None,
                 single_use_group: None,
                 single_use: false,
-                cast_cost_raise: None,
+                cast_cost_modifier: None,
                 alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
@@ -19932,6 +20028,7 @@ fn graveyard_timed_alt_cost_grant_omits_an_artifact_land_but_keeps_its_land_play
                 mana_spend_permission: None,
                 additional_cost: None,
                 driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+                cast_cost_modifier: None,
             },
             vec![TargetRef::Object(target)],
             source,
@@ -20036,6 +20133,7 @@ fn graveyard_in_place_alt_cost_grant_is_consumed_after_one_cast() {
                 mana_spend_permission: None,
                 enters_with_counter: None,
                 enters_with_modifications: Vec::new(),
+                cast_cost_modifier: None,
             });
     }
 
@@ -20143,6 +20241,7 @@ fn graveyard_cast_this_way_enters_with_finality_counter() {
             mana_spend_permission: None,
             additional_cost: None,
             driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+            cast_cost_modifier: None,
         },
         vec![TargetRef::Object(creature)],
         ObjectId(9100),
@@ -20245,6 +20344,7 @@ fn graveyard_cast_without_rider_has_no_finality_counter() {
             mana_spend_permission: None,
             additional_cost: None,
             driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+            cast_cost_modifier: None,
         },
         vec![TargetRef::Object(creature)],
         ObjectId(9101),
@@ -20348,6 +20448,7 @@ fn graveyard_cast_this_way_enters_with_type_grant_rider() {
             mana_spend_permission: None,
             additional_cost: None,
             driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+            cast_cost_modifier: None,
         },
         vec![TargetRef::Object(creature)],
         ObjectId(9110),
@@ -20466,6 +20567,7 @@ fn graveyard_cast_without_type_rider_is_not_a_vampire() {
             mana_spend_permission: None,
             additional_cost: None,
             driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
+            cast_cost_modifier: None,
         },
         vec![TargetRef::Object(creature)],
         ObjectId(9111),
@@ -20554,6 +20656,7 @@ fn enters_with_counter_does_not_leak_from_non_consumed_permission() {
                     mana_spend_permission: None,
                     enters_with_counter: rider_on_consumed.clone(),
                     enters_with_modifications: Vec::new(),
+                    cast_cost_modifier: None,
                 });
             // P2: foreign-granted (to the opponent) so it never supports
             // PlayerId(0)'s cast — it is the non-consumed sibling carrying the
@@ -20572,6 +20675,7 @@ fn enters_with_counter_does_not_leak_from_non_consumed_permission() {
                     mana_spend_permission: None,
                     enters_with_counter: Some(CounterType::Finality),
                     enters_with_modifications: Vec::new(),
+                    cast_cost_modifier: None,
                 });
         }
 
@@ -20670,6 +20774,7 @@ fn exact_permission_does_not_inherit_sibling_etb_counter() {
                     enters_with_counter,
                     enters_with_modifications: Vec::new(),
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
         }
     }
@@ -20764,6 +20869,7 @@ fn exact_permission_does_not_inherit_sibling_permanent_modification() {
                     enters_with_counter: None,
                     enters_with_modifications,
                     mana_spend_permission: None,
+                    cast_cost_modifier: None,
                 });
         }
     }
@@ -20828,6 +20934,7 @@ fn hand_alt_cost_permission_overrides_printed_mana_cost() {
                 mana_spend_permission: None,
                 enters_with_counter: None,
                 enters_with_modifications: Vec::new(),
+                cast_cost_modifier: None,
             });
     }
 
@@ -20879,6 +20986,7 @@ fn beseech_style_permission() -> CastingPermission {
         mana_spend_permission: None,
         enters_with_counter: None,
         enters_with_modifications: Vec::new(),
+        cast_cost_modifier: None,
     }
 }
 
@@ -20921,6 +21029,7 @@ fn failing_mana_value_permission_does_not_override_unconstrained_permission() {
                 mana_spend_permission: None,
                 enters_with_counter: None,
                 enters_with_modifications: Vec::new(),
+                cast_cost_modifier: None,
             });
     }
 
@@ -20990,7 +21099,7 @@ fn once_per_turn_collection_counter_play_permission_requires_live_source_static(
                 card_filter: None,
                 single_use_group: None,
                 single_use: false,
-                cast_cost_raise: None,
+                cast_cost_modifier: None,
                 alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
@@ -21066,7 +21175,7 @@ fn collection_counter_play_permission_is_once_per_turn() {
                 card_filter: None,
                 single_use_group: None,
                 single_use: false,
-                cast_cost_raise: None,
+                cast_cost_modifier: None,
                 alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
@@ -24509,6 +24618,7 @@ fn install_first_kicked_spell_reducer(state: &mut GameState, player: PlayerId) -
                 amount: ManaCost::generic(1),
                 spell_filter: Some(kicked_filter.clone()),
                 dynamic_count: None,
+                reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
             })
             .affected(TargetFilter::Typed(
                 TypedFilter::card().controller(ControllerRef::You),
@@ -25400,6 +25510,7 @@ fn add_esior_style_tax(state: &mut GameState) -> ObjectId {
                 amount: ManaCost::generic(3),
                 spell_filter: Some(spell_filter),
                 dynamic_count: None,
+                reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
             })
             .affected(TargetFilter::Typed(
                 TypedFilter::card().controller(ControllerRef::Opponent),
@@ -27992,6 +28103,7 @@ fn prototype_from_exile_uses_play_permission_any_color_not_alt_cost_sibling() {
             mana_spend_permission: None,
             enters_with_counter: None,
             enters_with_modifications: Vec::new(),
+            cast_cost_modifier: None,
         },
         CastingPermission::PlayFromExile {
             provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
@@ -28006,7 +28118,7 @@ fn prototype_from_exile_uses_play_permission_any_color_not_alt_cost_sibling() {
             card_filter: None,
             single_use_group: None,
             single_use: false,
-            cast_cost_raise: None,
+            cast_cost_modifier: None,
             alt_ability_cost: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
         },
@@ -28432,7 +28544,13 @@ fn cost_reduction_removes_matching_colored_symbols() {
         generic: 0,
         shards: vec![ManaCostShard::White, ManaCostShard::Blue],
     };
-    apply_cost_mod_to_mana(&mut cost, &reduction, 1, false);
+    apply_cost_mod_to_mana(
+        &mut cost,
+        &reduction,
+        1,
+        false,
+        crate::types::statics::CostReductionReach::SpillsToGeneric,
+    );
     assert_eq!(
         cost,
         ManaCost::Cost {
@@ -28452,7 +28570,13 @@ fn colored_cost_reduction_can_remove_hybrid_symbol_once() {
         generic: 0,
         shards: vec![ManaCostShard::White, ManaCostShard::Blue],
     };
-    apply_cost_mod_to_mana(&mut cost, &reduction, 1, false);
+    apply_cost_mod_to_mana(
+        &mut cost,
+        &reduction,
+        1,
+        false,
+        crate::types::statics::CostReductionReach::SpillsToGeneric,
+    );
     assert_eq!(
         cost,
         ManaCost::Cost {
@@ -28483,7 +28607,13 @@ fn colored_cost_reduction_spills_to_generic_when_cost_has_no_matching_color() {
             ManaCostShard::Green,
         ],
     };
-    apply_cost_mod_to_mana(&mut cost, &reduction, 1, false);
+    apply_cost_mod_to_mana(
+        &mut cost,
+        &reduction,
+        1,
+        false,
+        crate::types::statics::CostReductionReach::SpillsToGeneric,
+    );
     assert_eq!(
         cost,
         ManaCost::Cost {
@@ -28513,7 +28643,13 @@ fn colored_cost_reduction_spills_excess_beyond_matching_color_to_generic() {
             ManaCostShard::Green,
         ],
     };
-    apply_cost_mod_to_mana(&mut cost, &reduction, 1, false);
+    apply_cost_mod_to_mana(
+        &mut cost,
+        &reduction,
+        1,
+        false,
+        crate::types::statics::CostReductionReach::SpillsToGeneric,
+    );
     assert_eq!(
         cost,
         ManaCost::Cost {
@@ -28536,7 +28672,13 @@ fn colored_cost_reduction_never_touches_mismatched_color_pip() {
         generic: 0,
         shards: vec![ManaCostShard::White],
     };
-    apply_cost_mod_to_mana(&mut cost, &reduction, 1, false);
+    apply_cost_mod_to_mana(
+        &mut cost,
+        &reduction,
+        1,
+        false,
+        crate::types::statics::CostReductionReach::SpillsToGeneric,
+    );
     assert_eq!(
         cost,
         ManaCost::Cost {
@@ -28594,6 +28736,7 @@ fn battlefield_cost_increase_applies_before_reduction_floor() {
                 amount: ManaCost::generic(2),
                 spell_filter: None,
                 dynamic_count: None,
+                reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
             })
             .affected(you_spells()),
         );
@@ -28617,6 +28760,7 @@ fn battlefield_cost_increase_applies_before_reduction_floor() {
                 amount: ManaCost::generic(1),
                 spell_filter: None,
                 dynamic_count: None,
+                reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
             })
             .affected(you_spells()),
         );
@@ -28945,6 +29089,7 @@ fn self_cost_reduction_applies_after_battlefield_increase_floor() {
             amount: ManaCost::generic(2),
             spell_filter: None,
             dynamic_count: None,
+            reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
         })
         .affected(TargetFilter::SelfRef);
         reduction.active_zones = crate::types::zones::self_spell_cost_mod_active_zones();
@@ -28969,6 +29114,7 @@ fn self_cost_reduction_applies_after_battlefield_increase_floor() {
                 amount: ManaCost::generic(1),
                 spell_filter: None,
                 dynamic_count: None,
+                reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
             })
             .affected(TargetFilter::Typed(
                 TypedFilter::card().controller(ControllerRef::You),
@@ -29634,6 +29780,7 @@ fn cast_only_from_zones_blocks_affected_opponent_from_exile() {
             mana_spend_permission: None,
             enters_with_counter: None,
             enters_with_modifications: Vec::new(),
+            cast_cost_modifier: None,
         });
 
     assert!(is_blocked_by_cast_only_from_zones(
@@ -32466,7 +32613,8 @@ fn escape_phyrexian_cost_deducts_life_after_exile() {
             e,
             GameEvent::LifeChanged {
                 player_id,
-                amount: -2
+                amount: -2,
+                ..
             } if *player_id == PlayerId(0)
         )),
         "must emit LifeChanged -2 for Phyrexian life payment"
@@ -32820,6 +32968,7 @@ fn cast_with_keyword_convoke_uses_caster_not_stored_controller() {
                 mana_spend_permission: None,
                 enters_with_counter: None,
                 enters_with_modifications: Vec::new(),
+                cast_cost_modifier: None,
             });
     }
 
@@ -34145,7 +34294,7 @@ fn composite_activated_pay_life_cost_deducts_life() {
     assert!(
             events
                 .iter()
-                .any(|e| matches!(e, GameEvent::LifeChanged { player_id, amount: -1 } if *player_id == PlayerId(0))),
+                .any(|e| matches!(e, GameEvent::LifeChanged { player_id, amount: -1, .. } if *player_id == PlayerId(0))),
             "pay-life cost must emit the life-loss event"
         );
 }
@@ -34232,7 +34381,7 @@ fn phyrexian_cast_with_life_deducts_life() {
             result
                 .events
                 .iter()
-                .any(|e| matches!(e, GameEvent::LifeChanged { player_id, amount: -2 } if *player_id == PlayerId(0))),
+                .any(|e| matches!(e, GameEvent::LifeChanged { player_id, amount: -2, .. } if *player_id == PlayerId(0))),
             "CR 119.4: pay-life must emit a LifeChanged event with amount -2"
         );
 }
@@ -38226,6 +38375,7 @@ mod alt_cost_reduction_509 {
             amount: ManaCost::generic(generic),
             spell_filter: None,
             dynamic_count: None,
+            reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
         })
         .affected(TargetFilter::SelfRef);
         def.active_zones = crate::types::zones::self_spell_cost_mod_active_zones();
@@ -44592,6 +44742,7 @@ fn add_trinisphere(state: &mut GameState, owner: PlayerId) -> ObjectId {
             amount: ManaCost::generic(3),
             spell_filter: None,
             dynamic_count: None,
+            reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
         })
         .condition(StaticCondition::Not {
             condition: Box::new(StaticCondition::SourceIsTapped),
@@ -44963,6 +45114,7 @@ fn cost_floor_building_block_tops_up_generic_to_floor() {
                 amount: ManaCost::generic(5),
                 spell_filter: None,
                 dynamic_count: None,
+                reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
             }));
     }
     let spell = create_stack_spell(&mut state, PlayerId(0), ManaCost::generic(2));
@@ -45592,6 +45744,7 @@ fn normal_cost_grant(player: PlayerId, cost: ManaCost) -> crate::types::ability:
         enters_with_counter: None,
         enters_with_modifications: vec![],
         mana_spend_permission: None,
+        cast_cost_modifier: None,
     }
 }
 
@@ -45916,6 +46069,7 @@ fn free_cast_grant(player: PlayerId) -> crate::types::ability::CastingPermission
         enters_with_counter: None,
         enters_with_modifications: vec![],
         mana_spend_permission: None,
+        cast_cost_modifier: None,
     }
 }
 
@@ -45936,7 +46090,7 @@ fn play_from_exile_grant(
         card_filter: None,
         single_use_group: None,
         single_use: false,
-        cast_cost_raise: None,
+        cast_cost_modifier: None,
         alt_ability_cost: None,
         land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
         provenance: if companion {
@@ -46219,6 +46373,7 @@ fn resolution_offer_grant(
         enters_with_counter: None,
         enters_with_modifications: vec![],
         mana_spend_permission: None,
+        cast_cost_modifier: None,
     }
 }
 
@@ -46851,7 +47006,7 @@ fn add_impulse_exiled_card(
             })),
             single_use_group: Some(single_use_group),
             single_use: true,
-            cast_cost_raise: None,
+            cast_cost_modifier: None,
             alt_ability_cost: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
         });
@@ -47012,14 +47167,14 @@ fn play_from_exile_single_use_consumes_with_rider_fields() {
     for object_id in [first, second] {
         let obj = state.objects.get_mut(&object_id).unwrap();
         let CastingPermission::PlayFromExile {
-            cast_cost_raise,
+            cast_cost_modifier,
             land_enter_tapped,
             ..
         } = obj.casting_permissions.first_mut().unwrap()
         else {
             panic!("test helper creates PlayFromExile grants");
         };
-        *cast_cost_raise = Some(ManaCost::generic(1));
+        *cast_cost_modifier = Some(CastCostModifier::raise(ManaCost::generic(1)));
         *land_enter_tapped = crate::types::zones::EtbTapState::Tapped;
     }
 
@@ -47134,7 +47289,7 @@ fn grant_object_exile_land_play_permission(
             card_filter: None,
             single_use_group: None,
             single_use: false,
-            cast_cost_raise: None,
+            cast_cost_modifier: None,
             alt_ability_cost: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
         });
@@ -47388,7 +47543,7 @@ fn impulse_play_from_exile_land_uses_play_path_not_cast_path() {
             card_filter: None,
             single_use_group: None,
             single_use: false,
-            cast_cost_raise: None,
+            cast_cost_modifier: None,
             alt_ability_cost: None,
             land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
         });
@@ -52654,6 +52809,7 @@ fn quistis_class_grant_forwards_any_type_mana_and_pays_off_color_full_cost() {
             driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
             mana_spend_permission: Some(ManaSpendPermission::AnyTypeOrColor),
             additional_cost: None,
+            cast_cost_modifier: None,
         },
         vec![TargetRef::Object(spell)],
         ObjectId(9200),
@@ -52973,6 +53129,7 @@ fn resolve_graveyard_paid_grant_with_permission(
             driver: crate::types::ability::CastFromZoneDriver::DuringResolution,
             mana_spend_permission: Some(mana_spend_permission),
             additional_cost: None,
+            cast_cost_modifier: None,
         },
         vec![TargetRef::Object(spell)],
         ObjectId(9200),
@@ -52998,6 +53155,7 @@ fn resolve_graveyard_paid_grant_with_exile_rider(state: &mut GameState, spell: O
             driver: crate::types::ability::CastFromZoneDriver::DuringResolution,
             mana_spend_permission: Some(ManaSpendPermission::AnyColor),
             additional_cost: None,
+            cast_cost_modifier: None,
         },
         vec![TargetRef::Object(spell)],
         ObjectId(9200),
@@ -53569,6 +53727,7 @@ fn paid_cast_with_explicit_duration_remains_a_lingering_permission() {
             driver: crate::types::ability::CastFromZoneDriver::DuringResolution,
             mana_spend_permission: None,
             additional_cost: None,
+            cast_cost_modifier: None,
         },
         vec![TargetRef::Object(spell)],
         ObjectId(9200),
@@ -53803,6 +53962,7 @@ fn graveyard_paid_offer_uses_exact_appended_permission_over_conflicting_sibling(
             enters_with_counter: None,
             enters_with_modifications: Vec::new(),
             mana_spend_permission: None,
+            cast_cost_modifier: None,
         });
     add_mana(&mut state, PlayerId(0), ManaType::Red, 1);
     resolve_graveyard_paid_grant_with_exile_rider(&mut state, spell);
@@ -54973,6 +55133,7 @@ fn exact_resolution_offer_does_not_inherit_sibling_cast_transformed() {
                 enters_with_counter: None,
                 enters_with_modifications: Vec::new(),
                 mana_spend_permission: None,
+                cast_cost_modifier: None,
             });
     }
     let face_policy = crate::types::ability::ResolutionCastFacePolicy::new(
@@ -55044,7 +55205,7 @@ fn exact_resolution_offer_does_not_consume_sibling_once_per_turn_permission() {
                 card_filter: None,
                 single_use_group: None,
                 single_use: false,
-                cast_cost_raise: None,
+                cast_cost_modifier: None,
                 alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             });
@@ -55142,6 +55303,7 @@ fn exact_resolution_offer_without_concession_does_not_inherit_later_any_color_si
                 enters_with_counter: None,
                 enters_with_modifications: Vec::new(),
                 mana_spend_permission: None,
+                cast_cost_modifier: None,
             });
         obj.casting_permissions
             .push(CastingPermission::ExileWithAltCost {
@@ -55157,6 +55319,7 @@ fn exact_resolution_offer_without_concession_does_not_inherit_later_any_color_si
                 enters_with_counter: None,
                 enters_with_modifications: Vec::new(),
                 mana_spend_permission: Some(ManaSpendPermission::AnyColor),
+                cast_cost_modifier: None,
             });
     }
     add_mana(&mut state, PlayerId(0), ManaType::Red, 1);
@@ -55208,6 +55371,7 @@ fn without_paying_graveyard_free_cast_bypasses_paid_offer() {
             driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
             mana_spend_permission: None,
             additional_cost: None,
+            cast_cost_modifier: None,
         },
         vec![TargetRef::Object(spell)],
         ObjectId(9201),

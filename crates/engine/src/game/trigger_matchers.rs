@@ -2531,7 +2531,10 @@ pub(super) fn match_life_gained(
     source_context: &TriggerSourceContext,
     state: &GameState,
 ) -> bool {
-    if let GameEvent::LifeChanged { player_id, amount } = event {
+    if let GameEvent::LifeChanged {
+        player_id, amount, ..
+    } = event
+    {
         if *amount <= 0 {
             return false;
         }
@@ -2562,7 +2565,10 @@ pub(super) fn match_life_lost(
     source_context: &TriggerSourceContext,
     state: &GameState,
 ) -> bool {
-    if let GameEvent::LifeChanged { player_id, amount } = event {
+    if let GameEvent::LifeChanged {
+        player_id, amount, ..
+    } = event
+    {
         if *amount >= 0 {
             return false;
         }
@@ -2583,7 +2589,10 @@ pub(super) fn match_life_changed(
     source_context: &TriggerSourceContext,
     state: &GameState,
 ) -> bool {
-    if let GameEvent::LifeChanged { player_id, amount } = event {
+    if let GameEvent::LifeChanged {
+        player_id, amount, ..
+    } = event
+    {
         if *amount == 0 {
             return false;
         }
@@ -2710,7 +2719,37 @@ pub(super) fn match_sacrificed(
     // already be in the graveyard with its granted characteristics pruned (CR 400.7), or
     // — for a token (CR 111.7) — have ceased to exist and been removed from
     // `state.objects` by a prior SBA pass.
-    valid_card_matches_with_lki(trigger, state, *object_id, source_context)
+    if valid_card_matches_with_lki(trigger, state, *object_id, source_context) {
+        return true;
+    }
+    // CR 603.10a + CR 400.7: the sacrificed permanent's OWN "when you sacrifice
+    // ~" trigger (Carrot Cake). The source context is the departed battlefield
+    // incarnation, while the live object is already a new graveyard object, so a
+    // `SelfRef` filter answered against the live object can never hold. When the
+    // trigger's source IS the sacrificed object, answer the filter against its
+    // battlefield departure record — the same look-back authority the ceased
+    // (token) arm of `subject_filter_matches_with_lki` uses.
+    if source_event_subject_id(source_context) != *object_id {
+        return false;
+    }
+    // Bind to the departure row of THIS incarnation (the one the source context
+    // was latched from), not merely the latest move of the id: the graveyard card
+    // may already have moved again within the same batch.
+    let Some(filter) = trigger.valid_card.as_ref() else {
+        return false;
+    };
+    let Some(record) = state.zone_changes_this_turn.iter().rev().find(|change| {
+        change.object_id == *object_id
+            && change.from_zone == Some(Zone::Battlefield)
+            && change
+                .trigger_source_context
+                .as_ref()
+                .is_some_and(|ctx| ctx.identity.reference == source_context.identity.reference)
+    }) else {
+        return false;
+    };
+    let ctx = super::filter::FilterContext::from_trigger_source(source_context);
+    super::filter::matches_target_filter_on_zone_change_record(state, record, filter, &ctx)
 }
 
 pub(super) fn match_destroyed(
@@ -10588,6 +10627,7 @@ mod tests {
         let event = GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: 3,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         assert!(match_life_gained(
             &event,
@@ -10599,6 +10639,7 @@ mod tests {
         let loss_event = GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: -3,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         assert!(!match_life_gained(
             &loss_event,
@@ -10615,6 +10656,7 @@ mod tests {
         let event = GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: -3,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         assert!(match_life_lost(
             &event,
@@ -10626,6 +10668,7 @@ mod tests {
         let gain_event = GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: 3,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         assert!(!match_life_lost(
             &gain_event,
@@ -10646,6 +10689,7 @@ mod tests {
         let loss_one = GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: -1,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         assert!(match_life_lost(
             &loss_one,
@@ -10657,6 +10701,7 @@ mod tests {
         let loss_two = GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: -2,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         assert!(!match_life_lost(
             &loss_two,
@@ -10676,6 +10721,7 @@ mod tests {
         let loss_two = GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: -2,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         assert!(!match_life_lost(
             &loss_two,
@@ -10687,6 +10733,7 @@ mod tests {
         let loss_four = GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: -4,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         assert!(match_life_lost(
             &loss_four,

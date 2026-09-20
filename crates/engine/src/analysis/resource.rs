@@ -7024,6 +7024,14 @@ fn normalized_stack_entries(state: &GameState) -> Vec<(StackEntry, Option<Trigge
                 } => crate::game::triggers::normalize_ability_identity(ability),
                 StackEntryKind::Spell { ability: None, .. }
                 | StackEntryKind::KeywordAction { .. } => {}
+                // The payload keeps its `ObjectIncarnationRef`s: `norm.id` /
+                // `norm.source_id` zeroing does not reach inside it, so two
+                // otherwise-identical entries normalize unequal. That is
+                // fail-safe here — retained content differences only SUPPRESS a
+                // coverability match, never manufacture one (see this
+                // function's own contract). Re-audit when these entries carry
+                // live assignments.
+                StackEntryKind::CombatDamage { .. } => {}
             }
             (norm, firing)
         })
@@ -7244,7 +7252,11 @@ fn stack_entry_resolution_choice_freedom(
         }
         StackEntryKind::Spell { .. }
         | StackEntryKind::ActivatedAbility { .. }
-        | StackEntryKind::KeywordAction { .. } => ResolutionChoiceFreedom::MayPrompt,
+        | StackEntryKind::KeywordAction { .. }
+        // Fail-closed, per the classifier's contract: a choice-free verdict is
+        // a soundness claim requiring a resolver trace, and this kind has no
+        // resolver until combat-damage timing lands.
+        | StackEntryKind::CombatDamage { .. } => ResolutionChoiceFreedom::MayPrompt,
     }
 }
 
@@ -9679,6 +9691,48 @@ mod tests {
                 provenance: None,
             },
         }
+    }
+
+    /// CR 119.1 + CR 732.2a: two drain-cycle points whose stacks hold the same life-gain
+    /// trigger, differing only in the life TOTAL that trigger's firing event reports
+    /// (CR 603.7c), must compare modulo-EQUAL. The reported total is the projected
+    /// resource itself, so leaving it in compared content makes every drain cycle look
+    /// distinct and the loop is never certified. The control pair — a different life-change
+    /// AMOUNT — must still compare UNEQUAL: the projection drops the reading, never the
+    /// change.
+    ///
+    /// Revert proof: giving `LifeTotalReading` a derived `PartialEq` flips the first
+    /// assertion to `false`.
+    #[test]
+    fn modulo_equal_ignores_a_carried_life_total_reading() {
+        use crate::types::events::GameEvent;
+        use crate::types::game_state::StackEntryKind;
+
+        fn cycle_point(amount: i32, reported_total: i32) -> GameState {
+            let mut state = GameState::new_two_player(7);
+            state.players[1].life = reported_total;
+            let mut entry = trigger_entry(1, 500, 0);
+            if let StackEntryKind::TriggeredAbility { trigger_event, .. } = &mut entry.kind {
+                *trigger_event = Some(GameEvent::LifeChanged {
+                    player_id: PlayerId(1),
+                    amount,
+                    new_total: crate::types::events::LifeTotalReading(Some(reported_total)),
+                });
+            }
+            state.stack.push_back(entry);
+            state
+        }
+
+        assert!(
+            loop_states_equal_modulo_resources(&cycle_point(-1, 199), &cycle_point(-1, 198)),
+            "two drain cycles differing only in the life total their firing event reports \
+             must stay modulo-equal (CR 732.2a), or the loop is never certified"
+        );
+        assert!(
+            !loop_states_equal_modulo_resources(&cycle_point(-1, 199), &cycle_point(-2, 198)),
+            "a different life-change amount is a real difference in the period and must \
+             still compare UNEQUAL"
+        );
     }
 
     /// The modulo comparator must treat two cascade cycle points whose stacks hold
@@ -13140,6 +13194,7 @@ mod tests {
             amount: ManaCost::default(),
             spell_filter: None,
             dynamic_count,
+            reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
         };
         assert!(
             !cover_with_static_on_stable(modify(Some(object_count_ref()))),
@@ -17853,6 +17908,7 @@ mod tests {
             amount: ManaCost::NoCost,
             spell_filter: None,
             dynamic_count: None,
+            reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
         })
         .affected(TargetFilter::SelfRef)
         .condition(StaticCondition::QuantityComparison {
@@ -18056,6 +18112,7 @@ mod tests {
                 amount: ManaCost::NoCost,
                 spell_filter: None,
                 dynamic_count: None,
+                reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
             })
             .affected(TargetFilter::SelfRef)
             .condition(StaticCondition::QuantityComparison {

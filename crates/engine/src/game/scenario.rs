@@ -615,6 +615,27 @@ impl GameScenario {
         }
     }
 
+    /// Add a land card to a player's exile. Returns a `CardBuilder` for fluent
+    /// chaining. Used to stage land-play permissions from exile.
+    pub fn add_land_to_exile(&mut self, player: PlayerId, name: &str) -> CardBuilder<'_> {
+        let card_id = CardId(self.state.next_object_id);
+        let id = create_object(
+            &mut self.state,
+            card_id,
+            player,
+            name.to_string(),
+            Zone::Exile,
+        );
+        let obj = self.state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Land);
+        obj.base_card_types = obj.card_types.clone();
+
+        CardBuilder {
+            state: &mut self.state,
+            id,
+        }
+    }
+
     // --- Oracle text convenience constructors ---
 
     /// Add a creature to the battlefield with abilities parsed from Oracle text.
@@ -2033,6 +2054,7 @@ impl GameRunner {
             WaitingFor::CostTypeChoice { .. } => "CostTypeChoice",
             WaitingFor::SpliceOffer { .. } => "SpliceOffer",
             WaitingFor::DefilerPayment { .. } => "DefilerPayment",
+            WaitingFor::OrderCostReductions { .. } => "OrderCostReductions",
             WaitingFor::CastOffer {
                 kind: CastOfferKind::Adventure { .. },
                 ..

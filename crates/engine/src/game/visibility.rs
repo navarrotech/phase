@@ -138,6 +138,10 @@ fn redact_paid_cast_cleanup_authority(waiting_for: &mut WaitingFor) {
         | WaitingFor::ChooseGiftRecipient { .. }
         | WaitingFor::SpliceOffer { .. }
         | WaitingFor::DefilerPayment { .. }
+        // CR 601.2f: the cost-reduction order election pauses cost determination,
+        // well before a resolution-owned paid cast exists, so it carries no
+        // cleanup authority to redact.
+        | WaitingFor::OrderCostReductions { .. }
         | WaitingFor::ModalFaceChoice { .. }
         | WaitingFor::AlternativeCastChoice { .. }
         | WaitingFor::MutateMergeChoice { .. }
@@ -2198,8 +2202,21 @@ pub fn filter_state_for_viewer(state: &GameState, viewer: PlayerId) -> GameState
     // (object_id, card_id, ability, cost) — the card's identity is already visible via
     // the stack object.
 
+    // CR 100.4: a sideboard is the group of additional cards a player may use to
+    // modify their deck between games of a match, so the only moment a projection must
+    // carry deck-pool contents is while that player's own sideboarding prompt is live.
+    // Outside it the pools are registration data no viewer reads — `sideboard_projection`
+    // and the client's BetweenGamesSideboard modal are their only consumers, and both run
+    // under this prompt. The gate is the owner, not `can_view_private_for_player`: CR 723.5b
+    // bars a player controlling another from making choices the tournament rules call for,
+    // and sideboarding between games is one of those, so a turn controller has no
+    // sideboarding role to serve and the seat's registered list stays with its owner.
+    let sideboarding_player = match &state.waiting_for {
+        WaitingFor::BetweenGamesSideboard { player, .. } if *player == viewer => Some(*player),
+        _ => None,
+    };
     for pool in &mut filtered.deck_pools {
-        if pool.player != viewer {
+        if Some(pool.player) != sideboarding_player {
             // Per-seat redaction: replace the Arc'd decks with fresh empties.
             // Cheaper than `make_mut + clear` because we discard the contents;
             // the original Arcs remain shared by the unfiltered state and any
@@ -2897,6 +2914,8 @@ mod tests {
             prepaid_actual_mana_spent: None,
             base_cost: None,
             declared_mana_additions: Vec::new(),
+            accepted_cost_reductions: Vec::new(),
+            cost_reduction_election: None,
             activation_cost: None,
             deferred_random_discard_cost: None,
             activation_ability_index: None,
@@ -8532,6 +8551,7 @@ mod tests {
             granted_to,
             duration: None,
             source_id: None,
+            cast_cost_modifier: None,
         }];
         (state, card)
     }
@@ -8678,6 +8698,7 @@ mod tests {
                 enters_with_counter: None,
                 enters_with_modifications: Vec::new(),
                 mana_spend_permission: None,
+                cast_cost_modifier: None,
             }];
             (state, id)
         };

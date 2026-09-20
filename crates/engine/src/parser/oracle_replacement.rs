@@ -1021,7 +1021,7 @@ fn parse_search_found_replacement(original: &str, lower: &str) -> Option<Replace
                 card_filter: None,
                 single_use_group: None,
                 single_use: false,
-                cast_cost_raise: None,
+                cast_cost_modifier: None,
                 alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 invalidation: None,
@@ -28072,7 +28072,7 @@ mod opposition_agent_parser_tests {
                     card_filter: None,
                     single_use_group: None,
                     single_use: false,
-                    cast_cost_raise: None,
+                    cast_cost_modifier: None,
                     alt_ability_cost: None,
                     invalidation: None,
                     ..

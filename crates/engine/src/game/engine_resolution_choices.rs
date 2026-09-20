@@ -495,7 +495,7 @@ pub(crate) fn grant_search_found_permission_after_delivery(
                 card_filter: None,
                 single_use_group: None,
                 single_use: false,
-                cast_cost_raise: None,
+                cast_cost_modifier: None,
                 alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                 invalidation: None,
@@ -3353,8 +3353,15 @@ pub(super) fn handle_resolution_choice(
                     // (#6410).
                     let mut cost = base_cost.clone();
                     cost.concretize_x(amount);
+                    // CR 605.3b + CR 616.1: `pay_unless_cost` below has no resume
+                    // root, so a mana source that would pause for a replacement
+                    // choice cannot fund this payment.
                     if !casting::can_pay_effect_mana_cost_after_auto_tap(
-                        state, player, source_id, &cost,
+                        state,
+                        player,
+                        source_id,
+                        &cost,
+                        casting::PausedManaPayment::Unresumable,
                     ) {
                         return Err(EngineError::InvalidAction(format!(
                             "Player {:?} cannot pay {}",
@@ -9682,6 +9689,7 @@ mod tests {
                 enters_with_counter: None,
                 enters_with_modifications: Vec::new(),
                 mana_spend_permission: None,
+                cast_cost_modifier: None,
             });
 
         let window = WaitingFor::CastOffer {
@@ -9793,7 +9801,7 @@ mod tests {
                     card_filter: None,
                     single_use_group: None,
                     single_use: false,
-                    cast_cost_raise: None,
+                    cast_cost_modifier: None,
                     alt_ability_cost: None,
                     land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
                     invalidation: None,

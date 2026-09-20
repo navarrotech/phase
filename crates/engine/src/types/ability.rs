@@ -28,7 +28,7 @@ use super::phase::Phase;
 use super::player::{PlayerCounterKind, PlayerId};
 use super::proposed_event::AppliedReplacementKey;
 use super::replacements::ReplacementEvent;
-use super::statics::{ActivationExemption, CastFrequency, StaticMode};
+use super::statics::{ActivationExemption, CastFrequency, CostModifyMode, StaticMode};
 use super::stickers::{AppliedSticker, StickerKind};
 use super::triggers::TriggerMode;
 use super::zones::{EtbTapState, Zone};
@@ -2338,6 +2338,21 @@ pub const CAST_BOUND_LOST_TO_DURATION_GAP: &str = "duration_scoped_cast_bound";
 /// takes that route (issue #8775).
 pub const ADDITIONAL_COST_ON_LINGERING_CAST_GAP: &str = "additional_cost_on_lingering_cast";
 
+/// CR 601.2f + CR 608.2c: The parser gap name for a "[each/a] spell cast this
+/// way costs {N} more/less to cast" rider (CR 608.2c binds "this way" to the
+/// immediately-preceding grant) that no preceding grant can carry.
+///
+/// Two shapes reach it: the rider sentence found no host at all, and the host
+/// it found is an `Effect::CastFromZone` on a driver with no cost-modifier slot
+/// (`DuringResolution` / `ResolutionWindow` cast through
+/// `initiate_cast_during_resolution` / `open_resolution_cast_window`, neither of
+/// which records one). Lowering either shape as a standalone clause would price
+/// EVERY spell its controller casts — a board-wide `StaticMode::ModifyCost` is
+/// the wrong scope for a rider the printed text scopes to one grant — while
+/// `cargo coverage` counted the card supported. The gap keeps the clause
+/// honestly red instead.
+pub const CAST_COST_MODIFIER_WITHOUT_HOST_GAP: &str = "cast_cost_modifier_without_host";
+
 /// CR 702.104a + CR 702.104b: The outcome of the Tribute choice the chosen opponent
 /// made as the creature entered the battlefield. Persisted as a `ChosenAttribute` on
 /// the Tribute creature so the companion "if tribute wasn't paid" trigger (CR
@@ -4393,11 +4408,121 @@ impl ExileGrantCostProvenance {
     }
 }
 
+/// CR 601.2f: Why a permission-scoped [`CastCostModifier`] could not be built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum CastCostModifierError {
+    /// CR 601.2f: the cost FLOOR is the last step of total-cost determination
+    /// and is stated board-wide (Trinisphere class), never as a "spells cast
+    /// this way cost {N} more/less" rider on one grant. A permission-scoped
+    /// modifier therefore has no meaning for it, and the runtime that consumes
+    /// this type has no floor step to route it to.
+    #[error("CostModifyMode::Minimum is not supported for CastCostModifier")]
+    MinimumUnsupported,
+}
+
+/// CR 601.2f: A mana-cost modification scoped to the spells cast via ONE
+/// casting permission — "Each spell cast this way costs {1} more to cast."
+/// (Lightstall Inquisitor, Invasion of Gobakhan) and "Spells you cast this way
+/// cost {2} less to cast." (Urianger Augurelt). It is applied in the CR 601.2f
+/// total-cost step together with every other increase/reduction, so increases
+/// land before reductions and the mana component never falls below `{0}`.
+///
+/// CR 118.9d: cost increases and reductions apply to a spell's total cost
+/// whether that total is built from the printed mana cost or from an
+/// alternative cost, so the same rider rides on `PlayFromExile`,
+/// `ExileWithAltCost`, and `ExileWithAltAbilityCost` grants alike.
+///
+/// CR 305.1: a land is played as a special action and "is never a spell", so a
+/// `mode: Play` grant's land half is never modified by this — only its
+/// spell-cast half is.
+///
+/// Direction is the existing [`CostModifyMode`] axis, not a second
+/// `cast_cost_reduce` sibling field. The fields are private: the only ways to
+/// build one are [`CastCostModifier::new`], [`CastCostModifier::raise`], and
+/// [`CastCostModifier::reduce`], all of which refuse
+/// [`CostModifyMode::Minimum`], and the hand-written [`Deserialize`] applies
+/// the same refusal so no wire payload can smuggle in a mode the runtime has
+/// no step for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CastCostModifier {
+    mode: CostModifyMode,
+    amount: ManaCost,
+}
+
+impl CastCostModifier {
+    /// CR 601.2f: build a permission-scoped modifier, rejecting
+    /// [`CostModifyMode::Minimum`] (see [`CastCostModifierError`]).
+    pub fn new(mode: CostModifyMode, amount: ManaCost) -> Result<Self, CastCostModifierError> {
+        match mode {
+            CostModifyMode::Raise | CostModifyMode::Reduce => Ok(Self { mode, amount }),
+            CostModifyMode::Minimum => Err(CastCostModifierError::MinimumUnsupported),
+        }
+    }
+
+    /// CR 601.2f: "… costs {N} more to cast."
+    pub fn raise(amount: ManaCost) -> Self {
+        Self {
+            mode: CostModifyMode::Raise,
+            amount,
+        }
+    }
+
+    /// CR 601.2f: "… cost {N} less to cast."
+    pub fn reduce(amount: ManaCost) -> Self {
+        Self {
+            mode: CostModifyMode::Reduce,
+            amount,
+        }
+    }
+
+    /// The direction this modifier moves the total cost in.
+    pub fn mode(&self) -> CostModifyMode {
+        self.mode
+    }
+
+    /// The printed amount the total cost moves by.
+    pub fn amount(&self) -> &ManaCost {
+        &self.amount
+    }
+}
+
+/// Wire shapes accepted for a [`CastCostModifier`].
+///
+/// `Modern` is what is written today. `LegacyRaise` is the bare `ManaCost` the
+/// field held before the direction axis existed, when the only printed form was
+/// an increase — so it loads as [`CostModifyMode::Raise`]. `ManaCost` is
+/// internally tagged (`type`), and the modern form has no `type` key, so the
+/// two shapes are unambiguous.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CastCostModifierRepr {
+    Modern {
+        mode: CostModifyMode,
+        amount: ManaCost,
+    },
+    LegacyRaise(ManaCost),
+}
+
+impl<'de> Deserialize<'de> for CastCostModifier {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let (mode, amount) = match CastCostModifierRepr::deserialize(deserializer)? {
+            CastCostModifierRepr::Modern { mode, amount } => (mode, amount),
+            CastCostModifierRepr::LegacyRaise(amount) => (CostModifyMode::Raise, amount),
+        };
+        // CR 601.2f: the same refusal `new` applies, so a deserialized grant can
+        // never carry a mode the runtime has no step for.
+        Self::new(mode, amount).map_err(de::Error::custom)
+    }
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum CastingPermission {
-    /// CR 715.5: After Adventure resolves to exile, creature face castable from exile.
+    /// CR 715.3d: After Adventure resolves to exile, creature face castable from exile.
     AdventureCreature,
     /// Card may be cast from exile for the specified cost by its owner.
     /// Building block for Airbending, Suspend, and similar "cast from exile" mechanics.
@@ -4530,6 +4655,14 @@ pub enum CastingPermission {
         /// payment unchanged for every other exile/graveyard alt-cost grant.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         mana_spend_permission: Option<ManaSpendPermission>,
+        /// CR 601.2f + CR 118.9d: Optional cost modification for the spell cast
+        /// under this grant — "Spells you cast this way cost {2} less to cast."
+        /// (Urianger Augurelt). CR 118.9d: increases and reductions apply to a
+        /// total cost built from an alternative cost exactly as they do to one
+        /// built from the printed mana cost, so an alternative-cost grant is a
+        /// legitimate carrier. `None` for every grant with no printed rider.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cast_cost_modifier: Option<CastCostModifier>,
     },
     /// CR 400.7i: Play from exile until duration expires (impulse draw).
     /// Building block for "exile top N, choose one, you may play it this turn" patterns.
@@ -4607,10 +4740,23 @@ pub enum CastingPermission {
         /// within-window impulse-draw behavior.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         single_use: bool,
-        /// CR 601.2f: Optional mana-cost raise for spells cast via this permission
-        /// ("Each spell cast this way costs {1} more to cast." — Lightstall Inquisitor).
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        cast_cost_raise: Option<ManaCost>,
+        /// CR 601.2f: Optional mana-cost modification for spells cast via this
+        /// permission ("Each spell cast this way costs {1} more to cast." —
+        /// Lightstall Inquisitor; "Spells you cast this way cost {2} less to
+        /// cast." — Urianger Augurelt). CR 305.1: a land played via this same
+        /// grant is never a spell, so the land half is unaffected.
+        ///
+        /// Serde: the legacy key named in the `alias` below held a bare
+        /// `ManaCost` that was always an increase. The key is accepted by that
+        /// `alias`; the bare payload is accepted by [`CastCostModifier`]'s own
+        /// `Deserialize`. Both spellings name this one field, so carrying both
+        /// is a duplicate-field error rather than a silent last-one-wins.
+        #[serde(
+            default,
+            alias = "cast_cost_raise",
+            skip_serializing_if = "Option::is_none"
+        )]
+        cast_cost_modifier: Option<CastCostModifier>,
         /// CR 118.9 + CR 119.4: Optional non-mana alternative cost that REPLACES
         /// the mana cost for a spell cast via this permission ("If you cast a
         /// spell this way, pay life equal to its mana value rather than pay its
@@ -4699,6 +4845,13 @@ pub enum CastingPermission {
         /// grants serialized before the field existed carry `None`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_id: Option<ObjectId>,
+        /// CR 601.2f + CR 118.9d: Mirrors `ExileWithAltCost.cast_cost_modifier`
+        /// — the "spells cast this way cost {N} more/less to cast" rider still
+        /// modifies the total cost when the base of that total is a non-mana
+        /// alternative cost (CR 118.9d). `None` for every grant with no printed
+        /// rider.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cast_cost_modifier: Option<CastCostModifier>,
     },
     /// CR 702.185a: Warp — card may be cast from exile at its normal mana cost,
     /// but only after the specified turn ends. Persists for as long as card remains exiled.
@@ -4853,6 +5006,49 @@ impl CastingPermission {
             | Self::WarpExile { .. }
             | Self::Plotted { .. }
             | Self::Foretold { .. } => (None, None),
+        }
+    }
+
+    /// CR 601.2f: read the cost modification this permission applies to a spell
+    /// cast under it — "Each spell cast this way costs {1} more to cast."
+    /// (Lightstall Inquisitor), "Spells you cast this way cost {2} less to
+    /// cast." (Urianger Augurelt).
+    ///
+    /// This is the single place that knows WHICH variants can carry a
+    /// permission-scoped cost modifier, exactly as [`Self::lifetime`] is for
+    /// stated lifetimes. Cost determination reads a permission through it
+    /// rather than matching one variant and silently pricing the other two at
+    /// their unmodified cost.
+    ///
+    /// The match is wildcard-free, so a new permission variant is a COMPILE
+    /// ERROR here and must state whether it can carry a modifier.
+    ///
+    /// CR 305.1: this answers for a *cast*. A land played under a `mode: Play`
+    /// grant is never a spell, so the land-play path never consults it.
+    pub fn cast_cost_modifier(&self) -> Option<&CastCostModifier> {
+        match self {
+            // CR 118.9d: a cost increase/reduction applies to the total cost
+            // whether it was built from the printed mana cost or from an
+            // alternative one, so all three carrying forms answer alike.
+            Self::PlayFromExile {
+                cast_cost_modifier, ..
+            }
+            | Self::ExileWithAltCost {
+                cast_cost_modifier, ..
+            }
+            | Self::ExileWithAltAbilityCost {
+                cast_cost_modifier, ..
+            } => cast_cost_modifier.as_ref(),
+            // CR 702.170a + CR 702.143a + CR 715.3d: the card-native exile
+            // casting methods carry their own printed cost and no grant-scoped
+            // rider slot — no printed card attaches a "cast this way costs
+            // {N} more/less" rider to Adventure, Energy, Warp, Plot, or
+            // Foretell.
+            Self::AdventureCreature
+            | Self::ExileWithEnergyCost
+            | Self::WarpExile { .. }
+            | Self::Plotted { .. }
+            | Self::Foretold { .. } => None,
         }
     }
 }
@@ -6229,8 +6425,12 @@ pub enum FilterProp {
     /// count predicates like Valakut, the Molten Pinnacle's "if you control at
     /// least five other Mountains" — here "other" means "other than the newly-
     /// entered Mountain," not "other than Valakut." Resolves against
-    /// `FilterContext::triggering_object_id`, populated at trigger-condition
+    /// `FilterContext::triggering_object`, populated at trigger-condition
     /// evaluation from the current `GameEvent`.
+    ///
+    /// CR 400.7: the exclusion is keyed on the triggering object's exact IDENTITY
+    /// (id + incarnation), not on its storage id — an object that left and
+    /// returned is a new object and belongs back in the population.
     OtherThanTriggerObject,
     /// Matches objects with a specific color (for "white creature", "red spell", etc.).
     HasColor {
@@ -12869,6 +13069,77 @@ impl AbilityCost {
         }
     }
 
+    /// Visit every node of this cost tree in pre-order, recursing the container
+    /// arms (`Composite`, `OneOf`, `PerCounter`). The exhaustive match keeps
+    /// the traversal shape in lockstep with the enum — a new container variant
+    /// is a compile error here rather than a silently missed subtree — so every
+    /// cost-tree consumer (containment, coverage's parsed-item and gap
+    /// collectors) traverses the same complete shape.
+    pub(crate) fn for_each_cost_node<'a>(&'a self, visit: &mut impl FnMut(&'a AbilityCost)) {
+        visit(self);
+        match self {
+            AbilityCost::Composite { costs } | AbilityCost::OneOf { costs } => {
+                for cost in costs {
+                    cost.for_each_cost_node(visit);
+                }
+            }
+            AbilityCost::PerCounter { base, .. } => base.for_each_cost_node(visit),
+            AbilityCost::Mana { .. }
+            | AbilityCost::ManaDynamic { .. }
+            | AbilityCost::Tap
+            | AbilityCost::Untap
+            | AbilityCost::Loyalty { .. }
+            | AbilityCost::Sacrifice(_)
+            | AbilityCost::PayLife { .. }
+            | AbilityCost::Discard { .. }
+            | AbilityCost::Exile { .. }
+            | AbilityCost::ExileMaterials { .. }
+            | AbilityCost::CollectEvidence { .. }
+            | AbilityCost::ExileWithAggregate { .. }
+            | AbilityCost::TapCreatures { .. }
+            | AbilityCost::RemoveCounter { .. }
+            | AbilityCost::PayEnergy { .. }
+            | AbilityCost::PaySpeed { .. }
+            | AbilityCost::ReturnToHand { .. }
+            | AbilityCost::Unattach
+            | AbilityCost::UnattachFrom { .. }
+            | AbilityCost::Mill { .. }
+            | AbilityCost::Exert
+            | AbilityCost::Blight { .. }
+            | AbilityCost::Reveal { .. }
+            | AbilityCost::Behold { .. }
+            | AbilityCost::Waterbend { .. }
+            | AbilityCost::NinjutsuFamily { .. }
+            | AbilityCost::EffectCost { .. }
+            | AbilityCost::KeywordCostOfCastSpell { .. }
+            | AbilityCost::GetPlayerCounters { .. }
+            | AbilityCost::Unimplemented { .. } => {}
+        }
+    }
+
+    /// True when this cost tree contains an [`AbilityCost::Unimplemented`] leaf
+    /// or an [`AbilityCost::EffectCost`] whose embedded payment effect is itself
+    /// [`Effect::Unimplemented`] — either means the cost cannot be paid.
+    ///
+    /// Traversal delegates to [`AbilityCost::for_each_cost_node`], the single
+    /// cost-tree shape authority, so this predicate and coverage's parsed-item
+    /// and gap collectors cannot disagree about which subtrees exist.
+    ///
+    /// Mirrors `StaticCondition::contains_unrecognized`.
+    pub(crate) fn contains_unimplemented(&self) -> bool {
+        let mut found = false;
+        self.for_each_cost_node(&mut |node| {
+            found |= match node {
+                AbilityCost::Unimplemented { .. } => true,
+                AbilityCost::EffectCost { effect } => {
+                    matches!(effect.as_ref(), Effect::Unimplemented { .. })
+                }
+                _ => false,
+            };
+        });
+        found
+    }
+
     /// CR 601.2h + CR 602.2b: a disjunctive cost leg is resolved to the chosen
     /// instruction and the total cost is then paid as a whole.
     ///
@@ -17211,6 +17482,25 @@ pub enum Effect {
         /// driver is not `DuringResolution`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         additional_cost: Option<crate::types::mana::ManaCost>,
+        /// CR 601.2f + CR 608.2c: the "Spells you cast this way cost {N} less to
+        /// cast." / "… costs {N} more to cast." rider printed after this grant
+        /// (Urianger Augurelt's Play Arcanum). "This way" binds the rider to
+        /// THIS instruction (CR 608.2c), so it is carried here and stamped by
+        /// `cast_from_zone::record_lingering_permissions` onto each cast
+        /// permission the grant creates — never onto the CR 305.1 land-play
+        /// companion, which authorizes a land play and not a spell cast.
+        ///
+        /// Only ever `Some` when `driver` is
+        /// `CastFromZoneDriver::LingeringPermission`: that is the sole route
+        /// reaching `record_lingering_permissions`. The `DuringResolution` and
+        /// `ResolutionWindow` routes cast through
+        /// `initiate_cast_during_resolution` / `open_resolution_cast_window`,
+        /// which carry no cost-modifier slot, so the parser refuses to attach
+        /// the rider to them (`attach_cast_cost_modifier_to_prior_cast_from_zone`)
+        /// rather than drop it silently — the same discipline
+        /// `additional_cost` applies in the opposite direction.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cast_cost_modifier: Option<CastCostModifier>,
     },
     /// CR 608.2g + CR 601.2 + CR 118.9: Open an interactive "free-cast window"
     /// during this spell/ability's resolution: the controller may cast up to
@@ -28347,6 +28637,9 @@ pub struct BoardWideCostModifier<'a> {
     /// (CR 601.2f "as long as" / "during your turn" clauses). `None` is
     /// unconditional.
     pub condition: Option<&'a StaticCondition>,
+    /// CR 118.7b/c/d: whether an unmatched colored/colorless reduction unit
+    /// spills into generic mana. Only meaningful when `mode` is `Reduce`.
+    pub reach: crate::types::statics::CostReductionReach,
 }
 
 impl StaticDefinition {
@@ -28361,6 +28654,7 @@ impl StaticDefinition {
             amount,
             spell_filter,
             dynamic_count,
+            reach,
         } = &self.mode
         else {
             return None;
@@ -28378,6 +28672,7 @@ impl StaticDefinition {
             dynamic_count: dynamic_count.as_ref(),
             caster_scope: cost_modifier_caster_scope(self.affected.as_ref()),
             condition: self.condition.as_ref(),
+            reach: *reach,
         })
     }
 
@@ -31976,6 +32271,47 @@ impl ResolvedAbility {
         }
     }
 
+    /// CR 608.2c: A parsed ability chain is ONE printed ability — every link is
+    /// a later instruction of the same text, not an ability of its own. The
+    /// parser records the printed text only on the chain head, so any prompt a
+    /// chained link opens has nothing to show the player.
+    ///
+    /// That is not cosmetic. A `WaitingFor::OptionalEffectChoice` raised by a
+    /// chained link ("If you do, you may cast the copy without paying its mana
+    /// cost" — Isochron Scepter) rendered as a bare Yes/No with no question, so
+    /// declining it looked identical to dismissing a stray dialog. The player
+    /// had already paid the activation cost, and the decline silently discarded
+    /// the copy. 152 optional chain links in the 4k-card test fixture alone open
+    /// a prompt this way.
+    ///
+    /// Fill every link that carries no text of its own with the head's printed
+    /// text. A link that DOES carry its own text — a modal branch label such as
+    /// "tap" / "untap" — keeps it, while the head's text still reaches that
+    /// link's own children: one value propagated down the chain, mirroring
+    /// [`Self::set_scoped_player_recursive`]. Idempotent, so a chain built once
+    /// and re-backfilled after a later head assignment is unchanged.
+    pub fn backfill_chain_description(&mut self) {
+        let Some(description) = self.description.clone() else {
+            return;
+        };
+        self.fill_missing_link_descriptions(&description);
+    }
+
+    /// Recursive half of [`Self::backfill_chain_description`], kept separate so
+    /// the public entry always sources the text from the chain head rather than
+    /// from whichever link the recursion currently sits on.
+    fn fill_missing_link_descriptions(&mut self, description: &str) {
+        for link in [self.sub_ability.as_mut(), self.else_ability.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            if link.description.is_none() {
+                link.description = Some(description.to_string());
+            }
+            link.fill_missing_link_descriptions(description);
+        }
+    }
+
     /// CR 608.2c: Stamp `context.optional_effect_performed` across the local
     /// ability chain. Used when an optional effect is accepted after its prompt
     /// suspended the parent chain — the stashed "If you do" continuation was
@@ -35456,6 +35792,7 @@ mod tests {
             enters_with_counter: None,
             enters_with_modifications: Vec::new(),
             mana_spend_permission: None,
+            cast_cost_modifier: None,
         };
         let json = serde_json::to_string(&with_host).unwrap();
         assert!(
@@ -35514,6 +35851,7 @@ mod tests {
             granted_to: Some(PlayerId(0)),
             duration: Some(Duration::WhileControllingHost),
             source_id: Some(ObjectId(11)),
+            cast_cost_modifier: None,
         };
         let json = serde_json::to_string(&with_lifetime).unwrap();
         assert!(
@@ -35753,6 +36091,7 @@ mod tests {
             enters_with_counter: None,
             enters_with_modifications: Vec::new(),
             mana_spend_permission: None,
+            cast_cost_modifier: None,
         };
         let mut v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&modern).unwrap()).unwrap();
@@ -36777,6 +37116,66 @@ mod tests {
                 ],
             })
         );
+    }
+
+    /// `AbilityCost::contains_unimplemented` is the single containment
+    /// authority: it recurses `Composite`/`OneOf`/`PerCounter`, answers `true`
+    /// for a bare `Unimplemented`, and classifies an `EffectCost` by its
+    /// embedded payment effect.
+    #[test]
+    fn contains_unimplemented_recurses_composition_and_classifies_effect_cost() {
+        assert!(AbilityCost::Unimplemented {
+            description: "frobnicate".to_string(),
+        }
+        .contains_unimplemented());
+        assert!(AbilityCost::Composite {
+            costs: vec![
+                pay_life_cost(2),
+                AbilityCost::Unimplemented {
+                    description: "sacrifice a thing".to_string(),
+                },
+            ],
+        }
+        .contains_unimplemented());
+        assert!(AbilityCost::OneOf {
+            costs: vec![
+                generic_mana_cost(2),
+                AbilityCost::Composite {
+                    costs: vec![AbilityCost::Unimplemented {
+                        description: "frobnicate".to_string(),
+                    }],
+                },
+            ],
+        }
+        .contains_unimplemented());
+        assert!(AbilityCost::PerCounter {
+            counter: CounterType::Age,
+            target: TargetFilter::SelfRef,
+            base: Box::new(AbilityCost::Unimplemented {
+                description: "frobnicate".to_string(),
+            }),
+        }
+        .contains_unimplemented());
+        assert!(!AbilityCost::Composite {
+            costs: vec![pay_life_cost(2), generic_mana_cost(1)],
+        }
+        .contains_unimplemented());
+        // An `EffectCost` is classified by its embedded payment effect: an
+        // unimplemented payload is unpayable, a modeled one is not.
+        assert!(AbilityCost::EffectCost {
+            effect: Box::new(Effect::Unimplemented {
+                name: "static_structure".to_string(),
+                description: None,
+            }),
+        }
+        .contains_unimplemented());
+        assert!(!AbilityCost::EffectCost {
+            effect: Box::new(Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Any,
+            }),
+        }
+        .contains_unimplemented());
     }
 }
 
@@ -37914,6 +38313,321 @@ mod damage_redirect_target_serde_tests {
             serde_json::to_string(&DamageRedirectTarget::ChosenTarget)
                 .expect("chosen target serializes"),
             r#"{"type":"ChosenTarget"}"#
+        );
+    }
+}
+#[cfg(test)]
+mod cast_cost_modifier_serde_tests {
+    use super::*;
+
+    /// A `PlayFromExile` grant JSON body with `extra` spliced in as its only
+    /// rider key, so each matrix row differs in exactly one thing.
+    fn play_from_exile_json(extra: &str) -> String {
+        format!(r#"{{"type":"PlayFromExile","duration":"Permanent","granted_to":0,{extra}}}"#)
+    }
+
+    fn modifier_of(json: &str) -> Option<CastCostModifier> {
+        serde_json::from_str::<CastingPermission>(json)
+            .unwrap_or_else(|err| panic!("{json} must load: {err}"))
+            .cast_cost_modifier()
+            .cloned()
+    }
+
+    const MODERN_REDUCE: &str = r#""cast_cost_modifier":{"mode":"Reduce","amount":{"type":"Cost","shards":[],"generic":2}}"#;
+    const MODERN_KEY_LEGACY_PAYLOAD: &str =
+        r#""cast_cost_modifier":{"type":"Cost","shards":[],"generic":2}"#;
+    const LEGACY_KEY_MODERN_PAYLOAD: &str =
+        r#""cast_cost_raise":{"mode":"Raise","amount":{"type":"Cost","shards":[],"generic":2}}"#;
+    const LEGACY_KEY_LEGACY_PAYLOAD: &str =
+        r#""cast_cost_raise":{"type":"Cost","shards":[],"generic":2}"#;
+
+    /// CR 601.2f: all four key x payload combinations load, and each lands on
+    /// the direction its shape means. The legacy key/payload predates the
+    /// direction axis, when the only printed rider was an increase.
+    #[test]
+    fn all_four_key_by_payload_combinations_load() {
+        assert_eq!(
+            modifier_of(&play_from_exile_json(MODERN_REDUCE)),
+            Some(CastCostModifier::reduce(ManaCost::generic(2))),
+            "modern key + modern payload"
+        );
+        assert_eq!(
+            modifier_of(&play_from_exile_json(MODERN_KEY_LEGACY_PAYLOAD)),
+            Some(CastCostModifier::raise(ManaCost::generic(2))),
+            "modern key + legacy bare ManaCost payload reads as the increase it was"
+        );
+        assert_eq!(
+            modifier_of(&play_from_exile_json(LEGACY_KEY_MODERN_PAYLOAD)),
+            Some(CastCostModifier::raise(ManaCost::generic(2))),
+            "legacy key + modern payload"
+        );
+        assert_eq!(
+            modifier_of(&play_from_exile_json(LEGACY_KEY_LEGACY_PAYLOAD)),
+            Some(CastCostModifier::raise(ManaCost::generic(2))),
+            "legacy key + legacy bare payload"
+        );
+    }
+
+    /// An absent rider is `None`, not a zero-amount modifier.
+    #[test]
+    fn absent_rider_is_none() {
+        assert_eq!(
+            modifier_of(r#"{"type":"PlayFromExile","duration":"Permanent","granted_to":0}"#),
+            None
+        );
+    }
+
+    /// Serialization always emits the modern key; the legacy name survives as
+    /// a read-side alias only.
+    #[test]
+    fn serialization_emits_only_the_modern_key() {
+        let permission = serde_json::from_str::<CastingPermission>(&play_from_exile_json(
+            LEGACY_KEY_LEGACY_PAYLOAD,
+        ))
+        .expect("legacy grant loads");
+        let json = serde_json::to_string(&permission).expect("grant serializes");
+        assert!(
+            json.contains("cast_cost_modifier"),
+            "modern key must be written: {json}"
+        );
+        assert!(
+            !json.contains("cast_cost_raise"),
+            "the legacy key must never be written back out: {json}"
+        );
+    }
+
+    /// Both spellings name ONE field, so carrying both is a duplicate, not a
+    /// silent last-one-wins.
+    #[test]
+    fn both_keys_at_once_is_a_duplicate_field_error() {
+        let json = play_from_exile_json(&format!("{LEGACY_KEY_LEGACY_PAYLOAD},{MODERN_REDUCE}"));
+        let err = serde_json::from_str::<CastingPermission>(&json)
+            .expect_err("a grant carrying both spellings must be rejected");
+        assert!(
+            err.to_string().contains("duplicate field"),
+            "expected a duplicate-field error, got {err}"
+        );
+    }
+
+    /// CR 601.2f: the cost floor is a separate, board-wide last step with no
+    /// per-grant form, so `Minimum` is refused at both entry points.
+    #[test]
+    fn minimum_mode_is_rejected_by_constructor_and_by_serde() {
+        assert_eq!(
+            CastCostModifier::new(CostModifyMode::Minimum, ManaCost::generic(3)),
+            Err(CastCostModifierError::MinimumUnsupported)
+        );
+        let json = play_from_exile_json(
+            r#""cast_cost_modifier":{"mode":"Minimum","amount":{"type":"Cost","shards":[],"generic":3}}"#,
+        );
+        let err = serde_json::from_str::<CastingPermission>(&json)
+            .expect_err("a Minimum payload must be rejected");
+        assert!(
+            err.to_string().contains("Minimum"),
+            "the rejection must name the unsupported mode, got {err}"
+        );
+    }
+
+    /// `new` accepts exactly the two directions the runtime has a step for.
+    #[test]
+    fn new_accepts_raise_and_reduce() {
+        assert_eq!(
+            CastCostModifier::new(CostModifyMode::Raise, ManaCost::generic(1)),
+            Ok(CastCostModifier::raise(ManaCost::generic(1)))
+        );
+        assert_eq!(
+            CastCostModifier::new(CostModifyMode::Reduce, ManaCost::generic(1)),
+            Ok(CastCostModifier::reduce(ManaCost::generic(1)))
+        );
+    }
+
+    /// CR 601.2f + CR 118.9d: the accessor is the single read authority, and it
+    /// answers for every carrying form. The card-native exile casting methods
+    /// have no rider slot and answer `None`.
+    #[test]
+    fn accessor_reads_every_carrying_variant() {
+        let modifier = CastCostModifier::reduce(ManaCost::generic(2));
+        let alt_cost = CastingPermission::ExileWithAltCost {
+            cost: ManaCost::generic(3),
+            cost_provenance: ExileGrantCostProvenance::Alternative,
+            cast_transformed: false,
+            constraint: None,
+            granted_to: None,
+            resolution_cleanup: None,
+            duration: None,
+            source_id: None,
+            graveyard_replacement: None,
+            enters_with_counter: None,
+            enters_with_modifications: Vec::new(),
+            mana_spend_permission: None,
+            cast_cost_modifier: Some(modifier.clone()),
+        };
+        assert_eq!(alt_cost.cast_cost_modifier(), Some(&modifier));
+        assert_eq!(
+            CastingPermission::AdventureCreature.cast_cost_modifier(),
+            None
+        );
+        assert_eq!(
+            CastingPermission::Foretold {
+                cost: ManaCost::generic(1),
+                turn_foretold: 1,
+            }
+            .cast_cost_modifier(),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod chain_description_backfill_tests {
+    use super::*;
+
+    /// Build a three-deep chain: a head with printed text, a middle link with
+    /// none (the shape Isochron Scepter's "If you do, you may cast the copy"
+    /// sub-ability has), and a leaf that carries its own modal branch label.
+    fn three_deep_chain() -> ResolvedAbility {
+        let leaf = ResolvedAbility {
+            description: Some("tap".to_string()),
+            ..ResolvedAbility::new(
+                Effect::Surveil {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+                Vec::new(),
+                ObjectId(1),
+                PlayerId(0),
+            )
+        };
+        let middle = ResolvedAbility {
+            sub_ability: Some(Box::new(leaf)),
+            ..ResolvedAbility::new(
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+                Vec::new(),
+                ObjectId(1),
+                PlayerId(0),
+            )
+        };
+        ResolvedAbility {
+            description: Some("printed ability text".to_string()),
+            sub_ability: Some(Box::new(middle)),
+            ..ResolvedAbility::new(
+                Effect::Scry {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+                Vec::new(),
+                ObjectId(1),
+                PlayerId(0),
+            )
+        }
+    }
+
+    #[test]
+    fn backfill_fills_textless_links_and_preserves_their_own_text() {
+        let mut chain = three_deep_chain();
+        chain.backfill_chain_description();
+
+        let middle = chain.sub_ability.as_deref().expect("middle link");
+        assert_eq!(
+            middle.description.as_deref(),
+            Some("printed ability text"),
+            "a link with no text of its own inherits the head's printed text"
+        );
+
+        let leaf = middle.sub_ability.as_deref().expect("leaf link");
+        assert_eq!(
+            leaf.description.as_deref(),
+            Some("tap"),
+            "a link that carries its own label keeps it"
+        );
+    }
+
+    /// The head's text must reach links BELOW one that carries its own label —
+    /// a recursion that sourced the text from the current link would stamp
+    /// "tap" here instead.
+    #[test]
+    fn backfill_reaches_links_below_a_labelled_link() {
+        let mut chain = three_deep_chain();
+        let deepest = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                player: TargetFilter::Controller,
+            },
+            Vec::new(),
+            ObjectId(1),
+            PlayerId(0),
+        );
+        chain
+            .sub_ability
+            .as_mut()
+            .and_then(|middle| middle.sub_ability.as_mut())
+            .expect("leaf link")
+            .sub_ability = Some(Box::new(deepest));
+
+        chain.backfill_chain_description();
+
+        let below_label = chain
+            .sub_ability
+            .as_deref()
+            .and_then(|middle| middle.sub_ability.as_deref())
+            .and_then(|leaf| leaf.sub_ability.as_deref())
+            .expect("link below the labelled one");
+        assert_eq!(
+            below_label.description.as_deref(),
+            Some("printed ability text"),
+            "the head's text propagates past a labelled link, not the label"
+        );
+    }
+
+    /// `else_ability` is the branch sibling of `sub_ability` and raises its own
+    /// prompts, so it takes the same backfill.
+    #[test]
+    fn backfill_covers_the_else_branch() {
+        let mut chain = three_deep_chain();
+        chain.else_ability = Some(Box::new(ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            Vec::new(),
+            ObjectId(1),
+            PlayerId(0),
+        )));
+
+        chain.backfill_chain_description();
+
+        assert_eq!(
+            chain
+                .else_ability
+                .as_deref()
+                .expect("else branch")
+                .description
+                .as_deref(),
+            Some("printed ability text"),
+        );
+    }
+
+    /// A head with no text of its own leaves the chain untouched rather than
+    /// stamping `None` over a link that has one.
+    #[test]
+    fn backfill_with_no_head_text_is_a_no_op() {
+        let mut chain = three_deep_chain();
+        chain.description = None;
+        chain.backfill_chain_description();
+
+        let middle = chain.sub_ability.as_deref().expect("middle link");
+        assert_eq!(middle.description, None);
+        assert_eq!(
+            middle
+                .sub_ability
+                .as_deref()
+                .expect("leaf link")
+                .description
+                .as_deref(),
+            Some("tap"),
         );
     }
 }

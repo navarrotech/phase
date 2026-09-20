@@ -226,6 +226,12 @@ pub fn build_resolved_from_def_with_targets(
     // unconditionally.
     resolved.modal = def.modal.clone();
     resolved.mode_abilities = def.mode_abilities.clone();
+    // CR 608.2c: The whole chain is one printed ability, but the parser records
+    // its text only on the head. Push that text down so a prompt raised by a
+    // chained link can say what it is asking (see
+    // `ResolvedAbility::backfill_chain_description`). Runs last: every link the
+    // chain will ever have is built by this point.
+    resolved.backfill_chain_description();
     resolved
 }
 
@@ -15583,6 +15589,7 @@ mod tests {
                 driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
                 mana_spend_permission: None,
                 additional_cost: None,
+                cast_cost_modifier: None,
             },
             Vec::new(),
             ObjectId(1),
@@ -15623,6 +15630,7 @@ mod tests {
                 driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
                 mana_spend_permission: None,
                 additional_cost: None,
+                cast_cost_modifier: None,
             },
             Vec::new(),
             ObjectId(1),
@@ -15657,6 +15665,7 @@ mod tests {
                 driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
                 mana_spend_permission: None,
                 additional_cost: None,
+                cast_cost_modifier: None,
             },
             Vec::new(),
             ObjectId(1),
@@ -16705,6 +16714,7 @@ mod tests {
                 driver: CastFromZoneDriver::DuringResolution,
                 mana_spend_permission: None,
                 additional_cost: None,
+                cast_cost_modifier: None,
             },
             vec![],
             ObjectId(900),
