@@ -183,6 +183,7 @@
     "packProgress": "Busta {{current}} di {{total}}",
     "openPack": "Apri busta",
     "openPackArt": "Apri l’illustrazione della busta",
+    "openAllPacks": "Apri tutte le buste",
     "pulls": "Le tue carte",
     "nextPack": "Busta successiva",
     "viewPool": "Vedi il tuo pool",
@@ -654,6 +655,8 @@
     "takeAria": "Prendi il mucchio {{index}}",
     "decline": "Rifiuta",
     "declineAria": "Rifiuta il mucchio {{index}}",
+    "spreadPile": "Distendi il mucchio {{index}}",
+    "stackPile": "Impila il mucchio {{index}}",
     "refusal": {
       "PileNotActive": "Non stai decidendo su questo mucchio.",
       "PileEmpty": "Questo mucchio è vuoto, non c'è nulla da prendere.",

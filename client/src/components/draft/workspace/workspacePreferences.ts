@@ -17,13 +17,13 @@ export const DRAFT_WORKSPACE_PACK_SCALE_STEP = 0.01;
  *
  * A separate number rather than a reuse, because the two surfaces show
  * different things at once: a pack is a grid of up to fifteen cards, while a
- * Winston pile row is one pile's revealed run beside two face-down stacks. A
- * player who has tuned one has said nothing about the other, and a shared
- * value would move a setting they never touched the first time they draft the
- * other format.
+ * Winston pile column is one pile's face-down remainder with its revealed run
+ * stacked under it, one such column per published pile. A player who has tuned
+ * one has said nothing about the other, and a shared value would move a setting
+ * they never touched the first time they draft the other format.
  *
- * The default is larger than `packScale`'s because the surface is one row wide
- * rather than a filled grid — the cards being decided on get the whole width.
+ * The two defaults are tuned independently and neither is computed from the
+ * other, which is the whole point of the separate declaration.
  */
 export const DRAFT_WORKSPACE_PILE_SCALE_DEFAULT = 1.35;
 export const DRAFT_WORKSPACE_PILE_SCALE_MIN = 0.4;

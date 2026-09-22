@@ -183,6 +183,7 @@
     "packProgress": "Sobre {{current}} de {{total}}",
     "openPack": "Abrir sobre",
     "openPackArt": "Abrir ilustración del sobre",
+    "openAllPacks": "Abrir todos los sobres",
     "pulls": "Tus cartas",
     "nextPack": "Siguiente sobre",
     "viewPool": "Ver tu pool",
@@ -654,6 +655,8 @@
     "takeAria": "Tomar el montón {{index}}",
     "decline": "Rechazar",
     "declineAria": "Rechazar el montón {{index}}",
+    "spreadPile": "Extender el montón {{index}}",
+    "stackPile": "Apilar el montón {{index}}",
     "refusal": {
       "PileNotActive": "No estás decidiendo sobre este montón.",
       "PileEmpty": "Este montón está vacío, no hay nada que tomar.",

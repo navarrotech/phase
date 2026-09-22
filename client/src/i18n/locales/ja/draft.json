@@ -183,6 +183,7 @@
     "packProgress": "パック {{current}} / {{total}}",
     "openPack": "パックを開封",
     "openPackArt": "パック開封の画像",
+    "openAllPacks": "すべてのパックを開封",
     "pulls": "開封したカード",
     "nextPack": "次のパック",
     "viewPool": "カードプールを表示",
@@ -732,6 +733,8 @@
     "takeAria": "山{{index}}を取る",
     "decline": "見送る",
     "declineAria": "山{{index}}を見送る",
+    "spreadPile": "山{{index}}を広げる",
+    "stackPile": "山{{index}}を重ねる",
     "refusal": {
       "PileNotActive": "今選択しているのはこの山ではありません。",
       "PileEmpty": "この山は空なので、取れるカードはありません。",

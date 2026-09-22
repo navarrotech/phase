@@ -183,6 +183,7 @@
     "packProgress": "Booster {{current}} z {{total}}",
     "openPack": "Otwórz booster",
     "openPackArt": "Otwórz grafikę boostera",
+    "openAllPacks": "Otwórz wszystkie boostery",
     "pulls": "Twoje karty",
     "nextPack": "Następny booster",
     "viewPool": "Zobacz swoją pulę",
@@ -654,6 +655,8 @@
     "takeAria": "Weź kupkę {{index}}",
     "decline": "Odrzuć",
     "declineAria": "Odrzuć kupkę {{index}}",
+    "spreadPile": "Rozłóż kupkę {{index}}",
+    "stackPile": "Spiętrz kupkę {{index}}",
     "refusal": {
       "PileNotActive": "Nie podejmujesz decyzji o tej kupce.",
       "PileEmpty": "Ta kupka jest pusta, nie ma czego brać.",
