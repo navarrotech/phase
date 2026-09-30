@@ -313,11 +313,11 @@ function AiSeatPanel({
 }: AiSeatPanelProps) {
   const { t } = useTranslation("menu");
   const isRandom = seat.deckId === AI_DECK_RANDOM;
-  // When the user has pinned a deck, expose the full list so they can switch
-  // to another pinned deck; otherwise scope to the filtered Random pool so
-  // the "Random" summary count matches the options shown.
-  const deckOptions = isRandom ? filteredDecks : candidates;
-  const selectionValid = isRandom || deckOptions.some((d) => d.id === seat.deckId);
+  // The Random pool filters only decide what "Random" may draw from. Pinning is
+  // an explicit choice, so every legal deck stays pinnable regardless of those
+  // filters; otherwise a deck excluded from Random (e.g. 99% coverage under a
+  // 100% floor, or an off-bracket deck) could never be selected at all.
+  const selectionValid = isRandom || candidates.some((d) => d.id === seat.deckId);
   const effectiveSelection: AiDeckSelection = selectionValid ? seat.deckId : AI_DECK_RANDOM;
 
   const sourceLabel = (candidate: AiDeckCandidate): string => {
@@ -350,9 +350,9 @@ function AiSeatPanel({
   const deckMenuItems = useMemo(
     () => [
       { value: AI_DECK_RANDOM, label: randomDeckLabel },
-      ...deckOptions.map((d) => ({ value: d.id, label: formatDeckLabel(d) })),
+      ...candidates.map((d) => ({ value: d.id, label: formatDeckLabel(d) })),
     ],
-    [deckOptions, randomDeckLabel],
+    [candidates, randomDeckLabel],
   );
   const selectedDeckLabel =
     effectiveSelection === AI_DECK_RANDOM

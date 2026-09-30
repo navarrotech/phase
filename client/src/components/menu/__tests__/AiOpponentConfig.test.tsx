@@ -4,7 +4,7 @@ import { act } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { AiOpponentConfig } from "../AiOpponentConfig";
-import { usePreferencesStore } from "../../../stores/preferencesStore";
+import { AI_DECK_RANDOM, usePreferencesStore } from "../../../stores/preferencesStore";
 import type { AiDeckCandidate } from "../../../services/aiDeckCatalog";
 
 vi.mock("../../../services/aiDeckCatalog", async () => {
@@ -224,5 +224,35 @@ describe("AiOpponentConfig — bracket filter", () => {
     await waitFor(() => {
       expect(screen.getByRole("button", { name: /^Deck$/i })).toHaveTextContent(/Random \(2\)/);
     });
+  });
+});
+
+describe("AiOpponentConfig — Random pool filters never hide pinnable decks", () => {
+  it("lists decks excluded from the Random pool so they can still be pinned", async () => {
+    const user = userEvent.setup();
+    mockCandidates = [
+      candidate("FullCoverage", 3),
+      { ...candidate("NearlyFullCoverage", 3), coveragePct: 99 },
+      candidate("OffBracket", 2),
+    ];
+    act(() => {
+      usePreferencesStore.getState().setAiCoverageFloor(100);
+      usePreferencesStore.getState().setAiBracketFilter([3]);
+      usePreferencesStore.getState().setAiSeatDeckId(0, AI_DECK_RANDOM);
+    });
+
+    render(<AiOpponentConfig selectedFormat="Commander" opponentCount={1} />);
+    const deckMenu = screen.getByRole("button", { name: /^Deck$/i });
+
+    // The Random summary still reflects the filtered pool.
+    expect(deckMenu).toHaveTextContent(/Random \(1\)/);
+
+    await user.click(deckMenu);
+    await user.click(screen.getByRole("option", { name: /^NearlyFullCoverage/ }));
+
+    await waitFor(() => {
+      expect(usePreferencesStore.getState().aiSeats[0].deckId).toBe("NearlyFullCoverage");
+    });
+    expect(screen.getByRole("button", { name: /^Deck$/i })).toHaveTextContent(/NearlyFullCoverage/);
   });
 });
