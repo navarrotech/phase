@@ -3315,7 +3315,13 @@ pub(crate) fn opponent_land_color_options(
             ) {
                 continue;
             }
-            for mana_type in mana_options_from_production(state, controller, *object_id, produced) {
+            // CR 106.7 + CR 109.5: "Could produce" asks what the land's own ability
+            // would produce, and "you"/"your" on that land means its controller, so
+            // evaluate it as the opponent who controls the land (Command Tower reads
+            // that opponent's commander), not as the activator surveying it.
+            for mana_type in
+                mana_options_from_production(state, obj.controller, *object_id, produced)
+            {
                 if !options.contains(&mana_type) {
                     options.push(mana_type);
                 }
@@ -3602,7 +3608,12 @@ pub(crate) fn produceable_mana_types_by_filter(
                 continue;
             }
             obj_had_explicit_ability = true;
-            for mana_type in mana_options_from_production(state, controller, *object_id, produced) {
+            // CR 106.7 + CR 109.5: `controller` scopes which lands are surveyed;
+            // each surveyed land's ability is evaluated for its own controller,
+            // which differs whenever the filter admits another player's lands.
+            for mana_type in
+                mana_options_from_production(state, obj.controller, *object_id, produced)
+            {
                 if !options.contains(&mana_type) {
                     options.push(mana_type);
                 }
