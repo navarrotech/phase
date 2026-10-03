@@ -1626,6 +1626,68 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
     resumed.dispose();
   });
 
+  // Issue #9527, native authority: a host that delegated to its local
+  // phase-server resumes without a WASM snapshot and must still re-announce
+  // its guests' persisted names.
+  it("re-announces persisted guest names when a native host resumes", async () => {
+    const { peer, onGuestConnected } = createFakePeer();
+    const hostDeck = {
+      player: { main_deck: ["Mountain"], sideboard: [] },
+      opponent: { main_deck: ["Forest"], sideboard: [] },
+      ai_decks: [],
+    };
+    const adapter = new P2PHostAdapter(
+      hostDeck,
+      peer as unknown as Peer,
+      onGuestConnected,
+      2,
+      commanderConfig(),
+      undefined,
+      5_000,
+      undefined,
+      true,
+      undefined,
+      {
+        gameId: "native-names-game",
+        roomCode: "ABCDE",
+        resumeData: {
+          session: {
+            gameId: "native-names-game",
+            roomCode: "ABCDE",
+            sessionKey: "native-names-session",
+            useBroker: false,
+            playerTokens: {},
+            guestDecks: {},
+            guestNames: { 1: "Bioplay" },
+            kickedTokens: [],
+            eliminatedSeats: [],
+            playerCount: 2,
+            hostDeckData: hostDeck,
+            gameStarted: true,
+            nativeSession: {
+              gameCode: "native-game",
+              fullKey: { game_code: "native-game", generation: 1 },
+              playerTokens: { 0: "native-host-token" },
+            },
+          },
+        },
+      },
+      {},
+    );
+    nativeWebSocketMocks.initializePregame.mockResolvedValue(NATIVE_HOST_ATTACHMENT);
+    const hostEvents: P2PAdapterEvent[] = [];
+    adapter.onEvent((event) => hostEvents.push(event));
+
+    await adapter.initialize();
+
+    expect(hostEvents).toContainEqual({
+      type: "playerIdentity",
+      playerId: 0,
+      playerNames: expect.objectContaining({ 1: "Bioplay" }),
+    });
+    adapter.dispose();
+  });
+
   it("releases unpublished resumed authority after a strict-save failure without acknowledging guests", async () => {
     persistenceMocks.saveResumableGameStrict.mockRejectedValueOnce(new Error("IndexedDB unavailable"));
     const { adapter, emitConnection } = makeResumedHost();
