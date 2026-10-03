@@ -3304,10 +3304,10 @@ pub(crate) fn opponent_land_color_options(
             };
             // CR 106.7: Skip both recursive producers. `OpponentLandColors`
             // facing itself yields no mana; `AnyTypeProduceableBy` (Reflecting
-            // Pool class) is excluded because (a) recursing into it would
-            // re-anchor `ControllerRef::You` to the wrong player and (b) the
-            // mutual cycle terminates cleanly only when both sides skip each
-            // other.
+            // Pool class) is excluded so the mutual cycle terminates cleanly
+            // (CR 106.5) when both sides skip each other. This is a cycle-breaking
+            // approximation, not a CR 106.7 requirement: an opponent's Reflecting
+            // Pool could legally produce what that opponent's other lands produce.
             if matches!(
                 produced,
                 ManaProduction::OpponentLandColors { .. }
