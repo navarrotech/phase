@@ -19664,6 +19664,12 @@ pub(crate) fn evaluate_condition(
             // Mirror the `ParentTargetController` fallback (targeting.rs): when
             // `targets` has no object, resolve the anaphor against
             // `TriggeringSource` from the current trigger event.
+            // CR 608.2c + CR 301.5 + CR 303.4: between those two, an instruction
+            // whose own subject is its source's attachment host ("put a +1/+1
+            // counter on equipped creature if it's red", the M13 Ring cycle)
+            // binds "it" to that host. The host is never a declared target, and
+            // it is uniquely determined by the attachment, so it is the nearest
+            // antecedent and outranks the trigger event's subject.
             let target_id = if let Some(index) = subject_slot {
                 match crate::game::targeting::resolve_live_parent_slot_from_root(
                     state, ability, *index,
@@ -19678,6 +19684,17 @@ pub(crate) fn evaluate_condition(
                     .find_map(|t| match t {
                         TargetRef::Object(id) => Some(*id),
                         _ => None,
+                    })
+                    .or_else(|| {
+                        let subject = ability
+                            .effect
+                            .target_filter()
+                            .filter(|filter| filter.contains_source_attachment_host())?;
+                        crate::game::targeting::resolved_object_ids_for_filter(
+                            state, ability, subject,
+                        )
+                        .into_iter()
+                        .next()
                     })
                     .or_else(|| {
                         crate::game::targeting::resolve_event_context_target(
