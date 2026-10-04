@@ -6811,6 +6811,47 @@ fn effect_has_iteration_bound_recipient(effect: &Effect) -> bool {
     )
 }
 
+/// CR 109.5 + CR 608.2c: does this chain node name the player a surrounding
+/// `player_scope` iteration is bound to? True when its condition tests the
+/// scoped player (`ScopedPlayerMatches` — "each opponent who …"), or when its
+/// effect's player/object filter references that player: the bare
+/// `ScopedPlayer` recipient ("loses 3 life", "draws a card") or a
+/// `ControllerRef::ScopedPlayer` controller/owner axis ("a creature they
+/// control", "their graveyard"). `OriginalController` ("you") is deliberately
+/// NOT a reference: it names the printed controller in every iteration.
+///
+/// Reads only this node; the filter traversal is `filter::filter_contains`, the
+/// single authority for "does this filter mention X anywhere".
+fn node_references_scoped_player(node: &ResolvedAbility) -> bool {
+    fn condition_tests_scoped_player(condition: &AbilityCondition) -> bool {
+        match condition {
+            AbilityCondition::ScopedPlayerMatches { .. } => true,
+            AbilityCondition::Not { condition } => condition_tests_scoped_player(condition),
+            AbilityCondition::And { conditions } | AbilityCondition::Or { conditions } => {
+                conditions.iter().any(condition_tests_scoped_player)
+            }
+            _ => false,
+        }
+    }
+    let names_scoped_player = |filter: &TargetFilter| {
+        crate::game::filter::filter_contains(filter, &|leaf| {
+            matches!(leaf, TargetFilter::ScopedPlayer)
+                || filter_uses_relative_controller_scoped(leaf)
+        })
+    };
+    // `Effect::target_filter()` surfaces every single-recipient axis (damage,
+    // life, draw, token owner, sacrifice, zone moves) but not a mass
+    // `ChangeZoneAll` population, which `ability_uses_relative_controller_scoped`
+    // likewise reads explicitly.
+    let effect_names_scoped_player = node.effect.target_filter().is_some_and(names_scoped_player)
+        || matches!(&node.effect, Effect::ChangeZoneAll { target, .. } if names_scoped_player(target));
+    effect_names_scoped_player
+        || node
+            .condition
+            .as_ref()
+            .is_some_and(condition_tests_scoped_player)
+}
+
 /// CR 608.2c + CR 701.20b: An effect that introduces a single per-player object
 /// referent which a later anaphoric clause ("that card", "it", "its mana value")
 /// in the same iteration binds to. `RevealTop` is the canonical case: it reveals
@@ -6937,14 +6978,15 @@ fn detach_after_player_scope_local_chain(
         .as_ref()
         .is_some_and(condition_depends_on_effect_performed);
     // CR 608.2c + CR 608.2f: a "this way" zone-change gate is per-iteration
-    // only when the gated clause is ABOUT the iterated player. Kroxa, Titan of
-    // Death's Hunger's "each opponent who didn't discard a nonland card this
-    // way loses 3 life" lowers to `LoseLife { ScopedPlayer }`: each opponent's
-    // own discard gates their own life loss, so the sub reads the ledger
-    // stamped by THIS iteration's zone change and stays in the scoped template
-    // — the zone-keyed twin of the performed-gate class above.
+    // only when the gated clause names the iterated player
+    // (`node_references_scoped_player`). Kroxa, Titan of Death's Hunger's "each
+    // opponent who didn't discard a nonland card this way loses 3 life" lowers
+    // to `LoseLife { ScopedPlayer }` gated on `ScopedPlayerMatches`: each
+    // opponent's own discard gates their own life loss, so the sub reads the
+    // ledger stamped by THIS iteration's zone change and stays in the scoped
+    // template — the zone-keyed twin of the performed-gate class above.
     //
-    // A gated clause about "you", the source, or a target is instead ONE
+    // A gated clause that never names the iterated player is instead ONE
     // look-back over the whole multi-player action. Locke, Treasure Hunter's
     // "each player mills a card. If a land card was milled this way, create a
     // Treasure token" creates exactly one Treasure as long as any land was
@@ -6956,7 +6998,7 @@ fn detach_after_player_scope_local_chain(
         .condition
         .as_ref()
         .is_some_and(condition_depends_on_zone_change_this_way)
-        && effect_has_iteration_bound_recipient(&next.effect);
+        && node_references_scoped_player(&next);
     // CR 608.2c: When the parser distributes "each player reveals the top card
     // of their library, loses life equal to that card's mana value, then puts
     // it into their hand" it stamps the SAME `player_scope` onto every clause.
@@ -19058,6 +19100,55 @@ fn subject_dependent_type_condition_has_no_subject(
     }
 }
 
+/// CR 608.2c: the objects a "[noun] was [verb]ed this way" look-back names —
+/// every member of `last_zone_changed_ids` matching `filter`. Single authority
+/// for both the `ZoneChangedThisWay` condition (any member) and the "that many"
+/// that follows it ([`zone_changed_this_way_gate_count`], the member count).
+pub(crate) fn zone_changed_this_way_matches<'a>(
+    state: &'a GameState,
+    ability: &'a ResolvedAbility,
+    filter: &'a TargetFilter,
+    destination: Option<Zone>,
+) -> impl Iterator<Item = ObjectId> + 'a {
+    // CR 107.3a + CR 601.2b: ability-context filter evaluation.
+    let ctx = crate::game::filter::FilterContext::from_ability(ability);
+    state
+        .last_zone_changed_ids
+        .iter()
+        .copied()
+        .filter(move |&id| {
+            crate::game::filter::matches_target_filter(state, id, filter, &ctx)
+            // CR 608.2c + CR 122.1h + CR 614.6: a destination-bound wording
+            // ("put into a graveyard / dies this way") needs the ARRIVAL, not
+            // just the move — a replacement that redirected the object
+            // elsewhere defeats it. Current zone IS the arrival zone here:
+            // nothing else runs between the parent instruction and this
+            // evaluation.
+            && destination.is_none_or(|zone| {
+                state.objects.get(&id).is_some_and(|obj| obj.zone == zone)
+            })
+        })
+}
+
+/// CR 608.2c: "When one or more nonland cards are exiled this way, put that
+/// many +1/+1 counters …" — read with the rules of English, "that many" names
+/// the population the node's own "this way" gate just tested: not the parent
+/// instruction's whole result (which also counts the land cards), and not the
+/// enclosing trigger's event. `None` when the node is not gated by an
+/// affirmative `ZoneChangedThisWay`, leaving the caller's cascade unchanged.
+pub(crate) fn zone_changed_this_way_gate_count(
+    state: &GameState,
+    ability: &ResolvedAbility,
+) -> Option<usize> {
+    match ability.condition.as_ref()? {
+        AbilityCondition::ZoneChangedThisWay {
+            filter,
+            destination,
+        } => Some(zone_changed_this_way_matches(state, ability, filter, *destination).count()),
+        _ => None,
+    }
+}
+
 /// CR 608.2c: Evaluate a condition against the current game state and ability context.
 /// Returns whether the condition is met. Handles all `AbilityCondition` variants as
 /// pure boolean evaluators — callers are responsible for any terminal control flow
@@ -19893,22 +19984,9 @@ pub(crate) fn evaluate_condition(
         AbilityCondition::ZoneChangedThisWay {
             filter,
             destination,
-        } => {
-            // CR 107.3a + CR 601.2b: ability-context filter evaluation.
-            let ctx = crate::game::filter::FilterContext::from_ability(ability);
-            state.last_zone_changed_ids.iter().any(|&id| {
-                crate::game::filter::matches_target_filter(state, id, filter, &ctx)
-                    // CR 608.2c + CR 122.1h + CR 614.6: a destination-bound
-                    // wording ("put into a graveyard / dies this way") needs the
-                    // ARRIVAL, not just the move — a replacement that redirected
-                    // the object elsewhere defeats it. Current zone IS the
-                    // arrival zone here: nothing else runs between the parent
-                    // instruction and this evaluation.
-                    && destination.is_none_or(|zone| {
-                        state.objects.get(&id).is_some_and(|obj| obj.zone == zone)
-                    })
-            })
-        }
+        } => zone_changed_this_way_matches(state, ability, filter, *destination)
+            .next()
+            .is_some(),
         // CR 608.2k + CR 608.2h: the cost-paid object is a persistent untargeted
         // reference, so it reads CURRENT information while it is still in a
         // public zone — not the payment-time snapshot. See

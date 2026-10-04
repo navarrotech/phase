@@ -7350,6 +7350,9 @@ fn battlefield_departure_counter_context(
 /// creation-time amount, CR 603.7a) use `determined_event_context_amount`.
 /// Resolution-precedence ordered:
 ///
+///   0. `zone_changed_this_way_gate_count` — when the resolving node is gated
+///      by "one or more <FILTER> were <verb>ed this way", "that many" is that
+///      gate's own matching population (CR 608.2c nearest antecedent).
 ///   1. `current_trigger_match_count` — the filtered subject count of a
 ///      batched trigger ("one or more <FILTER> <verb>"), set by
 ///      `stack::resolve_top` for the resolution. This is the canonical
@@ -7390,6 +7393,18 @@ fn event_context_amount(
         // Meditation); `None` otherwise, so it falls straight through to the
         // existing trigger/effect cascade.
         .or(state.post_replacement_token_substitution_count)
+        // CR 608.2c: a node gated by "one or more <filter> were <verb>ed this
+        // way" binds "that many" to that gate's own population — the nearest
+        // antecedent — ahead of any enclosing trigger or parent-effect amount.
+        // Augusta, Order Returned counts only the NONLAND cards exiled, and in
+        // a detached `player_scope` tail the ledger it reads is every player's.
+        .or_else(|| {
+            ability
+                .and_then(|ability| {
+                    crate::game::effects::zone_changed_this_way_gate_count(state, ability)
+                })
+                .map(usize_to_i32_saturating)
+        })
         .or_else(|| enclosing_trigger_match_count(state))
         // CR 706.4: Die results recorded earlier in THIS resolution
         // outrank the triggering event's own amount, so "roll one or more

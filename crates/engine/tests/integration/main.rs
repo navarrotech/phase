@@ -1835,6 +1835,7 @@ mod locke_mug_single_treasure_multiplayer;
 mod multi_slot_list_back_reference;
 mod optional_chain_link_prompt_description;
 mod planeswalker_token;
+mod player_scope_this_way_gate_class;
 mod professor_hojo_activation_cost;
 mod ripple_reveal_choice_interaction;
 mod siphon_insight_mana_rider;
