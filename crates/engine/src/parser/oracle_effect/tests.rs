@@ -2,6 +2,7 @@ use super::gap_diagnosis::diagnose_clause_gap;
 use super::lower::{
     rewrite_parent_target_to_last_created, target_filter_is_explicit_target_player_graveyard_card,
 };
+use super::sequence::split_clause_sequence;
 use super::*;
 use crate::game::coverage::card_face_has_unimplemented_parts;
 use crate::game::triggers::extract_target_filter_from_effect;
@@ -80410,7 +80411,6 @@ fn prevention_declared_prefixes_keep_full_filters_and_counts() {
 /// blanket "every closed quote ends the clause".
 #[test]
 fn self_cost_modification_after_closed_quote_is_its_own_chunk() {
-    use super::sequence::split_clause_sequence;
     let chunk_texts = |text: &str| -> Vec<String> {
         split_clause_sequence(text)
             .into_iter()

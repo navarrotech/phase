@@ -1756,7 +1756,10 @@ fn any_ability_has_instead_condition(parsed: &ParsedAbilities) -> bool {
 ///
 /// Exhaustive with no `_` arm on purpose: a new replacement-carrying effect must declare
 /// itself here rather than silently failing to suppress a false positive.
-fn effect_is_replacement_carrier(effect: &Effect) -> bool {
+///
+/// `preceding` is the effect of the chain node this one follows, if any; it is what
+/// lets a granted replacement be checked against the object its grant names.
+fn effect_is_replacement_carrier(effect: &Effect, preceding: Option<&Effect>) -> bool {
     match effect {
         // CR 614.11: "the next time you would draw a card this turn, [effect] instead"
         // (Words of Worship / Wilding class) — the substitute rides on the effect.
@@ -1777,26 +1780,33 @@ fn effect_is_replacement_carrier(effect: &Effect) -> bool {
         // when printed on a permanent.
         Effect::GenericEffect {
             static_abilities, ..
-        } => static_abilities
-            .iter()
-            .flat_map(|grant| grant.modifications.iter())
-            .any(|modification| match modification {
+        } => static_abilities.iter().any(|grant| {
+            grant.modifications.iter().any(|modification| match modification {
                 ContinuousModification::GrantStaticAbility { definition } => {
                     static_is_replacement_carrier(definition)
                 }
                 // CR 614.1a: a quoted "If this permanent would leave the battlefield,
                 // exile it instead …" grant (Geth, Thane of Contracts; Llanowar
                 // Greenwidow) carries its `ReplacementDefinition` directly — the same
-                // payload `parsed.replacements` holds for a printed replacement.
-                // Deliberately presence-based rather than event-checked like
-                // `static_is_replacement_carrier`: it mirrors the detector's
-                // `!parsed.replacements.is_empty()` early return, which accepts any
-                // parsed replacement as the represented "instead". Who the grant is
-                // bound to (`affected`) is an anaphor question this detector does not
-                // answer.
-                ContinuousModification::GrantReplacement { .. } => true,
+                // payload `parsed.replacements` holds for a printed replacement. The
+                // replaced event is not checked (unlike `static_is_replacement_carrier`):
+                // this mirrors the detector's `!parsed.replacements.is_empty()` early
+                // return, which accepts any parsed replacement as the represented
+                // "instead".
+                //
+                // CR 608.2c + CR 400.7: what IS checked is that the grant names the
+                // object the chain just moved. A source-bound grant (`affected: SelfRef`)
+                // right after a zone move of ANOTHER object ("return the chosen card …
+                // and it gains \"…\"" — Spirit-Sister's Call) installs the replacement
+                // on the source instead of the moved card, so the "instead" clause is
+                // not represented and the warning stays. A self-move ("Return this card
+                // … It gains" — Llanowar Greenwidow) keeps `SelfRef` correctly.
+                ContinuousModification::GrantReplacement { .. } => !(grant.affected
+                    == Some(TargetFilter::SelfRef)
+                    && preceding.is_some_and(moves_another_object)),
                 _ => false,
-            }),
+            })
+        }),
         _ => false,
     }
 }
@@ -1824,8 +1834,22 @@ fn def_is_represented_instead_branch(def: &AbilityDefinition) -> bool {
     def.condition.is_some() && def.else_ability.is_some()
 }
 
+/// CR 400.7 + CR 608.2c: a zone move of an object other than the ability's source.
+/// The moved card is the antecedent a following "it gains" grant must name.
+fn moves_another_object(effect: &Effect) -> bool {
+    matches!(effect, Effect::ChangeZone { target, .. } if *target != TargetFilter::SelfRef)
+}
+
 fn def_tree_has_replacement_carrier(def: &AbilityDefinition) -> bool {
-    if effect_is_replacement_carrier(&def.effect) || def_is_represented_instead_branch(def) {
+    def_chain_has_replacement_carrier(def, None)
+}
+
+/// Walks `def` and its chain; `preceding` is the effect of the node `def` follows as
+/// a `sub_ability` (see `effect_is_replacement_carrier`).
+fn def_chain_has_replacement_carrier(def: &AbilityDefinition, preceding: Option<&Effect>) -> bool {
+    if effect_is_replacement_carrier(&def.effect, preceding)
+        || def_is_represented_instead_branch(def)
+    {
         return true;
     }
     if let Effect::CreateDelayedTrigger { effect, .. } = &*def.effect {
@@ -1834,7 +1858,7 @@ fn def_tree_has_replacement_carrier(def: &AbilityDefinition) -> bool {
         }
     }
     if let Some(ref sub) = def.sub_ability {
-        if def_tree_has_replacement_carrier(sub) {
+        if def_chain_has_replacement_carrier(sub, Some(&def.effect)) {
             return true;
         }
     }
@@ -6399,6 +6423,61 @@ If you sang a song the whole time you were searching and shuffling, you may unta
         );
         assert!(
             !has_swallowed_detector(&parsed, "Replacement_Instead"),
+            "{:?}",
+            parsed.parse_warnings
+        );
+    }
+
+    /// CR 608.2c + CR 400.7: the same granted replacement does NOT represent the
+    /// "instead" clause when the grant is bound to the source (`affected: SelfRef`)
+    /// right after a zone move of a different object — the returned card, not the
+    /// enchantment, is what "it gains" names (Spirit-Sister's Call). The warning stays
+    /// until the grant names the moved card.
+    #[test]
+    fn replacement_instead_still_reported_for_source_bound_grant_after_moving_another_object() {
+        let parsed = parse_named(
+            "At the beginning of your end step, choose target permanent card in your \
+             graveyard. You may sacrifice a permanent that shares a card type with the \
+             chosen card. If you do, return the chosen card from your graveyard to the \
+             battlefield and it gains \"If this permanent would leave the battlefield, \
+             exile it instead of putting it anywhere else.\"",
+            "Spirit-Sister's Call",
+            &["Enchantment"],
+        );
+        // Reach guard: the line parsed cleanly (so the detector ran), and the grant
+        // carrying the replacement is the source-bound one following the move.
+        assert!(
+            !any_ability_has_unimplemented(&parsed),
+            "{:?}",
+            parsed.triggers
+        );
+        let execute = parsed.triggers[0]
+            .execute
+            .as_deref()
+            .expect("the trigger has an effect");
+        let mover = std::iter::successors(Some(execute), |def| def.sub_ability.as_deref())
+            .find(|def| matches!(&*def.effect, Effect::ChangeZone { .. }))
+            .expect("the chosen card is returned");
+        let grant = mover
+            .sub_ability
+            .as_deref()
+            .expect("the quoted grant chains after the return");
+        assert!(
+            matches!(
+                &*grant.effect,
+                Effect::GenericEffect { static_abilities, .. }
+                    if static_abilities.iter().any(|definition| {
+                        definition.affected == Some(TargetFilter::SelfRef)
+                            && definition.modifications.iter().any(|modification| {
+                                matches!(modification, ContinuousModification::GrantReplacement { .. })
+                            })
+                    })
+            ),
+            "{:?}",
+            grant.effect
+        );
+        assert!(
+            has_swallowed_detector(&parsed, "Replacement_Instead"),
             "{:?}",
             parsed.parse_warnings
         );
