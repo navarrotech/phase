@@ -21227,11 +21227,15 @@ fn try_parse_put_into_exile_from(
             ))
             .parse(input)
         }
-        parse_origin_zone
-            .parse(after_from)
-            .ok()
-            .map(|(_, z)| z)
-            .unwrap_or(None)
+        // Strict origin + tail (mirrors `parse_graveyard_origin_union`): an
+        // origin this grammar cannot fully consume fails the arm. Dropping it
+        // would leave an unconstrained trigger that fires on exile from any
+        // zone (e.g. "from an opponent's library").
+        let (tail, origin) = parse_origin_zone.parse(after_from).ok()?;
+        if !tail.trim().is_empty() {
+            return None;
+        }
+        origin
     } else if after_verb.is_empty() {
         None
     } else {

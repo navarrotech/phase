@@ -23028,6 +23028,118 @@ fn trigger_one_or_more_put_into_your_graveyard_with_unconsumed_origin_tail_stays
     );
 }
 
+/// Reach-guard for the honest-red pins below: the same sentence with a
+/// recognized origin parses through the single put-into-exile arm, so the
+/// pins' `Unknown` result can only come from the origin, not an upstream bail.
+#[test]
+fn trigger_put_into_exile_from_your_library_parses_origin() {
+    let def = parse_trigger_line(
+        "Whenever a creature card is put into exile from your library, draw a card.",
+        "Some Card",
+    );
+    assert_eq!(def.mode, TriggerMode::ChangesZone);
+    assert_eq!(def.origin, Some(Zone::Library));
+    assert_eq!(def.destination, Some(Zone::Exile));
+}
+
+/// Honest-red (#9505): an origin the single put-into-exile arm cannot parse
+/// fails the arm instead of silently becoming an unconstrained exile trigger
+/// that fires on exile from any zone.
+#[test]
+fn trigger_put_into_exile_from_unparseable_origin_stays_unknown() {
+    let def = parse_trigger_line(
+        "Whenever a creature card is put into exile from an opponent's library, draw a card.",
+        "Some Card",
+    );
+    assert!(
+        matches!(def.mode, TriggerMode::Unknown(_)),
+        "an unparseable exile origin must fail the arm, got {:?}",
+        def.mode
+    );
+}
+
+/// Honest-red (#9505): a recognized origin followed by an unconsumed tail
+/// fails the arm instead of silently dropping the remainder.
+#[test]
+fn trigger_put_into_exile_with_unconsumed_origin_tail_stays_unknown() {
+    let def = parse_trigger_line(
+        "Whenever a creature card is put into exile from your library or an opponent's hand, draw a card.",
+        "Some Card",
+    );
+    assert!(
+        matches!(def.mode, TriggerMode::Unknown(_)),
+        "an unconsumed exile origin remainder must fail the arm, got {:?}",
+        def.mode
+    );
+}
+
+/// Honest-red (#9505, batched fall-through): a batched exile line whose origin
+/// the batched arm rejects must not be rescued by the single arm via subject
+/// decomposition as an unconstrained exile trigger. The reach-guard is the
+/// your-qualified batched sibling (Rakshasa Vizier shape), which differs only
+/// in the origin possessive.
+#[test]
+fn trigger_one_or_more_put_into_exile_from_unparseable_origin_stays_unknown() {
+    let accepted = parse_trigger_line(
+        "Whenever one or more cards are put into exile from your library, draw a card.",
+        "Some Card",
+    );
+    assert_eq!(
+        accepted.mode,
+        TriggerMode::ChangesZoneAll,
+        "reach-guard: the your-qualified batched line must parse"
+    );
+
+    let def = parse_trigger_line(
+        "Whenever one or more cards are put into exile from an opponent's library, draw a card.",
+        "Some Card",
+    );
+    assert!(
+        matches!(def.mode, TriggerMode::Unknown(_)),
+        "an unparseable batched exile origin must not fall through as unconstrained, got {:?}",
+        def.mode
+    );
+}
+
+/// Positive controls: every origin the single put-into-exile arm recognizes
+/// still parses to a `ChangesZone` trigger with the expected scalar origin.
+#[test]
+fn trigger_put_into_exile_accepted_origins() {
+    let cases = [
+        ("the battlefield", Some(Zone::Battlefield)),
+        ("anywhere", None),
+        ("your library", Some(Zone::Library)),
+        ("your hand", Some(Zone::Hand)),
+        ("your graveyard", Some(Zone::Graveyard)),
+    ];
+    for (origin_text, expected_origin) in cases {
+        let line =
+            format!("Whenever a creature card is put into exile from {origin_text}, draw a card.");
+        let def = parse_trigger_line(&line, "Some Card");
+        assert_eq!(def.mode, TriggerMode::ChangesZone, "{line}");
+        assert_eq!(def.origin, expected_origin, "{line}");
+        assert_eq!(def.destination, Some(Zone::Exile), "{line}");
+    }
+}
+
+/// Self-referential shape (Urza's Sylex): "When ~ is put into exile from the
+/// battlefield" keeps its battlefield origin and exile look-back zone.
+#[test]
+fn trigger_self_put_into_exile_from_battlefield() {
+    let def = parse_trigger_line(
+        "When Urza's Sylex is put into exile from the battlefield, you may pay {2}.",
+        "Urza's Sylex",
+    );
+    assert_eq!(def.mode, TriggerMode::ChangesZone);
+    assert_eq!(def.origin, Some(Zone::Battlefield));
+    assert_eq!(def.destination, Some(Zone::Exile));
+    assert!(
+        def.trigger_zones.contains(&Zone::Exile),
+        "self-referential exile trigger must look back from exile, got {:?}",
+        def.trigger_zones
+    );
+}
+
 /// CR 109.5 + CR 400.3: opponent-qualified union against an opponent-owned
 /// destination — the mirror of the Oglor (You+You) accept shape. The
 /// bare-ellipsis second disjunct inherits the head's `Opponent` qualifier, so
