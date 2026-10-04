@@ -6936,19 +6936,27 @@ fn detach_after_player_scope_local_chain(
         .condition
         .as_ref()
         .is_some_and(condition_depends_on_effect_performed);
-    // CR 608.2c + CR 109.5: a decline-branch sub-ability gated on
-    // `ZoneChangedThisWay` (Kroxa, Titan of Death's Hunger: "each opponent who
-    // didn't discard a nonland card this way") reads `last_zone_changed_ids`
-    // stamped by THIS iteration's own scoped zone change — it is per-opponent
-    // by construction exactly like the performed-gate class above, just keyed
-    // on WHAT moved rather than WHETHER the parent action happened. Detaching
-    // it as the unscoped tail would evaluate it once, after every opponent's
-    // discard has already overwritten the ledger, against the wrong (or a
-    // stale aggregate) zone-change set.
-    let next_is_zone_change_this_way_gated = next
+    // CR 608.2c + CR 608.2f: a "this way" zone-change gate is per-iteration
+    // only when the gated clause is ABOUT the iterated player. Kroxa, Titan of
+    // Death's Hunger's "each opponent who didn't discard a nonland card this
+    // way loses 3 life" lowers to `LoseLife { ScopedPlayer }`: each opponent's
+    // own discard gates their own life loss, so the sub reads the ledger
+    // stamped by THIS iteration's zone change and stays in the scoped template
+    // — the zone-keyed twin of the performed-gate class above.
+    //
+    // A gated clause about "you", the source, or a target is instead ONE
+    // look-back over the whole multi-player action. Locke, Treasure Hunter's
+    // "each player mills a card. If a land card was milled this way, create a
+    // Treasure token" creates exactly one Treasure as long as any land was
+    // milled (ruling 2025-06-06). Kept in scope it would be re-evaluated, and
+    // its implicit controller rebound, once per player. Detached, it resolves
+    // once, after `publish_player_scope_clause_results` has published every
+    // player's zone changes as the clause's aggregate ledger.
+    let next_is_scoped_player_zone_change_gated = next
         .condition
         .as_ref()
-        .is_some_and(condition_depends_on_zone_change_this_way);
+        .is_some_and(condition_depends_on_zone_change_this_way)
+        && effect_has_iteration_bound_recipient(&next.effect);
     // CR 608.2c: When the parser distributes "each player reveals the top card
     // of their library, loses life equal to that card's mana value, then puts
     // it into their hand" it stamps the SAME `player_scope` onto every clause.
@@ -7015,7 +7023,7 @@ fn detach_after_player_scope_local_chain(
         && is_player_scope_local_continuation(&node.effect, &next.effect, scope)
         && !next_is_scoped_search_shuffle_tail;
     if next_is_performed_gated
-        || next_is_zone_change_this_way_gated
+        || next_is_scoped_player_zone_change_gated
         || next_is_co_scoped_anaphoric_consumer
         || next_is_optional_clause_continuation
         || next_is_local_continuation
@@ -9176,6 +9184,25 @@ fn affected_objects_from_events(
                 })
                 .collect()
         }
+        // CR 608.2c + CR 108.2b: a token-creating node in a MIXED chain is not
+        // the antecedent of its continuation's anaphor. Locke, Treasure
+        // Hunter's "each player mills a card. If a land card was milled this
+        // way, create a Treasure token. Until end of turn, you may cast a spell
+        // from among those cards" and Ragavan, Nimble Pilferer's "create a
+        // Treasure token and exile the top card of that player's library. Until
+        // end of turn, you may cast that card" both name the moved CARDS — and
+        // a token is never a card. Without this arm the `_ =>` harvest reads the
+        // Treasure's own `ZoneChanged` and `publish_tracked_set` unions it into
+        // the card producer's set, so the Treasure joins "those cards".
+        //
+        // The gate is the SAME sole-producer rule the event-less arms above use,
+        // inverted: those arms PUBLISH only when sole and otherwise have nothing
+        // to harvest, whereas a token creation DOES emit `ZoneChanged`, so this
+        // arm must DECLINE when not sole. When the token creation is the chain's
+        // only producer (Force of Rage's "create two … tokens. Sacrifice those
+        // tokens …") the guard fails and the `_ =>` harvest publishes the
+        // created tokens exactly as before.
+        Effect::Token { .. } if !is_sole_chain_producer(state, ability) => Vec::new(),
         _ => {
             let dest_zone = match effect {
                 Effect::ChangeZone { destination, .. }
