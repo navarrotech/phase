@@ -20,8 +20,8 @@ use crate::support::shared_card_db as load_db;
 /// Exiles a creature card from P0's graveyard with Cremate while a watcher
 /// carrying `watcher_oracle` is on P0's battlefield, and returns how much life
 /// P0 lost.
-fn life_lost_after_graveyard_exile(watcher_oracle: &str) -> Option<i32> {
-    let db = load_db()?;
+fn life_lost_after_graveyard_exile(watcher_oracle: &str) -> i32 {
+    let db = load_db().expect("shared card database must be available for this integration test");
 
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
@@ -50,18 +50,16 @@ fn life_lost_after_graveyard_exile(watcher_oracle: &str) -> Option<i32> {
         Zone::Exile,
         "Cremate must exile the targeted card from the graveyard"
     );
-    Some(life_before - state.players[0].life)
+    life_before - state.players[0].life
 }
 
 /// Positive control: a recognized origin fires on a matching exile, proving
 /// the scenario reaches the trigger matcher.
 #[test]
 fn recognized_exile_origin_fires_on_matching_exile() {
-    let Some(life_lost) = life_lost_after_graveyard_exile(
+    let life_lost = life_lost_after_graveyard_exile(
         "Whenever a creature card is put into exile from your graveyard, you lose 1 life.",
-    ) else {
-        return;
-    };
+    );
     assert_eq!(
         life_lost, 1,
         "graveyard exile must fire the from-your-graveyard watcher"
@@ -72,11 +70,9 @@ fn recognized_exile_origin_fires_on_matching_exile() {
 /// exiling from a graveyard leaves the watcher silent.
 #[test]
 fn unparseable_exile_origin_does_not_fire_from_another_zone() {
-    let Some(life_lost) = life_lost_after_graveyard_exile(
+    let life_lost = life_lost_after_graveyard_exile(
         "Whenever a creature card is put into exile from an opponent's library, you lose 1 life.",
-    ) else {
-        return;
-    };
+    );
     assert_eq!(
         life_lost, 0,
         "an unparseable exile origin must not fire on exile from a graveyard"
