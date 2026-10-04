@@ -1844,10 +1844,16 @@ pub fn display_land_mana_pips(
             // type union (including Colorless) as a per-unit choice. Each
             // colored type emits a `Color` pip; a Colorless contribution emits
             // a separate `Colorless` pip so the frame faithfully shows the
-            // full option set.
+            // full option set. A cost-referent form ("the sacrificed land") has
+            // no referent until activation, so it shows no pips.
             ManaProduction::AnyTypeProduceableBy { land_filter, .. } => {
-                let types =
-                    produceable_mana_types_by_filter(state, land_filter, controller, object_id);
+                let types = produceable_mana_types_by_filter(
+                    state,
+                    land_filter,
+                    controller,
+                    object_id,
+                    None,
+                );
                 let colors: Vec<ManaColor> = types
                     .iter()
                     .copied()
@@ -2194,10 +2200,32 @@ pub(crate) fn feasible_mana_capacity(
             Effect::Mana { produced, .. } => {
                 let resolved =
                     super::ability_utils::build_resolved_from_def(ability, object_id, controller);
-                let gross = super::effects::mana::resolve_mana_types_for_ability(
-                    produced, state, &resolved,
-                )
-                .len() as u32;
+                // CR 106.7 + CR 608.2k + CR 117.1d: an unbound cost referent
+                // (see `unbound_cost_referent_mana_types`) yields its count when
+                // any legal choice could produce mana, and nothing otherwise
+                // (CR 106.5). The resolver alone would answer zero, because the
+                // referent is bound only when the cost is paid.
+                let gross = if let ManaProduction::AnyTypeProduceableBy {
+                    count,
+                    land_filter: TargetFilter::CostPaidObject,
+                } = produced
+                {
+                    let options = unbound_cost_referent_mana_types(
+                        state,
+                        controller,
+                        object_id,
+                        &ability.cost,
+                    );
+                    if options.is_empty() {
+                        0
+                    } else {
+                        super::quantity::resolve_quantity_with_targets(state, count, &resolved)
+                            .max(0) as u32
+                    }
+                } else {
+                    super::effects::mana::resolve_mana_types_for_ability(produced, state, &resolved)
+                        .len() as u32
+                };
                 // CR 605.3b: Net the mana paid to activate. Non-mana cost
                 // components (Sacrifice / Discard / PayLife / Exile) have no
                 // mana sub-cost, so `mana_sub_cost_of` returns `None` and the
@@ -2226,6 +2254,48 @@ pub(crate) fn feasible_mana_capacity(
         .max();
 
     explicit_max.unwrap_or(0)
+}
+
+/// CR 106.7 + CR 608.2k + CR 117.1d + CR 601.2g: The mana types a not-yet-
+/// activated "any type the sacrificed <noun> could produce" ability could add.
+/// The referent is bound only when the sacrifice cost is paid, so before
+/// activation the reading ranges over every legal choice for that cost: the
+/// union of what each candidate could produce, read top-level exactly as the
+/// bound referent will be (`snapshot_with_produceable_mana_types`). This is a
+/// castability estimate over choices, never a binding: production and the
+/// choice prompt read only the cost-paid snapshot. A cost with no non-self
+/// sacrifice (`None`) has no candidate set here, so it yields no types
+/// (CR 106.5, fail closed). A sacrificed permanent is controlled by the
+/// activator (CR 701.21a), so `controller` anchors every candidate's reading.
+/// Like KCI, this over-counts when one land is also counted as a tap source or
+/// by another sacrifice outlet (accepted trade-off, issue #1235, `casting.rs`
+/// capacity comment).
+pub(crate) fn unbound_cost_referent_mana_types(
+    state: &GameState,
+    controller: PlayerId,
+    source_id: ObjectId,
+    cost: &Option<AbilityCost>,
+) -> Vec<ManaType> {
+    let Some((_, candidates)) =
+        mana_abilities::sacrifice_cost_choice(state, controller, source_id, cost)
+    else {
+        return Vec::new();
+    };
+    let mut options = Vec::new();
+    for candidate in candidates {
+        let candidate_types = produceable_mana_types_of_object(
+            state,
+            candidate,
+            controller,
+            CouldProduceDepth::TopLevel,
+        );
+        for mana_type in candidate_types {
+            if !options.contains(&mana_type) {
+                options.push(mana_type);
+            }
+        }
+    }
+    options
 }
 
 /// CR 117.1d + CR 601.2g: True when cost payment can involve a currently
@@ -2311,6 +2381,7 @@ fn profile_kind_from_production(
     state: &GameState,
     object_id: ObjectId,
     controller: PlayerId,
+    cost: &Option<AbilityCost>,
     produced: &ManaProduction,
     resolved: &crate::types::ability::ResolvedAbility,
 ) -> Option<ActivatableManaProfileKind> {
@@ -2348,6 +2419,25 @@ fn profile_kind_from_production(
             } else {
                 Some(ActivatableManaProfileKind::AnyOneColor { count, options })
             }
+        }
+        // CR 106.7 + CR 608.2k + CR 601.2g: "any type the sacrificed land could
+        // produce" has no referent until its cost is paid; credit the union over
+        // the cost's legal choices (KCI precedent: the estimator, not the gate,
+        // is cost-aware). The count is read from the expression because the
+        // resolver yields no types for an unbound referent.
+        ManaProduction::AnyTypeProduceableBy {
+            count,
+            land_filter: TargetFilter::CostPaidObject,
+        } => {
+            let options = unbound_cost_referent_mana_types(state, controller, object_id, cost);
+            if options.is_empty() {
+                return None;
+            }
+            let count = super::quantity::resolve_quantity_with_targets(state, count, resolved);
+            Some(ActivatableManaProfileKind::AnyOneColor {
+                count: count.max(0) as u32,
+                options,
+            })
         }
         ManaProduction::OpponentLandColors { .. }
         | ManaProduction::AnyTypeProduceableBy { .. }
@@ -2448,9 +2538,16 @@ fn activatable_mana_profiles_for_object(
             }
             let resolved =
                 super::ability_utils::build_resolved_from_def(ability, object_id, controller);
-            profile_kind_from_production(state, object_id, controller, produced, &resolved)
-                .and_then(|kind| profile_kind_allowed_for_context(kind, payment_context))
-                .map(|kind| ActivatableManaProfile { object_id, kind })
+            profile_kind_from_production(
+                state,
+                object_id,
+                controller,
+                &ability.cost,
+                produced,
+                &resolved,
+            )
+            .and_then(|kind| profile_kind_allowed_for_context(kind, payment_context))
+            .map(|kind| ActivatableManaProfile { object_id, kind })
         })
         .collect()
 }
@@ -3168,9 +3265,12 @@ fn mana_options_from_production(
         // CR 106.7: Compute colors dynamically from opponent-controlled lands.
         ManaProduction::OpponentLandColors { .. } => opponent_land_color_options(state, controller),
         // CR 106.7 + CR 106.1b: Compute the full type set (incl. Colorless)
-        // from lands matching `land_filter` (Reflecting Pool class).
+        // from lands matching `land_filter` (Reflecting Pool class). This
+        // enumeration has no resolving ability, so a cost-referent form ("the
+        // sacrificed land") has no pre-activation option set and contributes
+        // nothing, like `AnyCombinationOfObjectColors` below.
         ManaProduction::AnyTypeProduceableBy { land_filter, .. } => {
-            produceable_mana_types_by_filter(state, land_filter, controller, object_id)
+            produceable_mana_types_by_filter(state, land_filter, controller, object_id, None)
         }
         // CR 605.1a + CR 406.1 + CR 610.3: Compute colors dynamically from cards
         // exiled-with this source via `state.exile_links` (Pit of Offerings).
@@ -3616,13 +3716,34 @@ pub(crate) fn aura_taps_for_mana_sources_for_land(
 /// and `AnyTypeProduceableBy` abilities on the surveyed lands are skipped to
 /// prevent infinite mutual recursion (e.g., two Reflecting Pools facing each
 /// other with no other lands produce no mana, per CR 106.5).
+///
+/// CR 608.2k + CR 608.2h: When `land_filter` is the cost referent
+/// (`TargetFilter::CostPaidObject`, "the sacrificed land could produce" —
+/// Squandered Resources) there is no population to survey: the answer is the
+/// referent's own could-produce set, read from the resolving `ability`'s
+/// cost-paid snapshot.
 pub(crate) fn produceable_mana_types_by_filter(
     state: &GameState,
     land_filter: &TargetFilter,
     controller: PlayerId,
     self_source_id: ObjectId,
+    ability: Option<&ResolvedAbility>,
 ) -> Vec<ManaType> {
     use crate::game::filter::{matches_target_filter, FilterContext};
+    // CR 106.7 + CR 608.2k + CR 608.2h: "any type the sacrificed land could
+    // produce" names the ability's cost referent, not a battlefield population.
+    // The referent has left the battlefield (the cost moved it), so its
+    // could-produce set is read from the snapshot taken while it was still a
+    // permanent — an LKI read, deliberately not incarnation-gated (mirrors the
+    // `ObjectScope::CostPaidObject` LKI readers in `game/quantity.rs`). With no
+    // resolving ability (source enumeration, display) there is no referent yet,
+    // so no option set (CR 106.5).
+    if matches!(land_filter, TargetFilter::CostPaidObject) {
+        return ability
+            .and_then(|ability| ability.cost_paid_object.as_ref())
+            .map(|snapshot| snapshot.lki.produceable_mana_types.clone())
+            .unwrap_or_default();
+    }
     // CR 109.4: `ControllerRef::You` resolves against the activator. Anchor the
     // filter context to the explicit controller so the "you control" predicate
     // is correct even when the source object has left play (e.g., self-sac
@@ -3640,54 +3761,123 @@ pub(crate) fn produceable_mana_types_by_filter(
         if !matches_target_filter(state, *object_id, land_filter, &filter_ctx) {
             continue;
         }
-        // CR 106.7: Survey each mana ability, skipping the recursive variants
-        // so a self-referential cycle yields the empty set (CR 106.5).
-        let mut obj_had_explicit_ability = false;
-        for ability in obj.abilities.iter() {
-            if ability.kind != AbilityKind::Activated
-                || !super::mana_abilities::is_mana_ability(ability)
-            {
-                continue;
-            }
-            if !has_tap_component(&ability.cost) {
-                continue;
-            }
-            let Effect::Mana { produced, .. } = &*ability.effect else {
-                continue;
-            };
-            // CR 106.7: Skip recursive producers to prevent infinite mutual
-            // recursion (Reflecting Pool ↔ Reflecting Pool, Reflecting Pool ↔
-            // Exotic Orchard).
-            if matches!(
-                produced,
-                ManaProduction::OpponentLandColors { .. }
-                    | ManaProduction::AnyTypeProduceableBy { .. }
-            ) {
-                obj_had_explicit_ability = true;
-                continue;
-            }
-            obj_had_explicit_ability = true;
-            for mana_type in mana_options_from_production(state, controller, *object_id, produced) {
-                if !options.contains(&mana_type) {
-                    options.push(mana_type);
-                }
-            }
-        }
-        // Fallback: basic-land subtype-only objects (no explicit mana ability).
-        if !obj_had_explicit_ability {
-            if let Some(mana_type) = obj
-                .card_types
-                .subtypes
-                .iter()
-                .find_map(|s| super::mana_payment::land_subtype_to_mana_type(s))
-            {
-                if !options.contains(&mana_type) {
-                    options.push(mana_type);
-                }
+        let object_types = produceable_mana_types_of_object(
+            state,
+            *object_id,
+            controller,
+            CouldProduceDepth::Nested,
+        );
+        for mana_type in object_types {
+            if !options.contains(&mana_type) {
+                options.push(mana_type);
             }
         }
     }
     options
+}
+
+/// CR 106.7: Whether a could-produce reading is itself nested inside another
+/// could-produce census. A census must skip abilities that themselves produce
+/// from a could-produce clause so mutual producers (two Reflecting Pools,
+/// Reflecting Pool ↔ Exotic Orchard) terminate with the empty set (CR 106.5);
+/// a top-level reading of one permanent evaluates them once through their own
+/// (nested) census, which is what CR 106.7 asks of "the sacrificed land".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CouldProduceDepth {
+    Nested,
+    TopLevel,
+}
+
+/// CR 106.7 + CR 106.1b: The mana types `object_id` could produce right now —
+/// the union over its `{T}` mana abilities, ignoring whether their costs could
+/// be paid, with a basic-land-subtype fallback for objects that carry no
+/// explicit mana ability. The census (`produceable_mana_types_by_filter`) owns
+/// the population; this function owns the per-object reading, so the census and
+/// the cost-paid capture (`snapshot_with_produceable_mana_types`) cannot drift.
+/// `controller` anchors any nested "you control" survey the object's own
+/// abilities perform.
+pub(crate) fn produceable_mana_types_of_object(
+    state: &GameState,
+    object_id: ObjectId,
+    controller: PlayerId,
+    depth: CouldProduceDepth,
+) -> Vec<ManaType> {
+    let Some(obj) = state.objects.get(&object_id) else {
+        return Vec::new();
+    };
+    let mut options = Vec::new();
+    // CR 106.7: Survey each mana ability. A recursive producer still counts as
+    // an explicit mana ability, so it suppresses the subtype fallback below.
+    let mut obj_had_explicit_ability = false;
+    for ability in obj.abilities.iter() {
+        if ability.kind != AbilityKind::Activated
+            || !super::mana_abilities::is_mana_ability(ability)
+        {
+            continue;
+        }
+        if !has_tap_component(&ability.cost) {
+            continue;
+        }
+        let Effect::Mana { produced, .. } = &*ability.effect else {
+            continue;
+        };
+        obj_had_explicit_ability = true;
+        let is_recursive_producer = matches!(
+            produced,
+            ManaProduction::OpponentLandColors { .. } | ManaProduction::AnyTypeProduceableBy { .. }
+        );
+        // CR 106.7 + CR 106.5: Inside a census, skip recursive producers so
+        // Reflecting Pool ↔ Reflecting Pool and Reflecting Pool ↔ Exotic Orchard
+        // terminate. A top-level read evaluates them once through their own
+        // census, which runs `Nested`, so depth is bounded at two.
+        if is_recursive_producer {
+            match depth {
+                CouldProduceDepth::Nested => continue,
+                CouldProduceDepth::TopLevel => {}
+            }
+        }
+        for mana_type in mana_options_from_production(state, controller, object_id, produced) {
+            if !options.contains(&mana_type) {
+                options.push(mana_type);
+            }
+        }
+    }
+    // Fallback: basic-land subtype-only objects (no explicit mana ability).
+    if !obj_had_explicit_ability {
+        if let Some(mana_type) = obj
+            .card_types
+            .subtypes
+            .iter()
+            .find_map(|subtype| super::mana_payment::land_subtype_to_mana_type(subtype))
+        {
+            options.push(mana_type);
+        }
+    }
+    options
+}
+
+/// CR 608.2h + CR 106.7: Capture `object`'s public characteristics together with
+/// the mana types it could produce as it last existed, for a cost-paid referent
+/// ("the sacrificed land"). Taken while the permanent is still on the
+/// battlefield with layers applied, so a granted ability (Urborg's Swamp
+/// intrinsic, CR 305.6) is part of the answer. "Could produce" is defined for
+/// permanents; a card paid from a graveyard, library, or hand has no such set.
+/// The permanent's own controller anchors the reading — for a sacrifice that is
+/// the activator (CR 701.21a).
+pub(crate) fn snapshot_with_produceable_mana_types(
+    state: &GameState,
+    object: &crate::game::game_object::GameObject,
+) -> crate::types::game_state::LKISnapshot {
+    let mut lki = object.snapshot_for_mana_spent();
+    if object.zone == Zone::Battlefield {
+        lki.produceable_mana_types = produceable_mana_types_of_object(
+            state,
+            object.id,
+            object.controller,
+            CouldProduceDepth::TopLevel,
+        );
+    }
+    lki
 }
 
 pub fn mana_color_to_type(color: &ManaColor) -> ManaType {
@@ -6408,5 +6598,336 @@ mod tests {
             !source_is_snow(&state, ObjectId(0)),
             "the ObjectId(0) sentinel (and any absent object) is not a snow source",
         );
+    }
+
+    /// CR 106.7: the per-object could-produce authority, its cost-paid LKI
+    /// capture, and the pre-activation cost-referent union (Squandered
+    /// Resources, "any type the sacrificed land could produce").
+    mod could_produce {
+        use super::*;
+
+        const P0: PlayerId = PlayerId(0);
+        const P1: PlayerId = PlayerId(1);
+
+        fn tap_mana_ability(produced: ManaProduction) -> AbilityDefinition {
+            AbilityDefinition::new(
+                AbilityKind::Activated,
+                Effect::Mana {
+                    produced,
+                    restrictions: vec![],
+                    grants: vec![],
+                    expiry: None,
+                    target: None,
+                },
+            )
+            .cost(AbilityCost::Tap)
+        }
+
+        fn fixed(color: ManaColor) -> ManaProduction {
+            ManaProduction::Fixed {
+                colors: vec![color],
+                contribution: ManaContribution::Base,
+            }
+        }
+
+        fn reflecting_pool_production() -> ManaProduction {
+            ManaProduction::AnyTypeProduceableBy {
+                count: QuantityExpr::Fixed { value: 1 },
+                land_filter: TargetFilter::Typed(
+                    TypedFilter::land().controller(ControllerRef::You),
+                ),
+            }
+        }
+
+        fn add_object(
+            state: &mut GameState,
+            controller: PlayerId,
+            name: &str,
+            zone: Zone,
+            core_type: CoreType,
+            abilities: Vec<AbilityDefinition>,
+        ) -> ObjectId {
+            let id = create_object(state, CardId(700), controller, name.to_string(), zone);
+            let object = state.objects.get_mut(&id).unwrap();
+            object.card_types.core_types.push(core_type);
+            object.summoning_sick = false;
+            Arc::make_mut(&mut object.abilities).extend(abilities);
+            id
+        }
+
+        fn add_land(
+            state: &mut GameState,
+            controller: PlayerId,
+            name: &str,
+            productions: Vec<ManaProduction>,
+        ) -> ObjectId {
+            let abilities = productions.into_iter().map(tap_mana_ability).collect();
+            add_object(
+                state,
+                controller,
+                name,
+                Zone::Battlefield,
+                CoreType::Land,
+                abilities,
+            )
+        }
+
+        /// A Squandered Resources-shaped enchantment: "Sacrifice a land: Add one
+        /// mana of any type the sacrificed land could produce."
+        fn add_squandered(state: &mut GameState) -> ObjectId {
+            let ability = AbilityDefinition::new(
+                AbilityKind::Activated,
+                Effect::Mana {
+                    produced: ManaProduction::AnyTypeProduceableBy {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        land_filter: TargetFilter::CostPaidObject,
+                    },
+                    restrictions: vec![],
+                    grants: vec![],
+                    expiry: None,
+                    target: None,
+                },
+            )
+            .cost(AbilityCost::Sacrifice(SacrificeCost::count(
+                TargetFilter::Typed(TypedFilter::land()),
+                1,
+            )));
+            add_object(
+                state,
+                P0,
+                "Squandered Resources",
+                Zone::Battlefield,
+                CoreType::Enchantment,
+                vec![ability],
+            )
+        }
+
+        fn main_phase_state() -> GameState {
+            let mut state = GameState::new_two_player(42);
+            state.phase = crate::types::phase::Phase::PreCombatMain;
+            state.active_player = P0;
+            state.priority_player = P0;
+            state.waiting_for = WaitingFor::Priority { player: P0 };
+            state.turn_number = 2;
+            state
+        }
+
+        fn sorted(mut types: Vec<ManaType>) -> Vec<ManaType> {
+            types.sort_by_key(|mana_type| format!("{mana_type:?}"));
+            types
+        }
+
+        /// M1: the extracted per-object reading (`Nested`) reproduces the census,
+        /// and the census still applies its Land and controller filters on an
+        /// unfriendly board (a non-land mana creature, an opponent's land).
+        #[test]
+        fn nested_reading_matches_the_census_and_keeps_its_filters() {
+            let mut state = main_phase_state();
+            let forest = add_land(&mut state, P0, "Forest", vec![fixed(ManaColor::Green)]);
+            let wastes = add_land(
+                &mut state,
+                P0,
+                "Wastes",
+                vec![ManaProduction::Colorless {
+                    count: QuantityExpr::Fixed { value: 1 },
+                }],
+            );
+            let dual = add_land(
+                &mut state,
+                P0,
+                "Dual",
+                vec![fixed(ManaColor::Green), fixed(ManaColor::Blue)],
+            );
+            let pool = add_land(
+                &mut state,
+                P0,
+                "Reflecting Pool",
+                vec![reflecting_pool_production()],
+            );
+            let mana_creature = add_object(
+                &mut state,
+                P0,
+                "Red Mana Creature",
+                Zone::Battlefield,
+                CoreType::Creature,
+                vec![tap_mana_ability(fixed(ManaColor::Red))],
+            );
+            add_land(
+                &mut state,
+                P1,
+                "Opponent Swamp",
+                vec![fixed(ManaColor::Black)],
+            );
+
+            let nested = |object_id| {
+                produceable_mana_types_of_object(&state, object_id, P0, CouldProduceDepth::Nested)
+            };
+            assert_eq!(nested(forest), vec![ManaType::Green]);
+            assert_eq!(nested(wastes), vec![ManaType::Colorless]);
+            assert_eq!(nested(dual), vec![ManaType::Green, ManaType::Blue]);
+            assert_eq!(
+                nested(pool),
+                Vec::<ManaType>::new(),
+                "in-census recursive skip"
+            );
+            assert_eq!(nested(mana_creature), vec![ManaType::Red]);
+
+            let census = produceable_mana_types_by_filter(
+                &state,
+                &TargetFilter::Typed(TypedFilter::land().controller(ControllerRef::You)),
+                P0,
+                pool,
+                None,
+            );
+            assert_eq!(
+                sorted(census),
+                sorted(vec![ManaType::Green, ManaType::Colorless, ManaType::Blue]),
+                "the census excludes the non-land Red source and the opponent's Swamp"
+            );
+        }
+
+        /// M5: a top-level reading evaluates a recursive producer once through
+        /// its own census; the nested reading on the same board skips it.
+        #[test]
+        fn top_level_reading_evaluates_a_recursive_producer() {
+            let mut state = main_phase_state();
+            add_land(&mut state, P0, "Forest", vec![fixed(ManaColor::Green)]);
+            let pool = add_land(
+                &mut state,
+                P0,
+                "Reflecting Pool",
+                vec![reflecting_pool_production()],
+            );
+
+            assert_eq!(
+                produceable_mana_types_of_object(&state, pool, P0, CouldProduceDepth::TopLevel),
+                vec![ManaType::Green]
+            );
+            assert_eq!(
+                produceable_mana_types_of_object(&state, pool, P0, CouldProduceDepth::Nested),
+                Vec::<ManaType>::new()
+            );
+        }
+
+        /// M2 + M3: the cost-paid capture fills the could-produce set for a
+        /// permanent and leaves it empty for a card in another zone.
+        #[test]
+        fn capture_is_filled_on_the_battlefield_only() {
+            let mut state = main_phase_state();
+            let forest = add_land(&mut state, P0, "Forest", vec![fixed(ManaColor::Green)]);
+            let graveyard_forest = add_object(
+                &mut state,
+                P0,
+                "Graveyard Forest",
+                Zone::Graveyard,
+                CoreType::Land,
+                vec![tap_mana_ability(fixed(ManaColor::Green))],
+            );
+
+            let on_battlefield =
+                snapshot_with_produceable_mana_types(&state, &state.objects[&forest]);
+            assert_eq!(on_battlefield.produceable_mana_types, vec![ManaType::Green]);
+
+            let in_graveyard =
+                snapshot_with_produceable_mana_types(&state, &state.objects[&graveyard_forest]);
+            assert!(in_graveyard.produceable_mana_types.is_empty());
+        }
+
+        /// M4: the field is omitted when empty, absent keys deserialize to
+        /// empty, and a populated set round-trips.
+        #[test]
+        fn produceable_mana_types_serde_is_backward_compatible() {
+            let mut state = main_phase_state();
+            let forest = add_land(&mut state, P0, "Forest", vec![fixed(ManaColor::Green)]);
+
+            let empty = state.objects[&forest].snapshot_for_mana_spent();
+            let empty_json = serde_json::to_value(&empty).unwrap();
+            assert!(empty_json.get("produceable_mana_types").is_none());
+            let restored: crate::types::game_state::LKISnapshot =
+                serde_json::from_value(empty_json).unwrap();
+            assert!(restored.produceable_mana_types.is_empty());
+
+            let populated = snapshot_with_produceable_mana_types(&state, &state.objects[&forest]);
+            let round_trip: crate::types::game_state::LKISnapshot =
+                serde_json::from_value(serde_json::to_value(&populated).unwrap()).unwrap();
+            assert_eq!(round_trip.produceable_mana_types, vec![ManaType::Green]);
+        }
+
+        /// M6: before activation the referent ranges over the cost's legal
+        /// choices — your own lands only (CR 701.21a) — and a land that could
+        /// produce nothing contributes nothing (CR 106.5).
+        #[test]
+        fn unbound_referent_unions_the_legal_sacrifice_choices() {
+            let mut state = main_phase_state();
+            let squandered = add_squandered(&mut state);
+            add_land(&mut state, P0, "Forest", vec![fixed(ManaColor::Green)]);
+            add_land(&mut state, P0, "Island", vec![fixed(ManaColor::Blue)]);
+            add_land(
+                &mut state,
+                P1,
+                "Opponent Swamp",
+                vec![fixed(ManaColor::Black)],
+            );
+            let cost = state.objects[&squandered].abilities[0].cost.clone();
+
+            let options = unbound_cost_referent_mana_types(&state, P0, squandered, &cost);
+            assert_eq!(
+                sorted(options),
+                sorted(vec![ManaType::Green, ManaType::Blue]),
+                "an opponent's Swamp is not a legal sacrifice, so Black is excluded"
+            );
+
+            let mut wilds_only = main_phase_state();
+            let squandered = add_squandered(&mut wilds_only);
+            add_land(&mut wilds_only, P0, "Evolving Wilds", vec![]);
+            assert!(
+                unbound_cost_referent_mana_types(&wilds_only, P0, squandered, &cost).is_empty()
+            );
+
+            assert!(
+                unbound_cost_referent_mana_types(&state, P0, squandered, &Some(AbilityCost::Tap))
+                    .is_empty(),
+                "a cost with no non-self sacrifice has no referent candidates"
+            );
+        }
+
+        /// M7: both castability estimators credit an unbound referent on the
+        /// same boards — one mana from a tapped Forest, nothing from a land that
+        /// could produce nothing.
+        #[test]
+        fn castability_estimators_credit_an_unbound_referent() {
+            let mut state = main_phase_state();
+            let squandered = add_squandered(&mut state);
+            let forest = add_land(&mut state, P0, "Forest", vec![fixed(ManaColor::Green)]);
+            state.objects.get_mut(&forest).unwrap().tapped = true;
+
+            assert_eq!(feasible_mana_capacity(&state, squandered, P0, None), 1);
+            assert_eq!(
+                can_cover_shards_with_activatable_mana(
+                    &state,
+                    P0,
+                    None,
+                    None,
+                    &[ManaCostShard::Green]
+                ),
+                (true, 1)
+            );
+
+            let mut wilds_only = main_phase_state();
+            let squandered = add_squandered(&mut wilds_only);
+            add_land(&mut wilds_only, P0, "Evolving Wilds", vec![]);
+
+            assert_eq!(feasible_mana_capacity(&wilds_only, squandered, P0, None), 0);
+            assert_eq!(
+                can_cover_shards_with_activatable_mana(
+                    &wilds_only,
+                    P0,
+                    None,
+                    None,
+                    &[ManaCostShard::Green],
+                ),
+                (false, 0)
+            );
+        }
     }
 }

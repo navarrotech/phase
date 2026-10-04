@@ -1324,6 +1324,7 @@ mod split_offstack_mana_value;
 mod springheart_nantuko_bestow_landfall;
 mod springheart_realdb_repro;
 mod sprout_inalla_realistic_offer;
+mod squandered_resources_sacrificed_land_mana;
 mod squirming_emergence_mana_value_target;
 mod squirrel_mob_dynamic_pump;
 mod stack_ability_kind_axis;

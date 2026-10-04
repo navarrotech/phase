@@ -3122,6 +3122,7 @@ fn reveal_until_object_context_from_events(events: &[GameEvent]) -> Option<CostP
                 tapped: subject.tapped,
                 is_suspected: subject.is_suspected,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
             },
             incarnation: subject.identity.incarnation,
         }),
@@ -3185,6 +3186,7 @@ fn lki_snapshot_from_zone_change_record(record: &ZoneChangeRecord) -> LKISnapsho
         // (SBA unattaches everything the instant the host leaves, CR 704.5m/n), so carry
         // it through rather than dropping it on the way into the LKI.
         attachments: record.attachments.clone(),
+        produceable_mana_types: Vec::new(),
     }
 }
 
@@ -23215,6 +23217,7 @@ mod tests {
                 tapped: false,
                 is_suspected: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
             },
         );
 
@@ -26649,6 +26652,7 @@ mod tests {
                 tapped: false,
                 is_suspected: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
             },
         );
         let events = vec![

@@ -465,6 +465,20 @@ pub struct LKISnapshot {
     /// which is exactly the pre-change fail-closed behavior.
     #[serde(default)]
     pub attachments: Vec<AttachmentSnapshot>,
+    /// CR 106.7 + CR 608.2h: The mana types this object could produce as it last
+    /// existed on the battlefield (union over its mana abilities, ignoring cost
+    /// payability). A "could produce" read of a departed permanent — "the
+    /// sacrificed land" (Squandered Resources) — answers from here, because the
+    /// object's layered abilities are gone once it leaves.
+    ///
+    /// Empty by construction in `GameObject::snapshot_public_characteristics`
+    /// (`&self` cannot read the battlefield state CR 106.7 needs, e.g. a commander's
+    /// color identity); filled only by the mana-ability cost-paid captures that go
+    /// through `mana_sources::snapshot_with_produceable_mana_types`.
+    /// `#[serde(default)]` ⇒ pre-existing saves deserialize to an empty set, which
+    /// produces no mana (CR 106.5, fail closed).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub produceable_mana_types: Vec<ManaType>,
 }
 
 /// Complete event-time authority for a triggered ability's source.
@@ -37440,6 +37454,7 @@ mod tests {
                 tapped: false,
                 is_suspected: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
             }
         }
 

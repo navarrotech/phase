@@ -1185,6 +1185,8 @@ pub(crate) fn mana_choice_prompt(
         // mana types that filter-matching lands could produce, including
         // `Colorless`. With 0 or 1 options the resolver handles it without a
         // prompt (CR 106.5: empty union → no mana; single option auto-picks).
+        // CR 608.2k: the cost-referent form ("the sacrificed land") offers the
+        // referent's own could-produce set from the ability's cost-paid snapshot.
         ManaProduction::AnyTypeProduceableBy { land_filter, .. } => {
             let owner = state.objects.get(&source_id).map(|obj| obj.controller)?;
             let options = super::mana_sources::produceable_mana_types_by_filter(
@@ -1192,6 +1194,7 @@ pub(crate) fn mana_choice_prompt(
                 land_filter,
                 owner,
                 source_id,
+                color_ability,
             );
             // CR 106.5: An ability that would produce mana of an undefined type
             // produces no mana, so it needs no color choice.
@@ -1551,10 +1554,12 @@ pub fn handle_exile_for_mana_ability(
     // CR 117.1 + CR 400.7j + CR 608.2k: Capture the cost-paid object's public
     // characteristics before it leaves its zone.
     let captured = chosen.first().and_then(|id| {
-        state
-            .objects
-            .get(id)
-            .map(|obj| CostPaidObjectSnapshot::capture(obj, obj.snapshot_for_mana_spent()))
+        state.objects.get(id).map(|obj| {
+            // CR 608.2h + CR 106.7: include what the object could produce
+            // as it last existed ("the sacrificed land could produce").
+            let lki = super::mana_sources::snapshot_with_produceable_mana_types(state, obj);
+            CostPaidObjectSnapshot::capture(obj, lki)
+        })
     });
 
     let mut updated = pending.clone();
@@ -1598,10 +1603,12 @@ pub fn handle_sacrifice_for_mana_ability(
     }
 
     let captured = chosen.first().and_then(|id| {
-        state
-            .objects
-            .get(id)
-            .map(|obj| CostPaidObjectSnapshot::capture(obj, obj.snapshot_for_mana_spent()))
+        state.objects.get(id).map(|obj| {
+            // CR 608.2h + CR 106.7: include what the object could produce
+            // as it last existed ("the sacrificed land could produce").
+            let lki = super::mana_sources::snapshot_with_produceable_mana_types(state, obj);
+            CostPaidObjectSnapshot::capture(obj, lki)
+        })
     });
 
     let mut updated = pending.clone();
@@ -2184,10 +2191,6 @@ pub(super) fn advance_mana_ability_activation(
         if let Some((count, permanents)) =
             sacrifice_cost_choice(state, pending.player, pending.source_id, &ability_def.cost)
         {
-            let permanents: Vec<ObjectId> = permanents
-                .into_iter()
-                .filter(|id| !deferred_spell_sacrifice_reserved(state, *id))
-                .collect();
             if permanents.len() < count {
                 return Err(EngineError::ActionNotAllowed(
                     "Not enough eligible permanents to sacrifice for mana ability cost".to_string(),
@@ -5171,10 +5174,12 @@ fn prepare_deterministic_exile_cost_selection(
         ));
     }
     let captured = chosen.first().and_then(|id| {
-        state
-            .objects
-            .get(id)
-            .map(|obj| CostPaidObjectSnapshot::capture(obj, obj.snapshot_for_mana_spent()))
+        state.objects.get(id).map(|obj| {
+            // CR 608.2h + CR 106.7: include what the object could produce
+            // as it last existed ("the sacrificed land could produce").
+            let lki = super::mana_sources::snapshot_with_produceable_mana_types(state, obj);
+            CostPaidObjectSnapshot::capture(obj, lki)
+        })
     });
     let mut updated = pending.clone();
     updated.chosen_exiled = chosen;
@@ -5186,7 +5191,14 @@ fn prepare_deterministic_exile_cost_selection(
 /// for an `AbilityCost::Sacrifice(SacrificeCost::count(!SelfRef, 1))` mana ability cost.
 /// Delegates eligibility to the casting cost helper so mana and non-mana
 /// activation costs share the same battlefield/controller/filter semantics.
-fn sacrifice_cost_choice(
+///
+/// This is the single candidate authority for a non-self sacrifice mana cost:
+/// the activation seam surfaces these choices, and the castability gate reads
+/// the same set before activation
+/// (`mana_sources::unbound_cost_referent_mana_types`). CR 118.10: a permanent
+/// already committed to a pending spell's sacrifice cost is excluded here, so
+/// both readers agree on it. `None` means the cost has no non-self sacrifice.
+pub(crate) fn sacrifice_cost_choice(
     state: &GameState,
     player: PlayerId,
     source_id: ObjectId,
@@ -5194,7 +5206,10 @@ fn sacrifice_cost_choice(
 ) -> Option<(usize, Vec<ObjectId>)> {
     let (count, filter) = super::casting::find_non_self_sacrifice_cost(cost.as_ref()?)?;
     let permanents =
-        super::casting::find_eligible_sacrifice_targets(state, player, source_id, filter);
+        super::casting::find_eligible_sacrifice_targets(state, player, source_id, filter)
+            .into_iter()
+            .filter(|id| !deferred_spell_sacrifice_reserved(state, *id))
+            .collect();
     Some((count as usize, permanents))
 }
 

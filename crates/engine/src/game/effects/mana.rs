@@ -768,7 +768,10 @@ fn resolve_mana_types_impl(
         // per-type choice prompt is surfaced by `mana_choice_prompt` when the
         // option set has more than one type. CR 106.5: an empty option set
         // (no matching lands, or only mutually-recursive producers) produces
-        // no mana.
+        // no mana. CR 608.2k: the cost-referent form ("the sacrificed land")
+        // reads the referent's could-produce set from `ability`'s cost-paid
+        // snapshot, so a one-type referent auto-picks and a land that could
+        // produce nothing yields no mana.
         ManaProduction::AnyTypeProduceableBy { count, land_filter } => {
             let amount = resolve_count(count, state, ability, controller, source_id);
             let type_options = mana_sources::produceable_mana_types_by_filter(
@@ -776,6 +779,7 @@ fn resolve_mana_types_impl(
                 land_filter,
                 controller,
                 source_id,
+                ability,
             );
             let Some(first) = type_options.first().copied() else {
                 return Vec::new();
@@ -2800,6 +2804,7 @@ mod tests {
             &TargetFilter::Typed(TypedFilter::land().controller(ControllerRef::You)),
             PlayerId(0),
             ObjectId(100),
+            None,
         );
         assert!(options.contains(&ManaType::White), "union must include W");
         assert!(options.contains(&ManaType::Black), "union must include B");
@@ -2933,6 +2938,7 @@ mod tests {
             &land_filter,
             PlayerId(0),
             ObjectId(9999),
+            None,
         );
         assert!(
             options.contains(&ManaType::Colorless),
@@ -3030,6 +3036,7 @@ mod tests {
             &TargetFilter::Typed(TypedFilter::land().controller(ControllerRef::You)),
             PlayerId(1),
             pool,
+            None,
         );
         assert!(
             pool_opts.is_empty(),

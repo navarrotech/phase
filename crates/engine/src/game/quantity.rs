@@ -10479,6 +10479,7 @@ mod tests {
             tapped: false,
             is_suspected: false,
             attachments: Vec::new(),
+            produceable_mana_types: Vec::new(),
         };
 
         state.attacker_declarations_this_turn = vec![
@@ -20284,6 +20285,7 @@ mod tests {
                 tapped: false,
                 is_suspected: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
             },
         );
         state.current_trigger_event = Some(crate::types::events::GameEvent::CreatureDestroyed {
@@ -20350,6 +20352,7 @@ mod tests {
                 tapped: false,
                 is_suspected: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
             },
             incarnation: 0,
         });
@@ -20500,6 +20503,7 @@ mod tests {
                 tapped: false,
                 is_suspected: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
             },
             incarnation: 0,
         });
@@ -20581,6 +20585,7 @@ mod tests {
                 tapped: false,
                 is_suspected: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
             },
             incarnation: 0,
         });
@@ -20661,6 +20666,7 @@ mod tests {
                 tapped: false,
                 is_suspected: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
             },
             incarnation: 0,
         });
@@ -20727,6 +20733,7 @@ mod tests {
                 tapped: false,
                 is_suspected: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
             },
             incarnation: 0,
         };
@@ -20790,6 +20797,7 @@ mod tests {
                 tapped: false,
                 is_suspected: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
             },
             incarnation: 0,
         });
@@ -20846,6 +20854,7 @@ mod tests {
                 tapped: false,
                 is_suspected: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
             },
             incarnation: 0,
         };
@@ -20925,6 +20934,7 @@ mod tests {
                 tapped: false,
                 is_suspected: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
             },
             incarnation: 0,
         };
@@ -21281,6 +21291,7 @@ mod tests {
                 tapped: false,
                 is_suspected: false,
                 attachments: Vec::new(),
+                produceable_mana_types: Vec::new(),
             },
         );
         assert!(!state.lki_cache.is_empty());
@@ -22103,6 +22114,7 @@ mod tests {
                     tapped: false,
                     is_suspected: false,
                     attachments: Vec::new(),
+                    produceable_mana_types: Vec::new(),
                 },
             );
             state.exile_links.push(ExileLink {
