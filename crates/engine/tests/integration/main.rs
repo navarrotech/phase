@@ -1840,6 +1840,7 @@ mod professor_hojo_activation_cost;
 mod ripple_reveal_choice_interaction;
 mod siphon_insight_mana_rider;
 mod slow_motion_upkeep_sacrifice_return;
+mod token_card_tracked_set_consumers;
 mod uba_mask_draw_to_exile_play;
 mod ugin_ineffable_token_tracked_set;
 mod ultimate_magic_meteor_per_opponent_destroy;

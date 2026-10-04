@@ -9806,10 +9806,7 @@ fn first_tracked_set_consumer(ability: Option<&ResolvedAbility>) -> Option<&Reso
             ..
         } | Effect::ChooseFromZone { .. }
     ) || effect_references_tracked_set(&ability.effect)
-        || ability
-            .repeat_for
-            .as_ref()
-            .is_some_and(quantity_expr_references_tracked_set)
+        || node_counts_tracked_set(ability)
         || ability
             .player_scope
             .as_ref()
@@ -9844,16 +9841,29 @@ fn first_tracked_set_consumer_mode(
 /// `CreateDelayedTrigger`) is not in this class.
 fn tracked_set_consumer_reads_only_cards(producer: &ResolvedAbility) -> bool {
     first_tracked_set_consumer(producer.sub_ability.as_deref()).is_some_and(|consumer| {
-        let mut counts_set = false;
-        consumer.effect.for_each_quantity_expr(&mut |qty| {
-            counts_set |= quantity_expr_references_tracked_set(qty);
-        });
-        counts_set
+        node_counts_tracked_set(consumer)
             || matches!(
                 consumer.effect,
                 Effect::GrantCastingPermission { .. } | Effect::CastFromZone { .. }
             )
     })
+}
+
+/// CR 608.2c: does this node COUNT the chain tracked set — in any quantity its
+/// effect carries ("gain 1 life for each nonland card revealed this way") or in
+/// its `repeat_for` loop count ("for each nonland card revealed this way, draw a
+/// card", Seasoned Pyromancer #740)? One authority for both the consumer walk
+/// and the card-only classification, so the two can never disagree about which
+/// slots count.
+fn node_counts_tracked_set(node: &ResolvedAbility) -> bool {
+    let mut counts_set = node
+        .repeat_for
+        .as_ref()
+        .is_some_and(quantity_expr_references_tracked_set);
+    node.effect.for_each_quantity_expr(&mut |qty| {
+        counts_set |= quantity_expr_references_tracked_set(qty);
+    });
+    counts_set
 }
 
 pub(crate) fn tracked_set_publication_mode(
