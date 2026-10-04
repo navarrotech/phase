@@ -1220,9 +1220,12 @@ export class P2PHostAdapter implements EngineAdapter {
     }
     // A returning guest's `reconnect` frame carries no display name, so the
     // persisted copy is the only source for it after a host refresh.
-    for (const [pidStr, name] of Object.entries(session.guestNames ?? {})) {
-      if (typeof name === "string" && name) {
-        this.guestNames.set(Number(pidStr), name);
+    const guestNames = session.guestNames;
+    if (guestNames && typeof guestNames === "object" && !Array.isArray(guestNames)) {
+      for (const [pidStr, name] of Object.entries(guestNames)) {
+        if (typeof name === "string" && name) {
+          this.guestNames.set(Number(pidStr), name);
+        }
       }
     }
     for (const token of session.kickedTokens) this.kickedTokens.add(token);

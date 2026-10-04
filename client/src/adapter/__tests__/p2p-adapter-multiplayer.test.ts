@@ -1624,20 +1624,84 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
       playerNames: expect.objectContaining({ 1: "Bioplay" }),
     }));
     resumed.dispose();
+
+    // IndexedDB reads use a TypeScript type assertion, so older or malformed
+    // stored field values can still reach the adapter's rehydration boundary.
+    for (const guestNames of ["Bioplay", ["Unused", "Impostor"], { 1: 0 }, undefined]) {
+      const { adapter: fallback } = makeResumedHost({
+        ...savedSession,
+        guestNames: guestNames as unknown as PersistedP2PHostSession["guestNames"],
+      });
+      const fallbackEvents: P2PAdapterEvent[] = [];
+      fallback.onEvent((event) => fallbackEvents.push(event));
+      await fallback.initialize();
+      expect(fallbackEvents).toContainEqual({
+        type: "playerIdentity",
+        playerId: 0,
+        playerNames: { 0: "Host" },
+      });
+      fallback.dispose();
+    }
   });
 
   // Issue #9527, native authority: a host that delegated to its local
   // phase-server resumes without a WASM snapshot and must still re-announce
   // its guests' persisted names.
   it("re-announces persisted guest names when a native host resumes", async () => {
-    const { peer, onGuestConnected } = createFakePeer();
-    const hostDeck = {
-      player: { main_deck: ["Mountain"], sideboard: [] },
-      opponent: { main_deck: ["Forest"], sideboard: [] },
-      ai_decks: [],
+    const { adapter: original, emitConnection } = makeNativeHost(2, {
+      gameId: "native-names-game",
+      roomCode: "ABCDE",
+    });
+    const fullKey = { game_code: "native-game", generation: 1 };
+    const hostAttachment = { ...NATIVE_HOST_ATTACHMENT, fullKey };
+    const guestAttachment = { ...NATIVE_GUEST_ATTACHMENT, fullKey };
+    nativeWebSocketMocks.waitForPlayerSlots.mockResolvedValue([]);
+    nativeWebSocketMocks.initializePregame
+      .mockResolvedValueOnce(hostAttachment)
+      .mockResolvedValueOnce(guestAttachment);
+
+    await original.initialize();
+    const guest = await joinGuest(emitConnection, {
+      type: "guest_deck",
+      deckData: { player: { main_deck: ["Forest"], sideboard: [] } },
+      displayName: "Bioplay",
+    });
+    const start = original.initializeGame();
+    await vi.waitFor(() => expect(nativeWebSocketMocks.sendSeatMutation).toHaveBeenCalledWith({ type: "Start" }));
+    const snapshot: EngineSnapshot = {
+      state: remoteState("native named guest game started"),
+      legalResult: { actions: [], autoPassRecommended: false },
+      seq: 1,
     };
-    const adapter = new P2PHostAdapter(
-      hostDeck,
+    const nativeListeners = nativeWebSocketMocks.onEvent.mock.calls.map(
+      ([listener]) => listener as (event: WsAdapterEvent) => void,
+    );
+    expect(nativeListeners).toHaveLength(2);
+    for (const onNativeEvent of nativeListeners) {
+      onNativeEvent({ type: "stateChanged", snapshot, events: [], serverRevision: 1 });
+    }
+    await start;
+    await flushPromises(20);
+
+    const setup = (await guest.getSentMessages()).find(
+      (message): message is { type: "game_setup"; playerToken: string } =>
+        typeof message === "object" && message !== null && (message as { type: string }).type === "game_setup",
+    );
+    expect(setup?.playerToken).toBeDefined();
+    const savedCalls = persistenceMocks.saveP2PHostSession.mock.calls as unknown as Array<
+      [string, PersistedP2PHostSession]
+    >;
+    const savedSession = savedCalls[savedCalls.length - 1]![1];
+    expect(savedSession.guestNames).toEqual({ 1: "Bioplay" });
+    expect(savedSession.seatState?.seats[1]).toEqual({ type: "JoinedHuman" });
+    expect(savedSession.playerTokens[1]).toBe(setup!.playerToken);
+    expect(savedSession.guestDecks[1]).toEqual({ main_deck: ["Forest"], sideboard: [] });
+    expect(savedSession.nativeSession?.playerTokens).toEqual({ 0: "native-host-token", 1: "native-guest-token" });
+    original.dispose();
+
+    const { peer, onGuestConnected, emitConnection: emitResumedConnection } = createFakePeer();
+    const resumed = new P2PHostAdapter(
+      savedSession.hostDeckData as ConstructorParameters<typeof P2PHostAdapter>[0],
       peer as unknown as Peer,
       onGuestConnected,
       2,
@@ -1650,42 +1714,41 @@ describe("P2PHostAdapter — 3-4p multiplayer", () => {
       {
         gameId: "native-names-game",
         roomCode: "ABCDE",
-        resumeData: {
-          session: {
-            gameId: "native-names-game",
-            roomCode: "ABCDE",
-            sessionKey: "native-names-session",
-            useBroker: false,
-            playerTokens: {},
-            guestDecks: {},
-            guestNames: { 1: "Bioplay" },
-            kickedTokens: [],
-            eliminatedSeats: [],
-            playerCount: 2,
-            hostDeckData: hostDeck,
-            gameStarted: true,
-            nativeSession: {
-              gameCode: "native-game",
-              fullKey: { game_code: "native-game", generation: 1 },
-              playerTokens: { 0: "native-host-token" },
-            },
-          },
-        },
+        resumeData: { session: savedSession },
       },
       {},
     );
-    nativeWebSocketMocks.initializePregame.mockResolvedValue(NATIVE_HOST_ATTACHMENT);
+    nativeWebSocketMocks.initializePregame
+      .mockResolvedValueOnce(hostAttachment)
+      .mockResolvedValueOnce(guestAttachment);
     const hostEvents: P2PAdapterEvent[] = [];
-    adapter.onEvent((event) => hostEvents.push(event));
+    resumed.onEvent((event) => hostEvents.push(event));
 
-    await adapter.initialize();
+    await resumed.initialize();
 
     expect(hostEvents).toContainEqual({
       type: "playerIdentity",
       playerId: 0,
       playerNames: expect.objectContaining({ 1: "Bioplay" }),
     });
-    adapter.dispose();
+    const resumedNativeListeners = nativeWebSocketMocks.onEvent.mock.calls.slice(-2).map(
+      ([listener]) => listener as (event: WsAdapterEvent) => void,
+    );
+    for (const onNativeEvent of resumedNativeListeners) {
+      onNativeEvent({ type: "stateChanged", snapshot, events: [], serverRevision: 2 });
+    }
+    await vi.waitFor(() => expect(hostEvents).toContainEqual(expect.objectContaining({ type: "stateChanged" })));
+
+    const reconnected = await joinGuest(emitResumedConnection, {
+      type: "reconnect",
+      playerToken: setup!.playerToken,
+    });
+    await flushPromises();
+    expect(await reconnected.getSentMessages()).toContainEqual(expect.objectContaining({
+      type: "reconnect_ack",
+      playerNames: expect.objectContaining({ 1: "Bioplay" }),
+    }));
+    resumed.dispose();
   });
 
   it("releases unpublished resumed authority after a strict-save failure without acknowledging guests", async () => {
