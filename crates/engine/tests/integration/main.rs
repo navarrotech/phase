@@ -54,6 +54,7 @@ mod archdruids_charm_search_destination;
 mod archmage_ascension_gated_draw_replacement;
 mod archnemesis_you_attack_enchanted_player;
 mod arcum_weathervane_supertype_removal;
+mod arena_of_glory_any_of_that_mana_haste;
 mod ark_of_hunger_play_from_graveyard_751;
 mod armored_kincaller_or_condition;
 mod ashaya_nontoken_lands;
