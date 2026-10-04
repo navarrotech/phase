@@ -9226,25 +9226,32 @@ fn affected_objects_from_events(
                 })
                 .collect()
         }
-        // CR 608.2c + CR 108.2b: a token-creating node in a MIXED chain is not
-        // the antecedent of its continuation's anaphor. Locke, Treasure
-        // Hunter's "each player mills a card. If a land card was milled this
-        // way, create a Treasure token. Until end of turn, you may cast a spell
-        // from among those cards" and Ragavan, Nimble Pilferer's "create a
-        // Treasure token and exile the top card of that player's library. Until
-        // end of turn, you may cast that card" both name the moved CARDS — and
-        // a token is never a card. Without this arm the `_ =>` harvest reads the
-        // Treasure's own `ZoneChanged` and `publish_tracked_set` unions it into
-        // the card producer's set, so the Treasure joins "those cards".
+        // CR 608.2c + CR 108.2b: a token created in a MIXED chain must not join
+        // a population its consumer reads as CARDS. Locke, Treasure Hunter's
+        // "each player mills a card. If a land card was milled this way, create
+        // a Treasure token. Until end of turn, you may cast a spell from among
+        // those cards" and Ragavan, Nimble Pilferer's "create a Treasure token
+        // and exile the top card of that player's library. Until end of turn,
+        // you may cast that card" both name the moved cards — and a token is
+        // never a card. Without this arm the `_ =>` harvest reads the Treasure's
+        // own `ZoneChanged` and `publish_tracked_set` unions it into the card
+        // producer's set, so the Treasure joins "those cards".
         //
-        // The gate is the SAME sole-producer rule the event-less arms above use,
-        // inverted: those arms PUBLISH only when sole and otherwise have nothing
-        // to harvest, whereas a token creation DOES emit `ZoneChanged`, so this
-        // arm must DECLINE when not sole. When the token creation is the chain's
-        // only producer (Force of Rage's "create two … tokens. Sacrifice those
-        // tokens …") the guard fails and the `_ =>` harvest publishes the
-        // created tokens exactly as before.
-        Effect::Token { .. } if !is_sole_chain_producer(state, ability) => Vec::new(),
+        // Two guards, both required:
+        //  * not the sole producer — when the token creation is the chain's
+        //    only producer (Force of Rage's "create two … tokens. Sacrifice
+        //    those tokens …") the tokens ARE the population;
+        //  * the consumer reads only cards — a consumer that names the token
+        //    itself (Ugin, the Ineffable's "When that token leaves the
+        //    battlefield, put the exiled card into your hand") needs it in the
+        //    set alongside the exiled card.
+        // Either guard failing falls through to the `_ =>` harvest unchanged.
+        Effect::Token { .. }
+            if !is_sole_chain_producer(state, ability)
+                && tracked_set_consumer_reads_only_cards(ability) =>
+        {
+            Vec::new()
+        }
         _ => {
             let dest_zone = match effect {
                 Effect::ChangeZone { destination, .. }
@@ -9777,17 +9784,15 @@ fn is_owner_library_shuffle_consumer(ability: &ResolvedAbility) -> bool {
     )
 }
 
-fn first_tracked_set_consumer_mode(
-    ability: Option<&ResolvedAbility>,
-) -> Option<TrackedSetPublicationMode> {
+/// The first node at or below `ability` (within its mode) that consumes the
+/// chain tracked set.
+fn first_tracked_set_consumer(ability: Option<&ResolvedAbility>) -> Option<&ResolvedAbility> {
     let ability = ability?;
     if crosses_modal_boundary(ability) {
         return None;
     }
     if is_owner_library_shuffle_consumer(ability) {
-        return Some(TrackedSetPublicationMode::Prospective {
-            cause: ThisWayCause::OwnerLibraryShuffleSubject,
-        });
+        return Some(ability);
     }
     // CR 608.2c: a `ParentTarget`-affected grant is deliberately NOT treated as
     // a consumer here — `grant_affects_parent_target` is applied only inside
@@ -9810,10 +9815,45 @@ fn first_tracked_set_consumer_mode(
             .as_ref()
             .is_some_and(player_filter_references_tracked_set);
     if consumes_here {
-        return Some(TrackedSetPublicationMode::Normal);
+        return Some(ability);
     }
-    first_tracked_set_consumer_mode(ability.sub_ability.as_deref())
-        .or_else(|| first_tracked_set_consumer_mode(ability.else_ability.as_deref()))
+    first_tracked_set_consumer(ability.sub_ability.as_deref())
+        .or_else(|| first_tracked_set_consumer(ability.else_ability.as_deref()))
+}
+
+fn first_tracked_set_consumer_mode(
+    ability: Option<&ResolvedAbility>,
+) -> Option<TrackedSetPublicationMode> {
+    first_tracked_set_consumer(ability).map(|consumer| {
+        if is_owner_library_shuffle_consumer(consumer) {
+            TrackedSetPublicationMode::Prospective {
+                cause: ThisWayCause::OwnerLibraryShuffleSubject,
+            }
+        } else {
+            TrackedSetPublicationMode::Normal
+        }
+    })
+}
+
+/// CR 108.2b + CR 601.2a: does the chain's tracked-set consumer read its
+/// population as CARDS only? Casting from the set ("you may cast that card",
+/// "a spell from among those cards") moves a card to the stack, and a count
+/// "for each card <verb>ed this way" counts cards — a token is neither. A
+/// consumer that names the created object itself ("When that token leaves the
+/// battlefield, put the exiled card into your hand" — Ugin, the Ineffable's
+/// `CreateDelayedTrigger`) is not in this class.
+fn tracked_set_consumer_reads_only_cards(producer: &ResolvedAbility) -> bool {
+    first_tracked_set_consumer(producer.sub_ability.as_deref()).is_some_and(|consumer| {
+        let mut counts_set = false;
+        consumer.effect.for_each_quantity_expr(&mut |qty| {
+            counts_set |= quantity_expr_references_tracked_set(qty);
+        });
+        counts_set
+            || matches!(
+                consumer.effect,
+                Effect::GrantCastingPermission { .. } | Effect::CastFromZone { .. }
+            )
+    })
 }
 
 pub(crate) fn tracked_set_publication_mode(
