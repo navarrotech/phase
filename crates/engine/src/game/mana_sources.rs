@@ -3789,8 +3789,9 @@ pub(crate) enum CouldProduceDepth {
 }
 
 /// CR 106.7 + CR 106.1b: The mana types `object_id` could produce right now —
-/// the union over its `{T}` mana abilities, ignoring whether their costs could
-/// be paid, with a basic-land-subtype fallback for objects that carry no
+/// the union over its `{T}` mana abilities (the census's existing
+/// `has_tap_component` scope, stricter than CR 106.7's "ignore whether any costs
+/// could be paid"), with a basic-land-subtype fallback for objects that carry no
 /// explicit mana ability. The census (`produceable_mana_types_by_filter`) owns
 /// the population; this function owns the per-object reading, so the census and
 /// the cost-paid capture (`snapshot_with_produceable_mana_types`) cannot drift.
