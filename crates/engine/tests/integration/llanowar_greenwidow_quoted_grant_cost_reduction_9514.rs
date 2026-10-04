@@ -11,9 +11,14 @@
 //! mana cost. CR 601.2f: the total cost is that cost minus all cost reductions.
 //!
 //! The test drives the real activation pipeline from the graveyard with exactly
-//! the reduced mana available, so it fails if the reduction is dropped.
+//! the reduced mana available, so it fails if the reduction is dropped. It then
+//! destroys the returned card to prove the quoted grant's replacement is live on
+//! it (CR 614.1a: "exile it instead"; CR 611.2a: the grant states no duration).
 
-use engine::game::scenario::{GameScenario, P0};
+use engine::game::effects::resolve_ability_chain;
+use engine::game::scenario::{GameRunner, GameScenario, P0};
+use engine::types::ability::{Effect, ResolvedAbility, TargetFilter, TargetRef};
+use engine::types::events::GameEvent;
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaColor, ManaType, ManaUnit};
 use engine::types::phase::Phase;
@@ -29,6 +34,23 @@ fn mana(mana_type: ManaType, count: usize) -> Vec<ManaUnit> {
     (0..count)
         .map(|_| ManaUnit::new(mana_type, ObjectId(0), false, vec![]))
         .collect()
+}
+
+/// Destroy `object` through the production zone-change hub so a granted
+/// Moved→Exile replacement, if live, is consulted. Mirrors
+/// `issue_6566_granted_leave_exile::destroy`.
+fn destroy(runner: &mut GameRunner, object: ObjectId) {
+    let destroy = ResolvedAbility::new(
+        Effect::Destroy {
+            target: TargetFilter::Any,
+            cant_regenerate: false,
+        },
+        vec![TargetRef::Object(object)],
+        object,
+        P0,
+    );
+    let mut events = Vec::<GameEvent>::new();
+    resolve_ability_chain(runner.state_mut(), &destroy, &mut events, 0).expect("destroy resolves");
 }
 
 #[test]
@@ -65,4 +87,9 @@ fn greenwidow_graveyard_ability_is_reduced_per_basic_land_type() {
         runner.state().objects[&greenwidow].tapped,
         "the card returns to the battlefield tapped"
     );
+
+    // CR 614.1a: the granted "exile it instead of putting it anywhere else"
+    // replacement lives on the returned card, so destroying it exiles it.
+    destroy(&mut runner, greenwidow);
+    assert_eq!(runner.state().objects[&greenwidow].zone, Zone::Exile);
 }

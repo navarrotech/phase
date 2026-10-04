@@ -1788,6 +1788,12 @@ fn effect_is_replacement_carrier(effect: &Effect) -> bool {
                 // exile it instead …" grant (Geth, Thane of Contracts; Llanowar
                 // Greenwidow) carries its `ReplacementDefinition` directly — the same
                 // payload `parsed.replacements` holds for a printed replacement.
+                // Deliberately presence-based rather than event-checked like
+                // `static_is_replacement_carrier`: it mirrors the detector's
+                // `!parsed.replacements.is_empty()` early return, which accepts any
+                // parsed replacement as the represented "instead". Who the grant is
+                // bound to (`affected`) is an anaphor question this detector does not
+                // answer.
                 ContinuousModification::GrantReplacement { .. } => true,
                 _ => false,
             }),
