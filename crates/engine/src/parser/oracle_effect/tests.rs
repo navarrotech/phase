@@ -80401,3 +80401,37 @@ fn prevention_declared_prefixes_keep_full_filters_and_counts() {
         );
     }
 }
+
+/// CR 602.2b + CR 601.2f: a self cost-modification sentence ("This ability costs
+/// {N} less/more to activate …") after a sentence-ending closed quote belongs to
+/// the outer activated ability, so the chunker closes the quoted grant before it
+/// (Llanowar Greenwidow). Reach guard: an anaphoric continuation after the same
+/// quote still stays attached, proving the split is selective rather than a
+/// blanket "every closed quote ends the clause".
+#[test]
+fn self_cost_modification_after_closed_quote_is_its_own_chunk() {
+    use super::sequence::split_clause_sequence;
+    let chunk_texts = |text: &str| -> Vec<String> {
+        split_clause_sequence(text)
+            .into_iter()
+            .map(|chunk| chunk.text)
+            .collect()
+    };
+    let grant = "it gains \"If ~ would leave the battlefield, exile it instead of putting it \
+        anywhere else.\"";
+
+    for rider in [
+        "This ability costs {1} less to activate for each basic land type among lands you control",
+        "This ability costs {2} more to activate",
+    ] {
+        let chunks = chunk_texts(&format!("{grant} {rider}."));
+        assert_eq!(
+            chunks,
+            vec![grant.to_string(), rider.to_string()],
+            "{rider}"
+        );
+    }
+
+    let anaphoric = chunk_texts(&format!("{grant} The token is goaded."));
+    assert_eq!(anaphoric.len(), 1, "{anaphoric:?}");
+}
