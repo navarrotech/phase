@@ -14462,7 +14462,8 @@ impl AbilityCost {
         match self {
             // The dry run has a real arm for exactly the shapes
             // `supports_effect_cost_payment` admits (PutCounter{SelfRef} /
-            // Mana{Fixed}); every other shape hits the payment-path fallback and
+            // Mana{Fixed} / Draw by a context-ref player); every other shape hits
+            // the payment-path fallback and
             // is refused on every board. `supports_cumulative_upkeep_payment`
             // below delegates to the same predicate, but as a MATCH GUARD
             // (`EffectCost { .. } if self.supports_effect_cost_payment() => true`)
@@ -14598,22 +14599,42 @@ impl AbilityCost {
     /// a player choice. This is shared by cumulative-upkeep synthesis and the
     /// resolution-time payment gate so supported cards never install a trigger
     /// whose cost will later be rejected.
+    ///
+    /// CR 118.1 + CR 121.1: the deterministic effect-as-cost forms are source
+    /// counters, fixed mana, and a draw by the cost's context-ref player (the
+    /// controller, or the original controller for "has you draw a card").
+    ///
+    /// - An `UpTo` draw count is excluded: it is a CR 608.2d announcement the
+    ///   payment authority has no payment-time arm for.
+    /// - The draw target set is closed to the two context-ref players. An
+    ///   object reference never draws, and an announced player target is not a
+    ///   cost the payer can carry out without a choice.
+    /// - An effect-cost `Draw { count: N }` is paid as N one-card instructions:
+    ///   the CR 702.24a repetition of "draw a card", each consulted on its own
+    ///   for instruction-level replacements (CR 121.2a). That is exact for every
+    ///   printed draw cost, all of which are "draw a card". A printed multi-card
+    ///   draw cost is a single instruction and would need its instruction size
+    ///   carried separately from the repetition count.
     pub fn supports_effect_cost_payment(&self) -> bool {
-        matches!(
-            self,
-            AbilityCost::EffectCost { effect }
-                if matches!(
-                    effect.as_ref(),
-                    Effect::PutCounter {
-                        target: TargetFilter::SelfRef,
-                        ..
-                    } | Effect::Mana {
-                        produced: ManaProduction::Fixed { .. },
-                        target: None,
-                        ..
-                    }
-                )
-        )
+        let AbilityCost::EffectCost { effect } = self else {
+            return false;
+        };
+        match effect.as_ref() {
+            Effect::PutCounter {
+                target: TargetFilter::SelfRef,
+                ..
+            } => true,
+            Effect::Mana {
+                produced: ManaProduction::Fixed { .. },
+                target: None,
+                ..
+            } => true,
+            Effect::Draw {
+                count,
+                target: TargetFilter::Controller | TargetFilter::OriginalController,
+            } => !count.is_up_to(),
+            _ => false,
+        }
     }
 
     /// CR 118: Classify this cost into one or more `CostCategory` buckets.
@@ -37694,6 +37715,40 @@ mod tests {
             filter: None,
         }
         .supports_cumulative_upkeep_payment());
+
+        // CR 118.1 + CR 121.1: a draw by the cost's context-ref player is a
+        // deterministic effect cost (Psychic Vortex: you; Decoy Gambit: the
+        // spell's original controller).
+        let draw_cost = |count: QuantityExpr, target: TargetFilter| AbilityCost::EffectCost {
+            effect: Box::new(Effect::Draw { count, target }),
+        };
+        assert!(
+            draw_cost(QuantityExpr::Fixed { value: 1 }, TargetFilter::Controller)
+                .supports_cumulative_upkeep_payment()
+        );
+        assert!(draw_cost(
+            QuantityExpr::Fixed { value: 1 },
+            TargetFilter::OriginalController
+        )
+        .supports_cumulative_upkeep_payment());
+        // CR 608.2d: an "up to" count is an announcement with no payment arm.
+        assert!(!draw_cost(
+            QuantityExpr::UpTo {
+                max: Box::new(QuantityExpr::Fixed { value: 1 }),
+            },
+            TargetFilter::Controller,
+        )
+        .supports_cumulative_upkeep_payment());
+        // An announced player target, or an object reference, is not a
+        // context-ref drawer.
+        assert!(
+            !draw_cost(QuantityExpr::Fixed { value: 1 }, TargetFilter::Player)
+                .supports_cumulative_upkeep_payment()
+        );
+        assert!(
+            !draw_cost(QuantityExpr::Fixed { value: 1 }, TargetFilter::SelfRef)
+                .supports_cumulative_upkeep_payment()
+        );
     }
 
     #[test]

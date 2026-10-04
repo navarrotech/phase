@@ -7911,11 +7911,14 @@ pub enum PendingCostMoveResume {
     },
     /// CR 118.12 + CR 122.1 + CR 616.1: A counter-addition unless-cost paused
     /// on a replacement choice. Covers Ward's player-counter payment and the
-    /// source-counter `EffectCost` used by cumulative upkeep. The resume reads
+    /// deterministic `EffectCost` shapes: the source counter used by cumulative
+    /// upkeep, and the draw cost (Psychic Vortex, Decoy Gambit). The resume reads
     /// `pending_effect` and `trigger_event` to settle the parked payment
-    /// instead of orphaning the pending ability; `cost`, `effect_description`
-    /// and `remaining` complete the serialized checkpoint payload and are read
-    /// on no resume path. CR 118.12: BOTH replacement
+    /// instead of orphaning the pending ability, and `unpaid_suffix` to pay the
+    /// part of the cost the pause left unissued. `cost`, `effect_description`
+    /// and `remaining` complete the serialized checkpoint payload, are read on
+    /// no resume path, and are carried forward unchanged when the resume parks
+    /// again. CR 118.12: BOTH replacement
     /// outcomes complete the payment — the "if they don't" clause checks whether
     /// the player chose to pay, "regardless of what events actually occurred",
     /// and this record's mere existence IS that choice (it is constructed only
@@ -7932,6 +7935,11 @@ pub enum PendingCostMoveResume {
         effect_description: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         remaining: Vec<PlayerId>,
+        /// CR 702.24a: the instructions of the cost not yet issued when the
+        /// payment paused. `None` when the pause came on the last instruction,
+        /// which is every pause of a cost performed as a single event.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unpaid_suffix: Option<Box<UnpaidCostSuffix>>,
     },
     /// CR 701.9b + CR 118.12 + CR 616.1: a RANDOM unless-discard that paused on
     /// a replacement choice (Library of Leng, Madness) partway through its batch.
@@ -8013,6 +8021,18 @@ pub struct RandomDiscardUnlessPaymentResume {
     /// Picks still owed after the paused card settles.
     #[serde(default)]
     pub remaining_count: u32,
+}
+
+/// CR 118.12 + CR 702.24a + CR 616.1: the unpaid remainder of an unless
+/// effect-cost whose payment paused on a replacement choice, and the payer who
+/// owes it. A remainder is not resumable without its payer, which the parked
+/// unless-payment does not otherwise record. Boxed for the
+/// `game_state_size.rs` stack budget.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnpaidCostSuffix {
+    pub payer: PlayerId,
+    #[serde(deserialize_with = "crate::types::ability::deserialize_ability_cost_compat")]
+    pub cost: AbilityCost,
 }
 
 /// CR 601.2h + CR 616.1: Resume paying a sequential cost after a replacement

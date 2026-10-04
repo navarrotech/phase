@@ -165,6 +165,34 @@ pub(crate) fn drain_pending_connive_reentry(
     }
 }
 
+/// CR 121.2 + CR 614.11a: drive every resumable draw instruction to completion
+/// or to its next pause. Returns the new `WaitingFor` when a resumed draw
+/// surfaces a choice, else `None`. Callers check for a Priority wait before
+/// calling; this helper has no entry check of its own.
+///
+/// `resume_draw_sequence` leaves a frame parked and sets `state.waiting_for`
+/// when its next draw surfaces its own choice, so any number of sequential
+/// re-pauses compose — each resume re-addresses the same frame by ID.
+fn resume_active_draw_sequences(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+) -> Option<WaitingFor> {
+    while let Some(frame_id) = state.active_draw_sequence().map(|frame| frame.frame_id) {
+        let _ = crate::game::effects::draw::resume_draw_sequence(state, frame_id, events);
+        if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+            return Some(state.waiting_for.clone());
+        }
+        if state
+            .active_draw_sequence()
+            .is_some_and(|frame| frame.frame_id == frame_id)
+        {
+            // No frame completed or paused; avoid retrying a stalled frame.
+            break;
+        }
+    }
+    None
+}
+
 /// CR 616.1 + CR 510.2 + CR 702.15b: the CR 616.1 round trip, plus the one turn-based
 /// action that can be parked waiting on it.
 ///
@@ -1097,22 +1125,9 @@ fn handle_replacement_choice_inner(
             // if the next unit surfaces its own choice, so an arbitrary number of
             // sequential re-pauses compose — each resume re-addresses the same
             // frame by ID.
-            while matches!(waiting_for, WaitingFor::Priority { .. }) {
-                let Some(frame_id) = state.active_draw_sequence().map(|frame| frame.frame_id)
-                else {
-                    break;
-                };
-                let _ = crate::game::effects::draw::resume_draw_sequence(state, frame_id, events);
-                if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
-                    waiting_for = state.waiting_for.clone();
-                    break;
-                }
-                if state
-                    .active_draw_sequence()
-                    .is_some_and(|frame| frame.frame_id == frame_id)
-                {
-                    // No frame completed or paused; avoid retrying a stalled frame.
-                    break;
+            if matches!(waiting_for, WaitingFor::Priority { .. }) {
+                if let Some(wf) = resume_active_draw_sequences(state, events) {
+                    waiting_for = wf;
                 }
             }
 
@@ -1647,6 +1662,22 @@ fn handle_replacement_choice_inner(
             state.waiting_for = WaitingFor::Priority {
                 player: state.active_player,
             };
+            // CR 121.2 + CR 614.11a: a skipped draw inside a draw instruction
+            // that a parked unless-cost owns finishes that instruction before the
+            // owning payment settles or issues its next instruction, mirroring
+            // the delivered arm's ordering. Gated to that park: the CR 608.3e
+            // teardown below reads only the stack top, so completing an ordinary
+            // effect's draw frame here would expose, then clear, a continuation
+            // that today survives under the frame. Non-cost draws keep their
+            // existing priority-boundary resume.
+            if matches!(
+                state.pending_cost_move_resume,
+                Some(PendingCostMoveResume::CounterAdditionUnlessPayment { .. })
+            ) {
+                if let Some(wf) = resume_active_draw_sequences(state, events) {
+                    return Ok(wf);
+                }
+            }
             let resumed_mana_ability_cost = matches!(
                 state.pending_cost_move_resume,
                 Some(PendingCostMoveResume::ManaAbilityPayment { .. })

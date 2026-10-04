@@ -1,0 +1,835 @@
+//! Psychic Vortex — cumulative upkeep paid by drawing cards.
+//!
+//! "Cumulative upkeep—Draw a card." CR 702.24a: at the beginning of the
+//! controller's upkeep an age counter goes on the permanent, then the controller
+//! may pay "draw a card" once for each age counter, or sacrifice it. Each payment
+//! is its own one-card draw instruction (CR 121.2a; Alms Collector's ruling: count
+//! the word "draw"). The second ability, "At the beginning of your end step,
+//! sacrifice a land and discard your hand", keeps working.
+//!
+//! Every row drives the real upkeep trigger through `PayUnlessCost` /
+//! `ChooseReplacement`, and every negative row carries a positive reach guard in
+//! the same test.
+
+use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
+use engine::types::ability::{AbilityCost, Effect, EffectKind, QuantityExpr, TargetFilter};
+use engine::types::actions::GameAction;
+use engine::types::counter::CounterType;
+use engine::types::events::GameEvent;
+use engine::types::game_state::{
+    CastPaymentMode, PendingCostMoveResume, UnpaidCostSuffix, WaitingFor,
+};
+use engine::types::identifiers::ObjectId;
+use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
+use engine::types::phase::Phase;
+use engine::types::player::PlayerId;
+use engine::types::zones::Zone;
+
+const PSYCHIC_VORTEX_ORACLE: &str = "Cumulative upkeep\u{2014}Draw a card. (At the beginning of \
+your upkeep, put an age counter on this permanent, then sacrifice it unless you pay its upkeep \
+cost for each age counter on it.)\nAt the beginning of your end step, sacrifice a land and \
+discard your hand.";
+
+const ALMS_COLLECTOR_ORACLE: &str = "Flash\nIf an opponent would draw two or more cards, \
+instead you and that player each draw a card.";
+
+const QUANTUM_RIDDLER_ORACLE: &str = "Flying\nWhen this creature enters, draw a card.\nAs long \
+as you have one or fewer cards in hand, if you would draw one or more cards, you draw that many \
+cards plus one instead.\nWarp {1}{U}";
+
+const MARALEN_ORACLE: &str = "Players can't draw cards.\nAt the beginning of each player's draw \
+step, that player loses 3 life, searches their library for a card, puts it into their hand, \
+then shuffles.";
+
+const SPIRIT_OF_THE_LABYRINTH_ORACLE: &str = "Each player can't draw more than one card each turn.";
+
+const OBSTINATE_FAMILIAR_ORACLE: &str = "If you would draw a card, you may skip that draw instead.";
+
+const STINKWEED_IMP_ORACLE: &str = "Flying\nWhenever this creature deals combat damage to a \
+creature, destroy that creature.\nDredge 5 (If you would draw a card, you may mill five cards \
+instead. If you do, return this card from your graveyard to your hand.)";
+
+const POSSESSED_PORTAL_ORACLE: &str = "If a player would draw a card, that player skips that draw \
+instead.\nAt the beginning of each end step, each player sacrifices a permanent of their choice \
+unless they discard a card.";
+
+const DIVINATION_ORACLE: &str = "Draw two cards.";
+
+/// Enough cards that every row's draws, and Dredge 5, stay legal.
+const STAGED_LIBRARY: [&str; 12] = [
+    "Library 1",
+    "Library 2",
+    "Library 3",
+    "Library 4",
+    "Library 5",
+    "Library 6",
+    "Library 7",
+    "Library 8",
+    "Library 9",
+    "Library 10",
+    "Library 11",
+    "Library 12",
+];
+
+/// ReplacementChoice index convention shared with the draw-replacement tests:
+/// `0` applies the replacement (Dredge, Obstinate Familiar's skip), `1` declines.
+const APPLY_REPLACEMENT: usize = 0;
+const DECLINE_REPLACEMENT: usize = 1;
+
+/// One player's hand, library and graveyard sizes at a point in a test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ZoneSizes {
+    hand: usize,
+    library: usize,
+    graveyard: usize,
+}
+
+impl ZoneSizes {
+    fn of(runner: &GameRunner, player: PlayerId) -> Self {
+        let player_state = &runner.state().players[player.0 as usize];
+        Self {
+            hand: player_state.hand.len(),
+            library: player_state.library.len(),
+            graveyard: player_state.graveyard.len(),
+        }
+    }
+}
+
+/// The cumulative-upkeep cost after CR 702.24a expansion: "draw a card" `draws`
+/// times, drawn by the controller.
+fn draw_cost(draws: i32) -> AbilityCost {
+    AbilityCost::EffectCost {
+        effect: Box::new(Effect::Draw {
+            count: QuantityExpr::Fixed { value: draws },
+            target: TargetFilter::Controller,
+        }),
+    }
+}
+
+/// P0's untap step with Psychic Vortex on the battlefield carrying
+/// `age_counters_before` age counters, P0's library staged with `library`, and
+/// whatever `setup` adds. The upkeep tick adds one more age counter.
+fn vortex_board<Fixture>(
+    age_counters_before: u32,
+    library: &[&str],
+    setup: impl FnOnce(&mut GameScenario) -> Fixture,
+) -> (GameRunner, ObjectId, Fixture) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::Untap);
+    scenario.with_library_top(P0, library);
+    let vortex = scenario
+        .add_enchantment_from_oracle(P0, "Psychic Vortex", PSYCHIC_VORTEX_ORACLE)
+        .id();
+    let fixture = setup(&mut scenario);
+    let mut runner = scenario.build();
+    if age_counters_before > 0 {
+        runner
+            .state_mut()
+            .objects
+            .get_mut(&vortex)
+            .expect("Psychic Vortex exists")
+            .counters
+            .insert(CounterType::Age, age_counters_before);
+    }
+    (runner, vortex, fixture)
+}
+
+/// Advances from the untap step through the cumulative-upkeep trigger. A
+/// payment prompt stops the advance, so a board that never shows one has
+/// already settled the trigger.
+fn advance_through_upkeep(runner: &mut GameRunner) {
+    runner.auto_advance_to_main_phase();
+    runner.advance_until_stack_empty();
+}
+
+/// Reach guard: the upkeep offered P0 the expanded draw cost.
+fn assert_draw_cost_prompt(runner: &GameRunner, draws: i32) {
+    match &runner.state().waiting_for {
+        WaitingFor::UnlessPayment { player, cost, .. } => {
+            assert_eq!(*player, P0, "Psychic Vortex's controller pays its upkeep");
+            assert_eq!(
+                *cost,
+                draw_cost(draws),
+                "CR 702.24a: the cost is \"draw a card\" once per age counter"
+            );
+        }
+        other => panic!("expected Psychic Vortex's cumulative-upkeep prompt, got {other:?}"),
+    }
+}
+
+/// CR 118.12: the paid epilogue ran — the cumulative-upkeep ability (whose
+/// guarded effect is the sacrifice) finished resolving.
+fn upkeep_ability_resolved(events: &[GameEvent], vortex: ObjectId) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event,
+            GameEvent::EffectResolved {
+                kind: EffectKind::Sacrifice,
+                source_id,
+                ..
+            } if *source_id == vortex
+        )
+    })
+}
+
+/// The unpaid suffix of the parked unless-payment. Panics when none is parked.
+fn parked_unpaid_suffix(runner: &GameRunner) -> Option<UnpaidCostSuffix> {
+    match &runner.state().pending_cost_move_resume {
+        Some(PendingCostMoveResume::CounterAdditionUnlessPayment { unpaid_suffix, .. }) => {
+            unpaid_suffix.as_deref().cloned()
+        }
+        other => panic!("expected a parked unless-payment, got {other:?}"),
+    }
+}
+
+fn assert_replacement_choice(runner: &GameRunner, context: &str) {
+    assert!(
+        matches!(
+            runner.state().waiting_for,
+            WaitingFor::ReplacementChoice { player: P0, .. }
+        ),
+        "{context}, got {:?}",
+        runner.state().waiting_for
+    );
+}
+
+fn zone_of(runner: &GameRunner, object: ObjectId) -> Zone {
+    runner.state().objects[&object].zone
+}
+
+/// CR 702.24a (AC2): with N age counters, paying draws N cards and keeps the
+/// permanent. Rows: N = 2 (one age counter already on it) and N = 1.
+#[test]
+fn paying_draws_a_card_per_age_counter_and_keeps_vortex() {
+    for (age_counters_before, draws) in [(1u32, 2usize), (0, 1)] {
+        let (mut runner, vortex, ()) = vortex_board(age_counters_before, &STAGED_LIBRARY, |_| ());
+        advance_through_upkeep(&mut runner);
+        assert_draw_cost_prompt(&runner, draws as i32);
+        let before = ZoneSizes::of(&runner, P0);
+
+        let result = runner
+            .act(GameAction::PayUnlessCost { pay: true })
+            .expect("drawing to pay the cumulative upkeep is legal");
+
+        let after = ZoneSizes::of(&runner, P0);
+        assert_eq!(after.hand, before.hand + draws, "one card per age counter");
+        assert_eq!(after.library, before.library - draws);
+        assert_eq!(zone_of(&runner, vortex), Zone::Battlefield);
+        assert_eq!(
+            runner.state().objects[&vortex]
+                .counters
+                .get(&CounterType::Age),
+            Some(&(draws as u32))
+        );
+        assert!(
+            upkeep_ability_resolved(&result.events, vortex),
+            "the paid upkeep must finish resolving, got {:?}",
+            result.events
+        );
+        assert!(runner.state().pending_cost_move_resume.is_none());
+    }
+}
+
+/// CR 702.24a (AC2): declining the payment sacrifices Psychic Vortex.
+#[test]
+fn declining_sacrifices_vortex_without_drawing() {
+    let (mut runner, vortex, ()) = vortex_board(1, &STAGED_LIBRARY, |_| ());
+    advance_through_upkeep(&mut runner);
+    assert_draw_cost_prompt(&runner, 2);
+    let before = ZoneSizes::of(&runner, P0);
+
+    runner
+        .act(GameAction::PayUnlessCost { pay: false })
+        .expect("declining is legal");
+
+    assert_eq!(zone_of(&runner, vortex), Zone::Graveyard);
+    assert_eq!(ZoneSizes::of(&runner, P0).hand, before.hand);
+}
+
+/// CR 121.3 + CR 121.4 + CR 704.5b: an empty library does not stop the draw
+/// payment (Psychic Vortex ruling). The payment is made, so Psychic Vortex is
+/// not sacrificed, and P0 loses the game at the state-based action check after
+/// the ability finishes resolving. Rows: N = 1 from an empty library, and N = 2
+/// with one card left (draws it, then attempts the second draw).
+///
+/// The engine's elimination cleanup then exiles the losing player's objects, so
+/// Psychic Vortex's survival is read from the event order rather than its final
+/// zone: the paid ability finishes resolving while it is still on the
+/// battlefield, and it never moves to the graveyard.
+#[test]
+fn paying_from_a_short_library_keeps_vortex_and_loses_the_game() {
+    for (age_counters_before, library) in [(0u32, &[][..]), (1, &["Only Card"][..])] {
+        let (mut runner, vortex, ()) = vortex_board(age_counters_before, library, |_| ());
+        advance_through_upkeep(&mut runner);
+        assert_draw_cost_prompt(&runner, age_counters_before as i32 + 1);
+
+        let result = runner
+            .act(GameAction::PayUnlessCost { pay: true })
+            .expect("CR 121.3: an empty library does not forbid choosing to draw");
+
+        let cards_drawn = result
+            .events
+            .iter()
+            .filter(|event| matches!(event, GameEvent::CardDrawn { player_id: P0, .. }))
+            .count();
+        assert_eq!(
+            cards_drawn,
+            library.len(),
+            "every card the library held is drawn"
+        );
+        let paid_epilogue = result
+            .events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    GameEvent::EffectResolved {
+                        kind: EffectKind::Sacrifice,
+                        source_id,
+                        ..
+                    } if *source_id == vortex
+                )
+            })
+            .expect("the paid cumulative upkeep must finish resolving");
+        let vortex_moves: Vec<(usize, Zone)> = result
+            .events
+            .iter()
+            .enumerate()
+            .filter_map(|(index, event)| match event {
+                GameEvent::ZoneChanged { object_id, to, .. } if *object_id == vortex => {
+                    Some((index, *to))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            vortex_moves
+                .iter()
+                .all(|(index, to)| *index > paid_epilogue && *to != Zone::Graveyard),
+            "Psychic Vortex must stay on the battlefield through the paid upkeep, got {vortex_moves:?}"
+        );
+        assert!(
+            runner.state().players[P0.0 as usize].is_eliminated,
+            "CR 704.5b: drawing from an empty library loses the game, got {:?}",
+            runner.state().waiting_for
+        );
+    }
+}
+
+/// CR 616.1 + CR 118.11 + CR 118.12: Dredge pauses the first of two draw
+/// instructions. The second instruction stays owed across the pause, is issued
+/// once the first completes, and parks again on its own Dredge choice. Replaced
+/// draws still pay the cost (Psychic Vortex ruling).
+#[test]
+fn a_dredge_pause_carries_the_unissued_draw_and_parks_it_again() {
+    let (mut runner, vortex, imp) = vortex_board(1, &STAGED_LIBRARY, |scenario| {
+        scenario
+            .add_creature_to_graveyard(P0, "Stinkweed Imp", 1, 2)
+            .from_oracle_text(STINKWEED_IMP_ORACLE)
+            .id()
+    });
+    advance_through_upkeep(&mut runner);
+    assert_draw_cost_prompt(&runner, 2);
+    let before = ZoneSizes::of(&runner, P0);
+
+    runner
+        .act(GameAction::PayUnlessCost { pay: true })
+        .expect("paying is legal");
+    assert_replacement_choice(&runner, "Dredge must pause the first draw instruction");
+    assert_eq!(
+        parked_unpaid_suffix(&runner),
+        Some(UnpaidCostSuffix {
+            payer: P0,
+            cost: draw_cost(1),
+        }),
+        "the second instruction is owed, not issued"
+    );
+
+    runner
+        .act(GameAction::ChooseReplacement {
+            index: DECLINE_REPLACEMENT,
+        })
+        .expect("declining Dredge is legal");
+    assert_replacement_choice(
+        &runner,
+        "the second instruction must be issued and pause on its own Dredge choice",
+    );
+    assert_eq!(
+        parked_unpaid_suffix(&runner),
+        None,
+        "the park now owes nothing beyond the paused instruction"
+    );
+
+    let result = runner
+        .act(GameAction::ChooseReplacement {
+            index: APPLY_REPLACEMENT,
+        })
+        .expect("applying Dredge is legal");
+
+    let after = ZoneSizes::of(&runner, P0);
+    assert_eq!(
+        zone_of(&runner, imp),
+        Zone::Hand,
+        "Dredge returned Stinkweed Imp"
+    );
+    assert_eq!(
+        after.hand,
+        before.hand + 2,
+        "one drawn card plus Stinkweed Imp"
+    );
+    assert_eq!(
+        after.library,
+        before.library - 1 - 5,
+        "one draw plus Dredge 5"
+    );
+    assert_eq!(zone_of(&runner, vortex), Zone::Battlefield);
+    assert!(upkeep_ability_resolved(&result.events, vortex));
+    assert!(runner.state().pending_cost_move_resume.is_none());
+    assert!(runner.state().active_draw_sequence().is_none());
+}
+
+/// Sub-case of the row above: declining Dredge on both instructions draws both.
+#[test]
+fn declining_dredge_on_both_draws_draws_two_cards() {
+    let (mut runner, vortex, ()) = vortex_board(1, &STAGED_LIBRARY, |scenario| {
+        scenario
+            .add_creature_to_graveyard(P0, "Stinkweed Imp", 1, 2)
+            .from_oracle_text(STINKWEED_IMP_ORACLE);
+    });
+    advance_through_upkeep(&mut runner);
+    assert_draw_cost_prompt(&runner, 2);
+    let before = ZoneSizes::of(&runner, P0);
+
+    runner
+        .act(GameAction::PayUnlessCost { pay: true })
+        .expect("paying is legal");
+    for instruction in 1..=2 {
+        assert_replacement_choice(&runner, &format!("Dredge pauses draw {instruction}"));
+        runner
+            .act(GameAction::ChooseReplacement {
+                index: DECLINE_REPLACEMENT,
+            })
+            .expect("declining Dredge is legal");
+    }
+
+    let after = ZoneSizes::of(&runner, P0);
+    assert_eq!(after.hand, before.hand + 2);
+    assert_eq!(after.library, before.library - 2);
+    assert_eq!(zone_of(&runner, vortex), Zone::Battlefield);
+    assert!(runner.state().pending_cost_move_resume.is_none());
+}
+
+/// CR 614.1b + CR 118.11 + CR 118.12: Obstinate Familiar's optional skip settles
+/// through the replacement handler's prevented boundary. A skipped draw still
+/// pays, the next instruction is issued after it, and the park settles PAID only
+/// once the last instruction completes.
+#[test]
+fn a_skipped_draw_still_pays_and_the_next_draw_follows() {
+    let (mut runner, vortex, ()) = vortex_board(1, &STAGED_LIBRARY, |scenario| {
+        scenario.add_creature_from_oracle(
+            P0,
+            "Obstinate Familiar",
+            1,
+            1,
+            OBSTINATE_FAMILIAR_ORACLE,
+        );
+    });
+    advance_through_upkeep(&mut runner);
+    assert_draw_cost_prompt(&runner, 2);
+    let before = ZoneSizes::of(&runner, P0);
+
+    runner
+        .act(GameAction::PayUnlessCost { pay: true })
+        .expect("paying is legal");
+    assert_replacement_choice(&runner, "the skip is offered on the first draw");
+    assert!(parked_unpaid_suffix(&runner).is_some());
+
+    runner
+        .act(GameAction::ChooseReplacement {
+            index: APPLY_REPLACEMENT,
+        })
+        .expect("skipping the draw is legal");
+    assert_eq!(
+        ZoneSizes::of(&runner, P0).library,
+        before.library,
+        "the first draw was skipped"
+    );
+    assert_replacement_choice(&runner, "the second draw is issued and offers its skip");
+    assert_eq!(parked_unpaid_suffix(&runner), None);
+
+    let result = runner
+        .act(GameAction::ChooseReplacement {
+            index: DECLINE_REPLACEMENT,
+        })
+        .expect("drawing normally is legal");
+
+    let after = ZoneSizes::of(&runner, P0);
+    assert_eq!(after.hand, before.hand + 1);
+    assert_eq!(after.library, before.library - 1);
+    assert!(runner.state().pending_cost_move_resume.is_none());
+    assert!(upkeep_ability_resolved(&result.events, vortex));
+    assert_eq!(zone_of(&runner, vortex), Zone::Battlefield);
+    assert!(runner.state().active_draw_sequence().is_none());
+}
+
+/// Sub-case: skipping both draws draws nothing, yet the cost is paid (CR 118.11).
+/// Possessed Portal's mandatory skip pays the same way without any prompt.
+#[test]
+fn skipping_every_draw_still_pays_the_cost() {
+    let (mut runner, vortex, ()) = vortex_board(1, &STAGED_LIBRARY, |scenario| {
+        scenario.add_creature_from_oracle(
+            P0,
+            "Obstinate Familiar",
+            1,
+            1,
+            OBSTINATE_FAMILIAR_ORACLE,
+        );
+    });
+    advance_through_upkeep(&mut runner);
+    assert_draw_cost_prompt(&runner, 2);
+    let before = ZoneSizes::of(&runner, P0);
+
+    runner
+        .act(GameAction::PayUnlessCost { pay: true })
+        .expect("paying is legal");
+    let mut events = Vec::new();
+    for draw in 1..=2 {
+        assert_replacement_choice(&runner, &format!("draw {draw} offers its skip"));
+        let result = runner
+            .act(GameAction::ChooseReplacement {
+                index: APPLY_REPLACEMENT,
+            })
+            .expect("skipping is legal");
+        events.extend(result.events);
+    }
+
+    assert_eq!(ZoneSizes::of(&runner, P0), before);
+    assert_eq!(zone_of(&runner, vortex), Zone::Battlefield);
+    assert!(upkeep_ability_resolved(&events, vortex));
+    assert!(runner.state().pending_cost_move_resume.is_none());
+
+    let (mut runner, vortex, ()) = vortex_board(1, &STAGED_LIBRARY, |scenario| {
+        scenario.add_artifact_from_oracle(P1, "Possessed Portal", POSSESSED_PORTAL_ORACLE);
+    });
+    advance_through_upkeep(&mut runner);
+    assert_draw_cost_prompt(&runner, 2);
+    let before = ZoneSizes::of(&runner, P0);
+
+    let result = runner
+        .act(GameAction::PayUnlessCost { pay: true })
+        .expect("a skip replacement does not forbid paying");
+
+    assert_eq!(
+        ZoneSizes::of(&runner, P0),
+        before,
+        "both draws were skipped"
+    );
+    assert_eq!(zone_of(&runner, vortex), Zone::Battlefield);
+    assert!(upkeep_ability_resolved(&result.events, vortex));
+    assert!(runner.state().pending_cost_move_resume.is_none());
+}
+
+/// CR 121.2 + CR 614.11a: a skipped draw inside a two-draw instruction finishes
+/// that instruction before the next instruction is issued. Quantum Riddler turns
+/// the first one-card instruction into two draws (P0's hand is empty), so
+/// skipping its first draw leaves its second still to come — and the second
+/// instruction must still be owed, not issued on top of the unfinished one.
+#[test]
+fn a_skip_inside_an_instruction_finishes_it_before_the_next_instruction() {
+    let (mut runner, vortex, ()) = vortex_board(1, &STAGED_LIBRARY, |scenario| {
+        scenario.add_creature_from_oracle(P0, "Quantum Riddler", 4, 6, QUANTUM_RIDDLER_ORACLE);
+        scenario.add_creature_from_oracle(
+            P0,
+            "Obstinate Familiar",
+            1,
+            1,
+            OBSTINATE_FAMILIAR_ORACLE,
+        );
+    });
+    advance_through_upkeep(&mut runner);
+    assert_draw_cost_prompt(&runner, 2);
+    let before = ZoneSizes::of(&runner, P0);
+    assert_eq!(
+        before.hand, 0,
+        "Quantum Riddler applies with one or fewer cards in hand"
+    );
+
+    runner
+        .act(GameAction::PayUnlessCost { pay: true })
+        .expect("paying is legal");
+    assert_replacement_choice(&runner, "the skip is offered on the first draw");
+    runner
+        .act(GameAction::ChooseReplacement {
+            index: APPLY_REPLACEMENT,
+        })
+        .expect("skipping is legal");
+
+    assert_replacement_choice(
+        &runner,
+        "the first instruction's second draw offers its skip",
+    );
+    assert_eq!(
+        parked_unpaid_suffix(&runner),
+        Some(UnpaidCostSuffix {
+            payer: P0,
+            cost: draw_cost(1),
+        }),
+        "the second instruction must not be issued before the first completes"
+    );
+    assert_eq!(ZoneSizes::of(&runner, P0).library, before.library);
+
+    let mut events = Vec::new();
+    for _ in 0..8 {
+        if !matches!(
+            runner.state().waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ) {
+            break;
+        }
+        let result = runner
+            .act(GameAction::ChooseReplacement {
+                index: DECLINE_REPLACEMENT,
+            })
+            .expect("drawing normally is legal");
+        events.extend(result.events);
+    }
+
+    // First instruction: its second draw (hand 1). Second instruction: hand 1
+    // is still "one or fewer", so Quantum Riddler makes it two draws (hand 3).
+    let after = ZoneSizes::of(&runner, P0);
+    assert_eq!(after.hand, 3);
+    assert_eq!(after.library, before.library - 3);
+    assert!(runner.state().pending_cost_move_resume.is_none());
+    assert!(upkeep_ability_resolved(&events, vortex));
+    assert_eq!(zone_of(&runner, vortex), Zone::Battlefield);
+}
+
+/// CR 121.3 + CR 614.17b: a can't-draw effect forbids choosing the draw
+/// payment, so the payment is never offered and Psychic Vortex is sacrificed.
+/// The prohibition applies whoever controls it.
+#[test]
+fn a_cant_draw_effect_refuses_the_payment_and_sacrifices_vortex() {
+    let (mut runner, _vortex, ()) = vortex_board(0, &STAGED_LIBRARY, |_| ());
+    advance_through_upkeep(&mut runner);
+    assert_draw_cost_prompt(&runner, 1);
+
+    for maralen_controller in [P0, P1] {
+        let (mut runner, vortex, ()) = vortex_board(0, &STAGED_LIBRARY, |scenario| {
+            scenario.add_creature_from_oracle(
+                maralen_controller,
+                "Maralen of the Mornsong",
+                2,
+                3,
+                MARALEN_ORACLE,
+            );
+        });
+        advance_through_upkeep(&mut runner);
+
+        assert!(
+            !matches!(runner.state().waiting_for, WaitingFor::UnlessPayment { .. }),
+            "Maralen ({maralen_controller:?}) must stop the payment being offered"
+        );
+        assert_eq!(zone_of(&runner, vortex), Zone::Graveyard);
+    }
+}
+
+/// CR 614.17a + CR 614.17b: a can't-draw effect that arrives while the prompt is
+/// open refuses `pay: true` on the live board; declining stays legal.
+#[test]
+fn a_cant_draw_effect_arriving_at_the_prompt_refuses_payment() {
+    let (mut runner, vortex, maralen) = vortex_board(0, &STAGED_LIBRARY, |scenario| {
+        scenario
+            .add_creature_from_oracle(P0, "Maralen of the Mornsong", 2, 3, MARALEN_ORACLE)
+            .id()
+    });
+    let mut events = Vec::new();
+    engine::game::zones::move_to_zone(runner.state_mut(), maralen, Zone::Exile, &mut events);
+    advance_through_upkeep(&mut runner);
+    assert_draw_cost_prompt(&runner, 1);
+
+    engine::game::zones::move_to_zone(runner.state_mut(), maralen, Zone::Battlefield, &mut events);
+
+    assert!(
+        runner.act(GameAction::PayUnlessCost { pay: true }).is_err(),
+        "a player can't choose to pay a cost that includes a draw that can't happen"
+    );
+    runner
+        .act(GameAction::PayUnlessCost { pay: false })
+        .expect("declining stays legal");
+    assert_eq!(zone_of(&runner, vortex), Zone::Graveyard);
+}
+
+/// CR 121.2b: a one-card-per-turn limit forbids paying a cost that includes
+/// drawing two cards, but not one that includes drawing one.
+#[test]
+fn a_per_turn_draw_limit_refuses_two_draws_but_not_one() {
+    let (mut runner, vortex, ()) = vortex_board(0, &STAGED_LIBRARY, |scenario| {
+        scenario.add_creature_from_oracle(
+            P1,
+            "Spirit of the Labyrinth",
+            3,
+            1,
+            SPIRIT_OF_THE_LABYRINTH_ORACLE,
+        );
+    });
+    advance_through_upkeep(&mut runner);
+    assert_draw_cost_prompt(&runner, 1);
+    let before = ZoneSizes::of(&runner, P0);
+    runner
+        .act(GameAction::PayUnlessCost { pay: true })
+        .expect("one draw is within the limit");
+    assert_eq!(ZoneSizes::of(&runner, P0).hand, before.hand + 1);
+    assert_eq!(zone_of(&runner, vortex), Zone::Battlefield);
+
+    let (mut runner, vortex, ()) = vortex_board(1, &STAGED_LIBRARY, |scenario| {
+        scenario.add_creature_from_oracle(
+            P1,
+            "Spirit of the Labyrinth",
+            3,
+            1,
+            SPIRIT_OF_THE_LABYRINTH_ORACLE,
+        );
+    });
+    advance_through_upkeep(&mut runner);
+    assert!(
+        !matches!(runner.state().waiting_for, WaitingFor::UnlessPayment { .. }),
+        "a two-draw cost can't be chosen under a one-card limit"
+    );
+    assert_eq!(zone_of(&runner, vortex), Zone::Graveyard);
+}
+
+/// CR 702.24a + CR 121.2a (Alms Collector ruling: count the word "draw"): two
+/// age counters mean two instructions to draw one card, never one instruction
+/// to draw two, so Alms Collector ("two or more cards") never applies.
+#[test]
+fn each_age_counter_is_its_own_one_card_instruction() {
+    let (mut runner, vortex, ()) = vortex_board(1, &STAGED_LIBRARY, |scenario| {
+        scenario.with_library_top(P1, &["Opponent 1", "Opponent 2", "Opponent 3"]);
+        scenario.add_creature_from_oracle(P1, "Alms Collector", 3, 4, ALMS_COLLECTOR_ORACLE);
+    });
+    advance_through_upkeep(&mut runner);
+    assert_draw_cost_prompt(&runner, 2);
+    let before = ZoneSizes::of(&runner, P0);
+    let opponent_before = ZoneSizes::of(&runner, P1);
+
+    runner
+        .act(GameAction::PayUnlessCost { pay: true })
+        .expect("paying is legal");
+
+    let after = ZoneSizes::of(&runner, P0);
+    assert_eq!(after.hand, before.hand + 2);
+    assert_eq!(after.library, before.library - 2);
+    assert_eq!(
+        ZoneSizes::of(&runner, P1).hand,
+        opponent_before.hand,
+        "Alms Collector must not apply to one-card instructions"
+    );
+    assert_eq!(zone_of(&runner, vortex), Zone::Battlefield);
+}
+
+/// CR 121.2a: every instruction gets its own instruction-level replacement
+/// consult. Quantum Riddler adds one card to an instruction drawn with one or
+/// fewer cards in hand: the first instruction (hand 0) draws two, the second
+/// (hand 2) draws one, totalling 3. A path that skipped the instruction-level
+/// consult would draw only 2.
+#[test]
+fn each_instruction_is_consulted_for_instruction_replacements() {
+    let (mut runner, vortex, ()) = vortex_board(1, &STAGED_LIBRARY, |scenario| {
+        scenario.add_creature_from_oracle(P0, "Quantum Riddler", 4, 6, QUANTUM_RIDDLER_ORACLE);
+    });
+    advance_through_upkeep(&mut runner);
+    assert_draw_cost_prompt(&runner, 2);
+    let before = ZoneSizes::of(&runner, P0);
+    assert_eq!(before.hand, 0);
+
+    runner
+        .act(GameAction::PayUnlessCost { pay: true })
+        .expect("paying is legal");
+
+    let after = ZoneSizes::of(&runner, P0);
+    assert_eq!(after.hand, 3);
+    assert_eq!(after.library, before.library - 3);
+    assert_eq!(zone_of(&runner, vortex), Zone::Battlefield);
+}
+
+/// AC3: "At the beginning of your end step, sacrifice a land and discard your
+/// hand." The controller's land goes; the opponent's land stays.
+#[test]
+fn end_step_sacrifices_a_land_and_discards_the_hand() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_library_top(P0, &STAGED_LIBRARY);
+    scenario.with_cards_in_hand(P0, &["Hand 1", "Hand 2"]);
+    let vortex = scenario
+        .add_enchantment_from_oracle(P0, "Psychic Vortex", PSYCHIC_VORTEX_ORACLE)
+        .id();
+    let own_land = scenario.add_basic_land(P0, ManaColor::Blue);
+    let opponent_land = scenario.add_basic_land(P1, ManaColor::Blue);
+    let mut runner = scenario.build();
+    let before = ZoneSizes::of(&runner, P0);
+
+    runner.advance_to_end_step();
+    runner.advance_until_stack_empty();
+
+    let after = ZoneSizes::of(&runner, P0);
+    assert_eq!(zone_of(&runner, own_land), Zone::Graveyard);
+    assert_eq!(zone_of(&runner, opponent_land), Zone::Battlefield);
+    assert_eq!(after.hand, 0, "the whole hand is discarded");
+    assert_eq!(
+        after.graveyard,
+        before.graveyard + 3,
+        "two cards and one land"
+    );
+    assert_eq!(zone_of(&runner, vortex), Zone::Battlefield);
+}
+
+/// Preservation: an ordinary effect's skipped draw keeps its existing
+/// priority-boundary resume. The prevented-boundary resume added for draw costs
+/// is gated to a parked unless-payment, so Divination's second draw still waits
+/// on its own skip prompt with the frame active.
+#[test]
+fn a_skipped_draw_of_an_ordinary_effect_is_unchanged() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_library_top(P0, &STAGED_LIBRARY);
+    let divination = scenario
+        .add_spell_to_hand_from_oracle(P0, "Divination", false, DIVINATION_ORACLE)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Blue],
+            generic: 0,
+        })
+        .id();
+    scenario.add_creature_from_oracle(P0, "Obstinate Familiar", 1, 1, OBSTINATE_FAMILIAR_ORACLE);
+    let mut runner = scenario.build();
+    runner.state_mut().players[P0.0 as usize]
+        .mana_pool
+        .add(ManaUnit::new(ManaType::Blue, ObjectId(0), false, vec![]));
+    let library_before = ZoneSizes::of(&runner, P0).library;
+
+    runner
+        .act(GameAction::CastSpell {
+            object_id: divination,
+            card_id: runner.state().objects[&divination].card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Auto,
+        })
+        .expect("cast Divination");
+    for _ in 0..8 {
+        if !matches!(runner.state().waiting_for, WaitingFor::ManaPayment { .. }) {
+            break;
+        }
+        runner.act(GameAction::PassPriority).expect("pay mana");
+    }
+    runner.advance_until_stack_empty();
+    assert_replacement_choice(&runner, "the skip is offered on Divination's first draw");
+
+    runner
+        .act(GameAction::ChooseReplacement {
+            index: APPLY_REPLACEMENT,
+        })
+        .expect("skipping is legal");
+
+    assert_replacement_choice(&runner, "the second draw offers its own skip");
+    assert_eq!(ZoneSizes::of(&runner, P0).library, library_before);
+    assert!(runner.state().active_draw_sequence().is_some());
+}

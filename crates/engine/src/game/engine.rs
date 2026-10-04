@@ -26139,6 +26139,7 @@ mod cost_move_drain_priority_boundary_tests {
                 trigger_event: None,
                 effect_description: None,
                 remaining: Vec::new(),
+                unpaid_suffix: None,
             });
         let mut events = Vec::new();
 

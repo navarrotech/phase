@@ -65,6 +65,7 @@ use super::engine::EngineError;
 use super::filter::FilterContext;
 use super::life_costs::can_pay_life_cost;
 use super::quantity::{resolve_quantity, resolve_quantity_with_targets};
+use super::replacement::ReplacementResult;
 use super::speed::{effective_speed, set_speed};
 use super::zone_pipeline::{self, ZoneMoveRequest, ZoneMoveResult};
 use crate::types::ability::ResolvedAbility;
@@ -1357,11 +1358,11 @@ fn pay_ability_cost_inner(
         // carries out the instructions specified". (NOT CR 118.3, which is the
         // resources rule and says nothing about an effect-as-cost.) Resolve the
         // effect on the source before the ability's own effect fires. The shared
-        // support predicate admits only deterministic source-counter and
-        // fixed-mana forms, so the effect shape itself asks the payer nothing.
-        // A replacement on the resulting event can still require a player
-        // choice, which parks the payment as `Paused` in the `PutCounter` arm
-        // below.
+        // support predicate admits only deterministic source-counter, fixed-mana
+        // and context-ref draw forms, so the effect shape itself asks the payer
+        // nothing. A replacement on the resulting event can still require a
+        // player choice, which parks the payment as `Paused` in the `PutCounter`
+        // and `Draw` arms below.
         AbilityCost::EffectCost { effect } => {
             use crate::types::ability::Effect;
             match effect.as_ref() {
@@ -1408,7 +1409,7 @@ fn pay_ability_cost_inner(
                         player,
                         source_id,
                         counter_type.clone(),
-                        counter_cost_count(count),
+                        resolved_cost_count(count),
                     );
                     if prevented {
                         return Ok(payment_failed(
@@ -1420,7 +1421,7 @@ fn pay_ability_cost_inner(
                         player,
                         source_id,
                         counter_type.clone(),
-                        counter_cost_count(count),
+                        resolved_cost_count(count),
                         events,
                     ) {
                         return Ok(PaymentOutcome::Paused {
@@ -1462,6 +1463,85 @@ fn pay_ability_cost_inner(
                             *expiry,
                             events,
                         );
+                    }
+                }
+                // CR 118.1 + CR 121.1: a draw performed as a cost, by the cost's
+                // context-ref player. Psychic Vortex's cumulative upkeep draws for
+                // its controller. Decoy Gambit's "unless its controller has you
+                // draw a card" is CR 118.12a grammar whose payer (the creature's
+                // controller) has the spell's original controller draw, so payer
+                // and drawer differ (CR 121.3a).
+                Effect::Draw {
+                    count,
+                    target: target @ (TargetFilter::Controller | TargetFilter::OriginalController),
+                } => {
+                    let requested = resolved_cost_count(resolve_cost_quantity(
+                        state, count, player, source_id, scope,
+                    ));
+                    let drawer = match scope {
+                        PaymentScope::Resolution { ability, .. } => {
+                            super::effects::resolve_player_for_context_ref(state, ability, target)
+                        }
+                        // An activated ability's controller and original
+                        // controller are both the activating player.
+                        PaymentScope::Activation { .. } => player,
+                    };
+                    // CR 614.17b + CR 121.3 + CR 121.2b: a drawer who can't draw
+                    // every card this cost includes can't choose to pay it.
+                    //
+                    // Activation-only on purpose. At resolution the choice is
+                    // refused upstream (the unless prompt's payer filter and
+                    // `handle_unless_payment`'s live re-check, both through
+                    // `resolution_cost_includes_impossible_event`). A resumed
+                    // suffix also re-enters this arm mid-payment, after CR 118.12
+                    // has latched the choice, and re-gating there would unpay a
+                    // choice already made. `is_payable_for_activation` admits
+                    // every `EffectCost` and `can_pay` dry-runs this arm, so here
+                    // it is the only CR 614.17b gate an activated draw cost
+                    // meets, mirroring the `PutCounter` arm above.
+                    if matches!(scope, PaymentScope::Activation { .. })
+                        && super::effects::draw::allowed_draw_count(state, drawer, requested)
+                            < requested
+                    {
+                        return Ok(payment_failed(
+                            "CR 614.17b: the drawer can't draw every card this cost includes",
+                        ));
+                    }
+                    // CR 702.24a + CR 121.2 + CR 121.2a: one one-card
+                    // instruction per repetition of "draw a card", each consulted
+                    // for instruction-level replacements on its own (Alms
+                    // Collector's ruling: count the word "draw").
+                    // CR 121.3 + CR 121.4: no library clamp. An empty library
+                    // still lets the drawer attempt the draw, which is recorded
+                    // for the CR 704.5b state-based action.
+                    // CR 118.11 + CR 118.12: a replaced, skipped or prevented
+                    // draw still pays this instruction.
+                    // CR 614.11a: a paused instruction completes before the
+                    // unpaid suffix resumes (`engine_replacement` orders both
+                    // replacement-choice boundaries that way).
+                    // No `EffectResolved` is emitted: paying a cost is not an
+                    // effect resolving, matching the sibling arms.
+                    for issued in 1..=requested {
+                        match super::effects::draw::start_draw_sequence(state, drawer, 1, events)
+                        {
+                            ReplacementResult::Execute(_) | ReplacementResult::Prevented => {}
+                            ReplacementResult::NeedsChoice(_) => {
+                                // The instructions not yet issued stay owed across
+                                // the pause; the parked payment carries them.
+                                let unissued = requested - issued;
+                                let remaining_cost = (unissued > 0).then(|| {
+                                    let value = i32::try_from(unissued)
+                                        .expect("a count clamped from an i32 fits in an i32");
+                                    AbilityCost::EffectCost {
+                                        effect: Box::new(Effect::Draw {
+                                            count: QuantityExpr::Fixed { value },
+                                            target: target.clone(),
+                                        }),
+                                    }
+                                });
+                                return Ok(PaymentOutcome::Paused { remaining_cost });
+                            }
+                        }
                     }
                 }
                 _ => {
@@ -2191,16 +2271,17 @@ fn self_counter_placement_is_prohibited(
     })
 }
 
-/// CR 118.5 + CR 702.24a: how many counters a resolution-time counter cost
-/// places, from its resolved `QuantityExpr`.
+/// CR 107.1b: the single clamp of a resolved effect-cost count — counters a
+/// counter cost places, or cards a draw cost draws — from its resolved
+/// `QuantityExpr` (CR 118.5 + CR 702.24a).
 ///
 /// CR 107.1b: "If a calculation that would determine the result of an effect
 /// yields a negative number, zero is used instead, unless that effect doubles,
 /// triples, or sets to a specific value a player's life total or the power
-/// and/or toughness of a creature or creature card." A counter count is in
-/// none of those exception classes, so a negative resolved quantity places
-/// ZERO counters — never its magnitude, which would turn a cost that performs
-/// no event into one that places counters the rules never asked for.
+/// and/or toughness of a creature or creature card." A counter or card count is
+/// in none of those exception classes, so a negative resolved quantity performs
+/// ZERO events — never its magnitude, which would turn a cost that performs no
+/// event into one that places counters or draws cards the rules never asked for.
 ///
 /// The resolver really can hand this function a negative value: `fold_compose`
 /// evaluates `QuantityExpr::Offset` as an unfloored `inner + offset` and
@@ -2217,8 +2298,9 @@ fn self_counter_placement_is_prohibited(
 /// (`pay_ability_cost_inner`) must preview the SAME count: if they disagree, a
 /// count the predicate reads as 0 short-circuits both previews to
 /// `Applied { count: 0 }`, the pay branch is offered, and the payment then
-/// refuses it — the exact offered-then-rejected defect CR 614.17b forbids.
-fn counter_cost_count(resolved: i32) -> u32 {
+/// refuses it — the exact offered-then-rejected defect CR 614.17b forbids. The
+/// draw cost's choice-time arm and pay arm share it for the same reason.
+fn resolved_cost_count(resolved: i32) -> u32 {
     u32::try_from(resolved.max(0)).unwrap_or(0)
 }
 
@@ -2262,7 +2344,7 @@ pub(crate) fn resolution_cost_includes_impossible_event(
                     payer,
                     ability.source_id,
                     counter_type.clone(),
-                    counter_cost_count(resolved),
+                    resolved_cost_count(resolved),
                 )
             }
             // CR 118.1: producing mana performs no counter placement, so nothing to prohibit.
@@ -2270,7 +2352,31 @@ pub(crate) fn resolution_cost_includes_impossible_event(
                 produced: crate::types::ability::ManaProduction::Fixed { .. },
                 ..
             } => false,
-            // `supports_effect_cost_payment` refuses every other effect-cost shape upstream.
+            // CR 614.17b + CR 121.3 + CR 121.3a: a can't-draw effect refuses the
+            // choice to pay a draw cost. The test is keyed on the DRAWER, never on
+            // `payer`: CR 121.3a applies the refusal to the player who would draw
+            // even when another player makes the choice (Decoy Gambit: the payer is
+            // the creature's controller, the drawer is the spell's caster).
+            //
+            // CR 121.2b: "the player can't pay a cost that includes drawing
+            // multiple cards" under a one-card-per-turn limit, so the whole
+            // expanded count is what the limit is measured against. This differs
+            // from `draw::resolve`'s "up to" doctrine (refuse only when nothing can
+            // be drawn): an up-to effect may shrink, a fixed cost cannot.
+            //
+            // CR 118.5: a zero-card cost includes no draw, so it is never refused.
+            Effect::Draw {
+                count,
+                target: target @ (TargetFilter::Controller | TargetFilter::OriginalController),
+            } => {
+                let drawer = super::effects::resolve_player_for_context_ref(state, ability, target);
+                let requested =
+                    resolved_cost_count(resolve_quantity_with_targets(state, count, ability));
+                super::effects::draw::allowed_draw_count(state, drawer, requested) < requested
+            }
+            // `supports_effect_cost_payment` admits exactly the three shapes above
+            // (source counters, fixed mana, a context-ref draw) and refuses every
+            // other effect-cost shape upstream.
             // CR 614.17b: this arm swallows ANY widening of that predicate, not just a further
             // counter-placing one, so admitting any new effect-cost shape owes a matching arm
             // here in the same change — otherwise the new shape answers "no impossible event"
@@ -4009,6 +4115,135 @@ mod tests {
             matches!(refused, Err(EngineError::ActionNotAllowed(_))),
             "a prevented counter-placement cost must refuse activation, got {refused:?}"
         );
+    }
+
+    /// Maralen of the Mornsong, verbatim Oracle text: a CR 121.3 can't-draw effect.
+    const MARALEN_ORACLE: &str = "Players can't draw cards.\n\
+        At the beginning of each player's draw step, that player loses 3 life, searches \
+        their library for a card, puts it into their hand, then shuffles.";
+
+    /// Stinkweed Imp, verbatim Oracle text: Dredge 5 makes every individual
+    /// draw a replacement choice while the library holds five or more cards.
+    const STINKWEED_IMP_ORACLE: &str = "Flying\n\
+        Whenever this creature deals combat damage to a creature, destroy that creature.\n\
+        Dredge 5 (If you would draw a card, you may mill five cards instead. If you do, \
+        return this card from your graveyard to your hand.)";
+
+    fn draw_effect_cost(count: i32) -> AbilityCost {
+        AbilityCost::EffectCost {
+            effect: Box::new(Effect::Draw {
+                count: QuantityExpr::Fixed { value: count },
+                target: TargetFilter::Controller,
+            }),
+        }
+    }
+
+    /// CR 614.17b + CR 121.3: "If an event can't happen, a player can't choose
+    /// to pay a cost that includes that event" — for a draw cost at
+    /// `PaymentScope::Activation`. As with the counter cost above, activation
+    /// never consults `resolution_cost_includes_impossible_event`, so the gate
+    /// inside the `Draw` pay arm is the only refusal available.
+    ///
+    /// Revert probe: dropping that gate lets (iii) report `Paid` under Maralen.
+    #[test]
+    fn activation_draw_cost_under_cant_draw_is_refused() {
+        let mut scenario = GameScenario::new();
+        scenario.with_library_top(P0, &["Top", "Second", "Third"]);
+        let source = scenario.add_creature(P0, "Draw Cost Source", 1, 1).id();
+        let cost = draw_effect_cost(1);
+
+        // (i) Reach guard: the draw cost is payable before the prohibition exists.
+        assert!(
+            can_pay_activation(&scenario.state, source, &cost),
+            "an unprohibited draw cost must be payable at activation"
+        );
+
+        // (ii) Paying it draws one card for the activating player.
+        let mut paid_state = scenario.state.clone();
+        let hand_before = paid_state.players[P0.0 as usize].hand.len();
+        let paid = pay_ability_cost_for_activation(
+            &mut paid_state,
+            P0,
+            source,
+            &cost,
+            Some(0),
+            &mut Vec::new(),
+        );
+        assert!(
+            matches!(paid, Ok(PaymentOutcome::Paid)),
+            "an unprohibited draw cost must pay, got {paid:?}"
+        );
+        assert_eq!(
+            paid_state.players[P0.0 as usize].hand.len(),
+            hand_before + 1,
+            "paying a draw cost must draw the card"
+        );
+
+        scenario.add_creature_from_oracle(P0, "Maralen of the Mornsong", 2, 3, MARALEN_ORACLE);
+
+        // (iii) Under a can't-draw effect the cost can't be chosen.
+        assert!(
+            !can_pay_activation(&scenario.state, source, &cost),
+            "a draw cost must be unpayable while its drawer can't draw"
+        );
+        let refused = pay_ability_cost_for_activation(
+            &mut scenario.state,
+            P0,
+            source,
+            &cost,
+            Some(0),
+            &mut Vec::new(),
+        );
+        assert!(
+            matches!(refused, Err(EngineError::ActionNotAllowed(_))),
+            "a can't-draw effect must refuse the draw cost, got {refused:?}"
+        );
+    }
+
+    /// CR 702.24a + CR 121.2 + CR 616.1: the draw cost is paid as one one-card
+    /// instruction per repetition, so a pause on the first instruction hands back
+    /// exactly the instructions not yet issued, and nothing when none remain.
+    #[test]
+    fn resolution_draw_cost_pause_returns_the_unissued_instructions() {
+        for (requested, expected_suffix) in [(3, Some(draw_effect_cost(2))), (1, None)] {
+            let mut scenario = GameScenario::new();
+            scenario.with_library_top(P0, &["L1", "L2", "L3", "L4", "L5", "L6", "L7"]);
+            scenario
+                .add_creature_to_graveyard(P0, "Stinkweed Imp", 1, 2)
+                .from_oracle_text(STINKWEED_IMP_ORACLE);
+            let source = scenario.add_creature(P0, "Draw Cost Source", 1, 1).id();
+            let ability = ResolvedAbility::new(
+                Effect::TargetOnly {
+                    target: TargetFilter::Any,
+                },
+                vec![],
+                source,
+                P0,
+            );
+
+            let outcome = pay_ability_cost_for_resolution(
+                &mut scenario.state,
+                P0,
+                &draw_effect_cost(requested),
+                &ability,
+                &mut Vec::new(),
+            );
+
+            let Ok(PaymentOutcome::Paused { remaining_cost }) = outcome else {
+                panic!("Dredge must pause the first of {requested} instructions, got {outcome:?}");
+            };
+            assert_eq!(
+                remaining_cost, expected_suffix,
+                "the pause hands back exactly the instructions not yet issued"
+            );
+            assert!(
+                matches!(
+                    scenario.state.waiting_for,
+                    WaitingFor::ReplacementChoice { .. }
+                ),
+                "the pause is the Dredge replacement choice"
+            );
+        }
     }
 
     // ---------------------------------------------------------------------

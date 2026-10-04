@@ -1213,6 +1213,7 @@ mod printed_damage_prevention_survives_turn;
 mod proctor_of_potential_restriction;
 mod proliferate_zero_counter;
 mod promise_of_loyalty;
+mod psychic_vortex_cumulative_upkeep_draw;
 mod pugnacious_hammerskull_another_dinosaur;
 mod pulse_of_the_forge;
 mod punishing_punch_twice_subject_power;
