@@ -1090,8 +1090,8 @@ mod tests {
     use super::*;
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        AbilityCost, AbilityDefinition, AbilityKind, ChoiceValue, DevotionColors, QuantityExpr,
-        QuantityRef, TargetFilter,
+        AbilityCost, AbilityDefinition, AbilityKind, ChoiceValue, ControllerRef, DevotionColors,
+        QuantityExpr, QuantityRef, TargetFilter, TypedFilter,
     };
     use crate::types::card_type::CoreType;
     use crate::types::identifiers::{CardId, ObjectId};
@@ -3138,8 +3138,6 @@ mod tests {
     /// yields that opponent's commander colors, not the activator's.
     #[test]
     fn produceable_types_by_opponent_filter_reads_command_tower_for_its_controller() {
-        use crate::types::ability::{ControllerRef, TypedFilter};
-
         let state = commander_board_with_opponent_command_tower();
 
         let options = crate::game::mana_sources::produceable_mana_types_by_filter(
