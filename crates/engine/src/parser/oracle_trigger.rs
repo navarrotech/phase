@@ -5762,7 +5762,7 @@ fn rebind_attack_anaphor_to_defending_player(cond: &mut TriggerCondition) {
             rebind_attack_anaphor_to_defending_player(condition)
         }
         // All other variants are leaves that carry no `PlayerScope`, which
-        // `TriggerCondition::designation_player_anchor` enforces exhaustively
+        // `TriggerCondition::evaluation_anchor` enforces exhaustively
         // for the designation family — nothing to rebind.
         _ => {}
     }
@@ -6331,6 +6331,22 @@ fn parse_first_time_counters_intervening_if(input: &str) -> OracleResult<'_, Tri
     let (rest, _) = alt((tag("that creature"), tag("that permanent"), tag("it"))).parse(rest)?;
     let (rest, _) = tag(" this turn").parse(rest)?;
     Ok((rest, TriggerCondition::FirstTimeObjectCountersAddedThisTurn))
+}
+
+/// CR 603.4 + CR 607.1c: "if you haven't added mana with this ability this turn" —
+/// a self-linked intervening-if (Carpet of Flowers). The guard's subject is this
+/// ability's own occurrence, so it lowers to `Not(AddedManaWithThisAbilityThisTurn)`.
+fn parse_added_mana_with_this_ability_intervening_if(
+    input: &str,
+) -> OracleResult<'_, TriggerCondition> {
+    let (rest, _) = tag("if you haven't ").parse(input)?;
+    let (rest, _) = tag("added mana with this ability this turn").parse(rest)?;
+    Ok((
+        rest,
+        TriggerCondition::Not {
+            condition: Box::new(TriggerCondition::AddedManaWithThisAbilityThisTurn),
+        },
+    ))
 }
 
 /// CR 508.1 + CR 603.4: "if a <type> and a <type> [and ...] attacked this combat"
@@ -6921,6 +6937,21 @@ fn extract_if_condition_with_card_name(
     // CounterAdded event), so it cannot lower through a StaticCondition.
     if let Some((before, condition, rest)) =
         scan_preceded(&lower, parse_first_time_counters_intervening_if)
+    {
+        let pos = before.len();
+        let clause_len = lower.len() - before.len() - rest.len();
+        return (
+            strip_condition_clause(text, pos, clause_len),
+            Some(condition),
+        );
+    }
+
+    // CR 603.4 + CR 607.1c: "if you haven't added mana with this ability this
+    // turn" — a self-linked intervening-if (Carpet of Flowers). Its subject is
+    // this triggered ability's own occurrence, which has no static analogue, so
+    // it cannot lower through a StaticCondition.
+    if let Some((before, condition, rest)) =
+        scan_preceded(&lower, parse_added_mana_with_this_ability_intervening_if)
     {
         let pos = before.len();
         let clause_len = lower.len() - before.len() - rest.len();

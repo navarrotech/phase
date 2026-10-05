@@ -8188,9 +8188,10 @@ fn project_out_resources(state: &GameState) -> GameState {
     // `triggers_fired_*` sets preserved below, EVERY triggered ability that deposits mana
     // writes it, and a blink or token loop mints a fresh `TriggerDefinitionRef` (new
     // incarnation, CR 400.7) each cycle, so a retained set would grow and falsely refuse a
-    // legitimate unrestricted loop. Its readers are beginning-of-main-phase intervening-ifs
-    // (CR 505.1 + CR 603.4), constant within a priority-bounded window; extra-phase loops are
-    // covered by the same warmup-skip argument as `ability_resolutions_this_turn` above.
+    // legitimate unrestricted loop. Its one reader is the CR 603.4 intervening-if leaf
+    // `TriggerCondition::AddedManaWithThisAbilityThisTurn`, which may sit on a trigger of any
+    // timing, so soundness rests on that leaf's classification below rather than on when its
+    // trigger fires.
     // Strict `GameState::eq` still compares it. Soundness obligation: any condition that reads
     // this field must be classified `projected: true` in `ability_scan` (as
     // `AbilityUseCountThisTurn` is), which keeps the fire-time projected-read gate

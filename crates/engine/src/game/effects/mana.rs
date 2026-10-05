@@ -451,8 +451,7 @@ fn record_firebending_if_marked(
 /// CR 608.2c), so the mana is added with that ability (Braid of Fire's
 /// cumulative upkeep, CR 702.24a). A `None` ref is the ordinary
 /// non-triggered case: spells, activated abilities, replacement
-/// may-costs. The state-trigger builder passes `None`, and no state
-/// trigger in the corpus adds mana.
+/// may-costs. The state-trigger builder passes `None`, so a state trigger records nothing here.
 pub(crate) fn record_triggered_ability_added_mana(
     state: &mut GameState,
     ability: &ResolvedAbility,
