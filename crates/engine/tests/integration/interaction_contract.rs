@@ -22,11 +22,10 @@ use engine::types::card::CardFace;
 use engine::types::counter::{CounterMatch, CounterType};
 use engine::types::format::FormatConfig;
 use engine::types::game_state::{
-    AlternativeCastKeyword, AutoPassMode, CastPaymentMode, GameState, MulliganBottomEntry,
-    MulliganDecisionEntry, MulliganDecisionPhase, ManaChoice, ManaChoicePrompt,
-    OpeningHandBottomReason, PendingTriggerSummary, PlayerDeckPool,
-    ResolutionOptionalPaymentOption, TurnBoundary, WaitingFor,
-    ZoneOpponentChooserPurpose,
+    AlternativeCastKeyword, AutoPassMode, CastPaymentMode, GameState, ManaChoice, ManaChoicePrompt,
+    MulliganBottomEntry, MulliganDecisionEntry, MulliganDecisionPhase, OpeningHandBottomReason,
+    PendingTriggerSummary, PlayerDeckPool, ResolutionOptionalPaymentOption, TurnBoundary,
+    WaitingFor, ZoneOpponentChooserPurpose,
 };
 use engine::types::identifiers::{CardId, ObjectId};
 use engine::types::interaction::{
