@@ -762,6 +762,76 @@ fn castability_follows_two_swamps_through_a_filter_land_payment() {
     assert!(state.pending_cast.is_none());
 }
 
+/// CR 601.2g + CR 605.3b: The producer -> filter-land routes a priority probe
+/// memoizes are spell-independent, so one probe must answer every cost the
+/// same way the uncached witness does, whichever cost explores the route tree
+/// first and whether a later query is served from the memo or resumes it.
+#[test]
+fn priority_probe_filter_land_route_memo_matches_the_uncached_witness() {
+    let mut state = setup_game_at_main_phase();
+    let spell =
+        create_generic_creature_in_hand(&mut state, 9_030, PlayerId(0), "Route Memo Stand-In", 0);
+    for name in ["First Swamp", "Second Swamp"] {
+        create_tap_mana_source(
+            &mut state,
+            name,
+            ManaProduction::Fixed {
+                colors: vec![ManaColor::Black],
+                contribution: ManaContribution::Base,
+            },
+        );
+    }
+    create_black_red_filter_land(&mut state, 9_031);
+    let colored = |shards: Vec<ManaCostShard>| ManaCost::Cost { shards, generic: 0 };
+    // Two Swamps plus a filter land net three mana: {B}{B}{R} is payable only
+    // through the filter-land route, {B}{B}{R}{R} is not payable at all.
+    let payable = colored(vec![
+        ManaCostShard::Black,
+        ManaCostShard::Black,
+        ManaCostShard::Red,
+    ]);
+    let unpayable = colored(vec![
+        ManaCostShard::Black,
+        ManaCostShard::Black,
+        ManaCostShard::Red,
+        ManaCostShard::Red,
+    ]);
+    assert!(can_feasibly_pay_mana_cost(
+        &state,
+        PlayerId(0),
+        Some(spell),
+        &payable
+    ));
+    assert!(!can_feasibly_pay_mana_cost(
+        &state,
+        PlayerId(0),
+        Some(spell),
+        &unpayable
+    ));
+
+    let feasible_with = |probe: &PriorityCastProbe, cost: &ManaCost| {
+        can_feasibly_pay_mana_cost_with_probe(
+            probe.state(),
+            PlayerId(0),
+            Some(spell),
+            cost,
+            Some(probe),
+        )
+    };
+
+    // Exhaust the route tree first, then answer from the memo.
+    let exhausted = PriorityCastProbe::new(&state, PlayerId(0));
+    assert!(!feasible_with(&exhausted, &unpayable));
+    assert!(feasible_with(&exhausted, &payable));
+    assert!(!feasible_with(&exhausted, &unpayable));
+
+    // Stop early on a payable cost, then resume the walk for an unpayable one.
+    let resumed = PriorityCastProbe::new(&state, PlayerId(0));
+    assert!(feasible_with(&resumed, &payable));
+    assert!(!feasible_with(&resumed, &unpayable));
+    assert!(feasible_with(&resumed, &payable));
+}
+
 #[test]
 fn castability_follows_a_manual_nonland_producer_through_a_filter_land_payment() {
     let mut state = setup_game_at_main_phase();
@@ -34999,6 +35069,53 @@ fn bare_subtype_land_cant_tap_excluded_from_legal_mana_actions() {
             .any(|action| action.source_object() == Some(forest)),
         "a can't-tap bare-subtype land must not offer its intrinsic mana ability, \
          got {legal_actions:?}"
+    );
+}
+
+/// CR 305.6 + CR 602.5 + CR 601.2g: the auto-tap PLANNING pass applies the
+/// same activation-prohibition gate to a bare-subtype artifact land's intrinsic
+/// mana ability as the interactive path does (Collector Ouphe class). Reaches
+/// the `land_mana_options` bare-subtype fallback directly with
+/// `ManaPayabilityMode::Planning`, paired with the identical land and no
+/// prohibition. (Through `CastSpell`, layer evaluation first materializes the
+/// intrinsic ability as an explicit definition, so this fallback is only
+/// reachable on a state whose layers have not run.)
+#[test]
+fn bare_subtype_artifact_land_planning_blocked_by_cant_be_activated() {
+    let mut state = setup_game_at_main_phase();
+    let forest = add_bare_subtype_forest(&mut state, PlayerId(0), 0xF012B);
+    state
+        .objects
+        .get_mut(&forest)
+        .unwrap()
+        .card_types
+        .core_types
+        .push(CoreType::Artifact);
+
+    let aura_sources = crate::game::mana_sources::taps_for_mana_trigger_sources(&state);
+    let planning = |state: &GameState| {
+        crate::game::mana_sources::auto_tap_land_mana_options_indexed(
+            state,
+            forest,
+            PlayerId(0),
+            &aura_sources,
+        )
+    };
+
+    assert!(
+        !planning(&state).is_empty(),
+        "control: without a prohibition the bare-subtype artifact land plans a mana option"
+    );
+
+    add_cant_be_activated_source(
+        &mut state,
+        PlayerId(1),
+        ProhibitionScope::AllPlayers,
+        TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact)),
+    );
+    assert!(
+        planning(&state).is_empty(),
+        "Collector Ouphe class: planning must not offer the artifact land's intrinsic mana ability"
     );
 }
 
