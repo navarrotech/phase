@@ -1825,6 +1825,7 @@ mod dismantle;
 mod ebondeath_not_named_died_condition;
 mod event_deadline_duration;
 mod exchange_control_of_a_spell;
+mod exchange_control_up_to_one_target;
 mod exploit_ceased_exploiter_lki;
 mod extra_turn_quantity;
 mod foreign_subject_split_guard;

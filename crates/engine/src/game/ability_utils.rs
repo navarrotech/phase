@@ -3731,12 +3731,15 @@ fn collect_target_slots_inner(
         for filter in paired_subject_slot_filters(&ability.effect) {
             let legal_targets =
                 legal_targets_for_ability_filter(state, ability, filter, &acc.slots);
-            if legal_targets.is_empty() && !ability.optional_targeting {
+            // CR 115.6 + CR 601.2c: zero-target authority is targeting_is_optional() —
+            // ability-wide optional_targeting and a min-0 multi_target ("up to one
+            // target", Gilded Drake) encode the same fact.
+            if legal_targets.is_empty() && !ability.targeting_is_optional() {
                 return Err(no_legal_target_slots());
             }
             acc.push(TargetSelectionSlot {
                 legal_targets,
-                optional: ability.optional_targeting,
+                optional: ability.targeting_is_optional(),
                 chooser: None,
                 effect_kind: acc.current_effect_kind,
                 effect_detail: acc.current_effect_detail,
@@ -6416,7 +6419,8 @@ fn collect_target_slot_specs(
             *next_instance += 1;
             specs.push(TargetSlotSpec {
                 filter: filter.clone(),
-                optional: ability.optional_targeting,
+                // CR 115.6: same authority as collect_target_slots_inner's paired arm.
+                optional: ability.targeting_is_optional(),
                 instance: id,
             });
         }
@@ -9052,11 +9056,12 @@ fn assign_targets_recursive(
     // hold exactly its own claimed entries.
     if paired_subject_filters(&ability.effect).is_some() {
         let claimed = paired_subject_slot_filters(&ability.effect).count();
+        // CR 115.6: same authority as collect_target_slots_inner's paired arm.
         for _ in 0..claimed {
             if let Some(chosen) = targets.get(*next_target) {
                 ability.targets.push(chosen.clone());
                 *next_target += 1;
-            } else if !ability.optional_targeting {
+            } else if !ability.targeting_is_optional() {
                 return Err(EngineError::InvalidAction(
                     "Missing required target".to_string(),
                 ));
@@ -9524,7 +9529,7 @@ fn assign_selected_slots_recursive(
     //
     // The two blocks are NOT interchangeable: this one is fed
     // `Option<TargetRef>` slots, so a DECLINED slot is representable and must
-    // be honoured (`None if ability.optional_targeting`), and a short list is
+    // be honoured (`None if ability.targeting_is_optional()`), and a short list is
     // a different error (`"Missing target selection"`) from a missing
     // required choice (`"Missing required target"`). MEASURED at BASE on
     // Arteeoh's live combat-damage trigger prompt: the second `ChooseTarget`
@@ -9541,7 +9546,8 @@ fn assign_selected_slots_recursive(
             };
             match selected_slot {
                 Some(chosen) => ability.targets.push(chosen.clone()),
-                None if ability.optional_targeting => {}
+                // CR 115.6: same authority as collect_target_slots_inner's paired arm.
+                None if ability.targeting_is_optional() => {}
                 None => {
                     return Err(EngineError::InvalidAction(
                         "Missing required target".to_string(),
@@ -11015,7 +11021,8 @@ fn minimum_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -> usi
     // filter. Mirrors the `move_counter_targets` term above; zero when
     // targeting is optional. Note the `(Controller, Player)` shape (Cliffside
     // Market) reserves exactly ONE — the context-ref half claims nothing.
-    let paired_subject_targets = if ability.optional_targeting {
+    // CR 115.6: same authority as collect_target_slots_inner's paired arm.
+    let paired_subject_targets = if ability.targeting_is_optional() {
         0
     } else {
         paired_subject_slot_filters(&ability.effect).count()
@@ -13002,6 +13009,76 @@ mod tests {
             minimum_targets_in_chain(&state, &companion_node),
             1,
             "reach guard: the companion machinery reserves 1 slot when it applies"
+        );
+    }
+
+    /// SU1 — CR 115.6 + CR 603.3d: a paired-subject node whose declared slot is
+    /// "up to one target" (Gilded Drake: `(SelfRef, creature an opponent
+    /// controls)` with a min-0 `multi_target`) yields one OPTIONAL slot even when
+    /// nothing is legal, and reserves no required slot, so the trigger can still
+    /// be put on the stack with zero targets. The slot builder, the per-slot spec
+    /// mirror and the minimum-count reservation all read the same authority,
+    /// `targeting_is_optional()`.
+    #[test]
+    fn paired_subject_up_to_one_slot_is_optional_with_no_legal_target() {
+        let mut state = GameState::new_two_player(43);
+        let drake = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Up To One Exchange Source".to_string(),
+            Zone::Battlefield,
+        );
+        // The source is P0's only creature and P1 controls none, so the declared
+        // slot "creature an opponent controls" has no legal target.
+        let mut node = ResolvedAbility::new(
+            Effect::ExchangeControl {
+                target_a: TargetFilter::SelfRef,
+                target_b: TargetFilter::Typed(
+                    TypedFilter::creature().controller(ControllerRef::Opponent),
+                ),
+            },
+            vec![],
+            drake,
+            PlayerId(0),
+        );
+
+        // Hostile leg (mandatory default preserved, and the reach guard that the
+        // paired arm's empty-legal exit is live): without the spec the empty
+        // slot is an error and one slot is reserved.
+        assert!(
+            build_target_slots(&state, &node).is_err(),
+            "a mandatory paired slot with no legal target must be rejected"
+        );
+        assert_eq!(minimum_targets_in_chain(&state, &node), 1);
+
+        node.multi_target = Some(MultiTargetSpec::up_to(QuantityExpr::Fixed { value: 1 }));
+        assert!(
+            !node.optional_targeting,
+            "the spec alone carries optionality"
+        );
+
+        let slots = build_target_slots(&state, &node)
+            .expect("an optional paired slot with no legal target is still a slot");
+        let [slot] = slots.as_slice() else {
+            panic!("expected exactly one declared slot, got {slots:?}");
+        };
+        assert!(
+            slot.optional,
+            "CR 115.6: the \"up to one\" slot may be left empty"
+        );
+        assert!(slot.legal_targets.is_empty());
+
+        let specs = target_slot_specs(&state, &node);
+        let [spec] = specs.as_slice() else {
+            panic!("expected exactly one slot spec, got {specs:?}");
+        };
+        assert!(spec.optional, "the spec mirror matches the surfaced slot");
+
+        assert_eq!(
+            minimum_targets_in_chain(&state, &node),
+            0,
+            "an optional paired slot reserves no required target"
         );
     }
 
