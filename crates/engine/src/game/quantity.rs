@@ -7348,7 +7348,11 @@ fn battlefield_departure_counter_context(
 /// tier determined one. `resolve_ref` reads `None` as 0; callers that must tell an
 /// undetermined amount from a determined zero (a delayed trigger freezing its
 /// creation-time amount, CR 603.7a) use `determined_event_context_amount`.
-/// Resolution-precedence ordered:
+/// Resolution-precedence ordered. Two context-scoped amounts outrank the whole
+/// list: a replacement condition's proposed-event amount (`ctx.event_amount`)
+/// and a Moonlit-style substitution count
+/// (`post_replacement_token_substitution_count`). Each is `Some` only inside its
+/// own context. After them:
 ///
 ///   0. `zone_changed_this_way_gate_count` — when the resolving node is gated
 ///      by "one or more <FILTER> were <verb>ed this way", "that many" is that
