@@ -14463,8 +14463,8 @@ impl AbilityCost {
             // The dry run has a real arm for exactly the shapes
             // `supports_effect_cost_payment` admits (PutCounter{SelfRef} /
             // Mana{Fixed} / Draw by a context-ref player); every other shape hits
-            // the payment-path fallback and
-            // is refused on every board. `supports_cumulative_upkeep_payment`
+            // the payment-path fallback and is refused on every board.
+            // `supports_cumulative_upkeep_payment`
             // below delegates to the same predicate, but as a MATCH GUARD
             // (`EffectCost { .. } if self.supports_effect_cost_payment() => true`)
             // because that function has a `_ => false` fallthrough to absorb the
