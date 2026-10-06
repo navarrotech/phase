@@ -8,23 +8,41 @@
 //! exchange, so "If you don't or can't make an exchange, sacrifice this
 //! creature" applies.
 //!
-//! Rows (phase 1 of the Gilded Drake charter):
+//! CR 101.1 + CR 608.2b: the trailing "This ability still resolves if its
+//! target becomes illegal" overrides CR 608.2b's "doesn't resolve". When the
+//! sole target is illegal at resolution the ability resolves anyway; the
+//! illegal target is unaffected, so no exchange happens and the rider
+//! sacrifices the Drake.
+//!
+//! Rows:
 //! - T1, positive control: a legal target that stays legal is exchanged and the
 //!   Drake is not sacrificed.
+//! - T2: the sole target is bounced in response, so the ability still resolves
+//!   without an exchange and the Drake is sacrificed.
+//! - T3: the sole target gains shroud in response, with the same outcome; the
+//!   target stays where it is.
 //! - T4: zero targets chosen while a legal opponent creature exists, so the
 //!   Drake is sacrificed.
 //! - T5: no opponent creature at all, so the trigger still goes on the stack and
 //!   the Drake is sacrificed.
-//!
-//! The trailing "This ability still resolves if its target becomes illegal"
-//! sentence is out of scope here and stays an unsupported parse.
+//! - T6, hostile sibling: Volatile Stormdrake has no override, so the same
+//!   bounce makes its trigger not resolve at all.
+//! - OB1: with no opponent creature, the trigger-payoff preflight credits the
+//!   Drake's trigger as fireable.
 
+use engine::game::ability_utils::{
+    ability_definition_supported, build_resolved_from_def,
+    simple_legal_target_assignment_exists_for_ability, validate_targets_in_chain,
+};
+use engine::game::keywords::has_keyword;
 use engine::game::scenario::{CastCommit, CastOutcome, GameRunner, GameScenario, P0, P1};
-use engine::types::ability::TargetRef;
+use engine::game::triggers::hypothetical_trigger_fireable;
+use engine::types::ability::{EffectKind, IllegalTargetsDisposition, ResolvedAbility, TargetRef};
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
 use engine::types::game_state::{StackEntryKind, TargetSelectionSlot, WaitingFor};
 use engine::types::identifiers::ObjectId;
+use engine::types::keywords::Keyword;
 use engine::types::mana::ManaCost;
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
@@ -33,6 +51,19 @@ use engine::types::zones::Zone;
 const GILDED_DRAKE_TEXT: &str = "Flying\nWhen this creature enters, exchange control of this \
     creature and up to one target creature an opponent controls. If you don't or can't make an \
     exchange, sacrifice this creature. This ability still resolves if its target becomes illegal.";
+
+/// Verbatim from Scryfall (`cards/named?exact=Volatile%20Stormdrake`): the same
+/// exchange with a mandatory slot and no override sentence.
+const VOLATILE_STORMDRAKE_TEXT: &str = "Flying, hexproof from activated and triggered \
+    abilities\nWhen this creature enters, exchange control of this creature and target creature \
+    an opponent controls. If you do, you get {E}{E}{E}{E}, then sacrifice that creature unless \
+    you pay an amount of {E} equal to its mana value.";
+
+/// Verbatim Oracle text of Unsummon (MTGJSON).
+const UNSUMMON_TEXT: &str = "Return target creature to its owner's hand.";
+
+/// A test spell, not a printed card: the one sentence T3 needs (CR 702.18a).
+const SHROUD_TEST_SPELL_TEXT: &str = "Target creature gains shroud until end of turn.";
 
 /// Upper bound on staging steps. The Drake needs a handful of actions (pass to
 /// resolve the spell, answer the trigger prompt); the bound only exists so a
@@ -132,14 +163,118 @@ fn drake_trigger_entry(
     state: &engine::types::game_state::GameState,
     drake: ObjectId,
 ) -> Option<Vec<TargetRef>> {
+    trigger_ability(state, drake).map(|ability| ability.targets.clone())
+}
+
+/// The resolved ability of `source`'s triggered ability on the stack, if any.
+fn trigger_ability(
+    state: &engine::types::game_state::GameState,
+    source: ObjectId,
+) -> Option<&ResolvedAbility> {
     state.stack.iter().find_map(|entry| {
-        let is_drake_trigger = entry.source_id == drake
+        let is_source_trigger = entry.source_id == source
             && matches!(entry.kind, StackEntryKind::TriggeredAbility { .. });
-        if !is_drake_trigger {
+        if !is_source_trigger {
             return None;
         }
-        entry.ability().map(|ability| ability.targets.clone())
+        entry.ability()
     })
+}
+
+/// A board with `name` (free to cast, `text` verbatim) in P0's hand, a Grizzly
+/// Bears controlled by P1, and a free instant with `response_text` in P1's hand.
+/// P0 is active and holds priority.
+fn build_response_board(
+    name: &str,
+    text: &str,
+    response_name: &str,
+    response_text: &str,
+) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let bear = scenario.add_creature(P1, "Grizzly Bears", 2, 2).id();
+    let source = scenario
+        .add_creature_to_hand_from_oracle(P0, name, 3, 3, text)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+    let response = scenario
+        .add_spell_to_hand_from_oracle(P1, response_name, true, response_text)
+        .with_mana_cost(ManaCost::zero())
+        .id();
+
+    let mut runner = scenario.build();
+    {
+        let state = runner.state_mut();
+        state.active_player = P0;
+        state.priority_player = P0;
+        state.waiting_for = WaitingFor::Priority { player: P0 };
+    }
+    (runner, source, bear, response)
+}
+
+/// With `source`'s ETB trigger staged on the stack, hand priority to P1, cast
+/// `response` at `bear`, and pass priority until the response has resolved and
+/// only the trigger is left on the stack, still unresolved.
+///
+/// The returned commit's `resolve()` then resolves the trigger, so its outcome
+/// events are the trigger's resolution events.
+fn respond_and_settle<'commit>(
+    commit: &'commit mut CastCommit<'_>,
+    source: ObjectId,
+    response: ObjectId,
+    bear: ObjectId,
+) -> CastCommit<'commit> {
+    // Priority goes to P1 only once the trigger is a real stack entry, the same
+    // hand-off the V5 row in `exchange_control_of_a_spell.rs` makes.
+    {
+        let state = commit.state_mut();
+        state.priority_player = P1;
+        state.waiting_for = WaitingFor::Priority { player: P1 };
+    }
+    let mut response_commit = commit.cast(response).target_objects(&[bear]).commit();
+    for _ in 0..STAGING_STEP_LIMIT {
+        let state = response_commit.state();
+        if state.stack.len() == 1 && trigger_ability(state, source).is_some() {
+            return response_commit;
+        }
+        response_commit
+            .act(GameAction::PassPriority)
+            .expect("PassPriority should succeed while the response resolves");
+    }
+    panic!(
+        "the response did not resolve ahead of the trigger within {STAGING_STEP_LIMIT} steps \
+         (stack: {:?}, waiting_for: {:?})",
+        response_commit.state().stack,
+        response_commit.state().waiting_for
+    );
+}
+
+fn exchange_resolutions(outcome: &CastOutcome, source: ObjectId) -> usize {
+    outcome
+        .events()
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                GameEvent::EffectResolved {
+                    kind: EffectKind::ExchangeControl,
+                    source_id,
+                    ..
+                } if *source_id == source
+            )
+        })
+        .count()
+}
+
+fn sacrificed_permanents(outcome: &CastOutcome) -> Vec<ObjectId> {
+    outcome
+        .events()
+        .iter()
+        .filter_map(|event| match event {
+            GameEvent::PermanentSacrificed { object_id, .. } => Some(*object_id),
+            _ => None,
+        })
+        .collect()
 }
 
 fn controller_changes(outcome: &CastOutcome) -> usize {
@@ -321,4 +456,240 @@ fn gilded_drake_without_an_opponent_creature_still_triggers_and_is_sacrificed() 
         outcome.state().players[0].graveyard.contains(&drake),
         "the Drake is in its owner P0's graveyard"
     );
+}
+
+/// T2. The bear is bounced in response, so as the trigger resolves its sole
+/// target is a new object (CR 400.7) and illegal. CR 101.1 + CR 608.2b: the
+/// card's override makes the ability resolve anyway; the illegal target is
+/// unaffected, so CR 701.12a makes no exchange, and "If you don't or can't make
+/// an exchange" sacrifices the Drake (CR 701.21a).
+///
+/// Fails on revert of the `resolve_top` gate or the parser stamp: the ability
+/// does not resolve and the Drake stays on the battlefield under P0.
+#[test]
+fn gilded_drake_still_resolves_when_its_target_is_bounced_and_is_sacrificed() {
+    let (mut runner, drake, bear, unsummon) =
+        build_response_board("Gilded Drake", GILDED_DRAKE_TEXT, "Unsummon", UNSUMMON_TEXT);
+    let (mut commit, observation) = stage_drake_trigger(&mut runner, drake, Some(bear));
+    assert_single_optional_prompt_offers(&observation, bear);
+    let settled = respond_and_settle(&mut commit, drake, unsummon, bear);
+
+    let state = settled.state();
+    assert_eq!(
+        state.objects.get(&bear).map(|object| object.zone),
+        Some(Zone::Hand),
+        "REACH GUARD: the bear was bounced before the trigger resolves"
+    );
+    let entry = trigger_ability(state, drake).expect("the Drake's trigger is still on the stack");
+    assert_eq!(
+        entry.targets,
+        vec![TargetRef::Object(bear)],
+        "REACH GUARD: the trigger still declares the bear"
+    );
+    assert_eq!(
+        entry.illegal_targets_disposition,
+        IllegalTargetsDisposition::StillResolves,
+        "REACH GUARD: the parsed override reached the stack entry"
+    );
+
+    let outcome = settled.resolve();
+
+    assert_eq!(
+        sacrificed_permanents(&outcome),
+        vec![drake],
+        "CR 701.21a: with no exchange made, the Drake is sacrificed (events were {:?})",
+        outcome.events()
+    );
+    assert!(
+        outcome.state().players[0].graveyard.contains(&drake),
+        "the Drake is in its owner P0's graveyard"
+    );
+    assert_eq!(
+        exchange_resolutions(&outcome, drake),
+        1,
+        "CR 608.2b: the ability resolved, its exchange running with no legal target \
+         (events were {:?})",
+        outcome.events()
+    );
+    assert_eq!(
+        controller_changes(&outcome),
+        0,
+        "CR 701.12a: no exchange happens with an illegal target (events were {:?})",
+        outcome.events()
+    );
+}
+
+/// T3. The bear gains shroud in response, so it can't be the target of the
+/// Drake's ability (CR 702.18a) and the sole target is illegal while the bear
+/// stays on the battlefield. CR 101.1 + CR 608.2b: the ability still resolves,
+/// the bear is unaffected (no exchange, CR 701.12a), and the Drake is
+/// sacrificed (CR 701.21a).
+///
+/// Fails on revert of the `resolve_top` gate or the parser stamp: the ability
+/// does not resolve and the Drake stays on the battlefield under P0.
+#[test]
+fn gilded_drake_still_resolves_when_its_target_gains_shroud_and_is_sacrificed() {
+    let (mut runner, drake, bear, shroud_spell) = build_response_board(
+        "Gilded Drake",
+        GILDED_DRAKE_TEXT,
+        "Shroud Test Spell",
+        SHROUD_TEST_SPELL_TEXT,
+    );
+    let (mut commit, observation) = stage_drake_trigger(&mut runner, drake, Some(bear));
+    assert_single_optional_prompt_offers(&observation, bear);
+    let settled = respond_and_settle(&mut commit, drake, shroud_spell, bear);
+
+    let state = settled.state();
+    let bear_object = state.objects.get(&bear).unwrap();
+    assert!(
+        bear_object.zone == Zone::Battlefield && has_keyword(bear_object, &Keyword::Shroud),
+        "REACH GUARD: the bear is still on the battlefield, now with shroud"
+    );
+    let entry = trigger_ability(state, drake).expect("the Drake's trigger is still on the stack");
+    assert_eq!(
+        entry.targets,
+        vec![TargetRef::Object(bear)],
+        "REACH GUARD: the trigger still declares the bear"
+    );
+    assert!(
+        validate_targets_in_chain(state, entry).targets.is_empty(),
+        "REACH GUARD: CR 608.2b re-validation finds the shrouded bear illegal"
+    );
+
+    let outcome = settled.resolve();
+
+    assert_eq!(
+        sacrificed_permanents(&outcome),
+        vec![drake],
+        "CR 701.21a: only the Drake is sacrificed, never the pruned bear (events were {:?})",
+        outcome.events()
+    );
+    assert!(
+        outcome.state().players[0].graveyard.contains(&drake),
+        "the Drake is in its owner P0's graveyard"
+    );
+    let bear_object = outcome.state().objects.get(&bear).unwrap();
+    assert_eq!(
+        (bear_object.zone, bear_object.controller),
+        (Zone::Battlefield, P1),
+        "CR 608.2b: the illegal target is unaffected"
+    );
+}
+
+/// T6, hostile sibling. Volatile Stormdrake prints the same exchange without
+/// an override, so when its sole target is bounced in response CR 608.2b
+/// applies: the ability doesn't resolve. No exchange, no energy, no sacrifice.
+///
+/// Fails if the gate goes soft for every ability: the dry exchange would then
+/// resolve and emit its `EffectResolved` event. Paired positive: T2's one.
+#[test]
+fn volatile_stormdrake_without_the_override_does_not_resolve_when_its_target_is_bounced() {
+    let (mut runner, stormdrake, bear, unsummon) = build_response_board(
+        "Volatile Stormdrake",
+        VOLATILE_STORMDRAKE_TEXT,
+        "Unsummon",
+        UNSUMMON_TEXT,
+    );
+    let (mut commit, observation) = stage_drake_trigger(&mut runner, stormdrake, Some(bear));
+    assert!(
+        observation.prompts.is_empty(),
+        "REACH GUARD: the mandatory slot with one legal creature binds without a prompt \
+         (observation: {observation:?})"
+    );
+    let settled = respond_and_settle(&mut commit, stormdrake, unsummon, bear);
+
+    let state = settled.state();
+    assert_eq!(
+        state.objects.get(&bear).map(|object| object.zone),
+        Some(Zone::Hand),
+        "REACH GUARD: the bear was bounced before the trigger resolves"
+    );
+    let entry =
+        trigger_ability(state, stormdrake).expect("the Stormdrake's trigger is still on the stack");
+    assert_eq!(
+        entry.targets,
+        vec![TargetRef::Object(bear)],
+        "REACH GUARD: the trigger still declares the bear"
+    );
+    assert_eq!(
+        entry.illegal_targets_disposition,
+        IllegalTargetsDisposition::DoesNotResolve,
+        "REACH GUARD: the Stormdrake carries the CR 608.2b default"
+    );
+    let energy_before = state.players[0].energy;
+
+    let outcome = settled.resolve();
+
+    assert_eq!(
+        exchange_resolutions(&outcome, stormdrake),
+        0,
+        "CR 608.2b: the ability does not resolve, so its exchange never runs (events were {:?})",
+        outcome.events()
+    );
+    let stormdrake_object = outcome.state().objects.get(&stormdrake).unwrap();
+    assert_eq!(
+        (stormdrake_object.zone, stormdrake_object.controller),
+        (Zone::Battlefield, P0),
+        "the Stormdrake stays P0's on the battlefield"
+    );
+    assert_eq!(
+        controller_changes(&outcome),
+        0,
+        "no control exchange happens"
+    );
+    assert_eq!(
+        outcome.state().players[0].energy,
+        energy_before,
+        "no energy is gained"
+    );
+}
+
+/// OB1. With no opponent creature, "up to one target" is still satisfiable by
+/// choosing zero targets (CR 115.6), so the trigger is live (CR 603.3d does not
+/// remove it). The trigger-payoff preflight must credit it: the paired slot's
+/// spec is optional. Hostile sibling: Volatile Stormdrake's mandatory slot has
+/// no legal target, so its trigger is not fireable on the same board.
+#[test]
+fn gilded_drake_trigger_is_fireable_in_the_preflight_without_an_opponent_creature() {
+    for (name, text, expected_assignment, expected_fireable) in [
+        ("Gilded Drake", GILDED_DRAKE_TEXT, Some(true), true),
+        (
+            "Volatile Stormdrake",
+            VOLATILE_STORMDRAKE_TEXT,
+            Some(false),
+            false,
+        ),
+    ] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let source = scenario.add_creature_from_oracle(P0, name, 3, 3, text).id();
+        let runner = scenario.build();
+        let state = runner.state();
+        let object = state.objects.get(&source).unwrap();
+        let triggers: Vec<_> = object.trigger_definitions.iter_unchecked().collect();
+        let [entry] = triggers.as_slice() else {
+            panic!("{name} has exactly one trigger, got {triggers:?}");
+        };
+        let execute = entry
+            .definition
+            .execute
+            .as_deref()
+            .expect("the trigger has an execute");
+        assert!(
+            ability_definition_supported(execute),
+            "REACH GUARD: {name}'s execute is supported, so the preflight reaches its slots"
+        );
+
+        let resolved = build_resolved_from_def(execute, source, P0);
+        assert_eq!(
+            simple_legal_target_assignment_exists_for_ability(state, &resolved, &[]),
+            expected_assignment,
+            "{name}: a legal target assignment exists only for an optional slot"
+        );
+        assert_eq!(
+            hypothetical_trigger_fireable(state, object, entry),
+            expected_fireable,
+            "{name}: fireable only when its slot can be left empty"
+        );
+    }
 }

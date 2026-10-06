@@ -4910,13 +4910,15 @@ fn instruction_outlives_declined_gate(
         // Printed, and naming no object or player: "up to N targets" only lets
         // the target list be empty (the targets are the effect's filters, audited
         // below); when the target is chosen; how the ability is labelled, which
-        // kind of ability it is, whether it can be copied, and X's minimum
-        // (every audited quantity is a fixed number).
+        // kind of ability it is, whether it can be copied, whether it still
+        // resolves with illegal targets (CR 608.2b, read only at the stack root),
+        // and X's minimum (every audited quantity is a fixed number).
         optional_targeting: _,
         target_choice_timing: _,
         description: _,
         kind: _,
         cant_be_copied: _,
+        illegal_targets_disposition: _,
         min_x_value: _,
         selected_mode_labels: _,
         modal_instruction_ordinal: _,

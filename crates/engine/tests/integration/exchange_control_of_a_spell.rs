@@ -740,33 +740,25 @@ fn an_accepted_chimera_exchange_that_happened_still_offers_the_retarget() {
     );
 }
 
-/// BLAST-RADIUS PIN (review round 2) — Gilded Drake's disposition when its
-/// sole declared target becomes illegal while staying on the battlefield.
+/// CR 608.2b default-disposition pin: an `ExchangeControl` ability whose sole
+/// declared target stops matching its filter, while staying on the
+/// battlefield, does not resolve.
 ///
-/// `validate_targets_in_chain`'s `ExchangeControl` arm re-validates against
-/// each declared filter, where the generic branch it replaced checked only
-/// `state.battlefield.contains`. For Gilded Drake ("exchange control of this
-/// creature and up to one target creature an opponent controls. If you don't
-/// or can't make an exchange, sacrifice this creature.") that flips the
-/// outcome when the target stops being a creature in response:
+/// `validate_targets_in_chain`'s `ExchangeControl` arm re-validates each
+/// declared target against its own filter, not merely against battlefield
+/// presence. A target that stops being a creature is therefore illegal, and
+/// with the ability's only target illegal, CR 608.2b says it doesn't resolve,
+/// so the sacrifice rider never runs.
 ///
-///   * BEFORE — the target survived re-validation, so the ability resolved
-///     and the exchange RAN against an illegal target. Plainly wrong.
-///   * AFTER  — the target is illegal, it is this ability's only instance of
-///     the word "target", so per CR 608.2b the ability doesn't resolve. This
-///     is the correct DEFAULT, and it is what this row pins.
-///
-/// KNOWN GAP, deliberately not fixed here: Gilded Drake's printed "This
-/// ability still resolves if its target becomes illegal" is an explicit CR
-/// 608.2b exception that the parser does not model at all — the clause is
-/// dropped, and `optional_targeting` is `false` despite "up to one target".
-/// With it modelled, the ability would resolve, the exchange would not
-/// happen, and the Drake would be sacrificed. Representing that exception is
-/// a parser + AST change well outside this run; this row exists so the
-/// current disposition is a recorded decision rather than an unnoticed side
-/// effect, and so it fails loudly when the exception is implemented.
+/// The ability here is hand-built without the card's override:
+/// `ResolvedAbility::new` defaults to `IllegalTargetsDisposition::DoesNotResolve`
+/// and it has no `multi_target`. It is exercised through
+/// `validate_targets_in_chain` + `check_fizzle`, which read no disposition, so
+/// this row pins the rules default. Gilded Drake's printed override ("This
+/// ability still resolves if its target becomes illegal", CR 101.1) is covered
+/// on the real pipeline by T2 and T3 in `exchange_control_up_to_one_target.rs`.
 #[test]
-fn gilded_drake_sole_target_that_stops_matching_its_filter_stops_the_ability() {
+fn exchange_sole_target_turning_illegal_does_not_resolve_by_default() {
     use engine::game::ability_utils::validate_targets_in_chain;
     use engine::game::zones::create_object;
     use engine::types::ability::{

@@ -196,6 +196,7 @@ pub fn build_resolved_from_def_with_targets(
     // cast/activation and every `Variable("X")` on the ability resolves to 0.
     resolved.announced_x = def.announced_x.clone();
     resolved.cant_be_copied = def.cant_be_copied;
+    resolved.illegal_targets_disposition = def.illegal_targets_disposition;
     resolved.description = def.description.clone();
     resolved.forward_result = def.forward_result;
     resolved.unless_pay = def.unless_pay.clone();
@@ -263,7 +264,7 @@ pub fn build_resolved_from_def_with_targets(
 ///
 /// Fields preserved from `parent`: controller, source_id, kind, context,
 /// original_controller, scoped_player, chosen_x, cost_paid_object,
-/// ability_index, may_trigger_origin.
+/// ability_index, may_trigger_origin, illegal_targets_disposition.
 ///
 /// `targets`: an override with its own declared target filter takes its
 /// independently resolution-validated target list from `sub`; a context-ref
