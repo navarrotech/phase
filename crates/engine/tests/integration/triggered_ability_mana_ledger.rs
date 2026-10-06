@@ -1310,3 +1310,31 @@ fn carpet_of_flowers_parses_its_guard_and_count_sourced_mana() {
         parsed.parse_warnings
     );
 }
+
+/// SHAPE (parser structure, not a runtime row). CR 603.4 + CR 607.1c: Oracle
+/// text may spell the guard's contraction with the typographic apostrophe
+/// (U+2019), and that spelling must lower to the same negated self-linked leaf.
+#[test]
+fn carpet_of_flowers_guard_parses_with_a_typographic_apostrophe() {
+    let curly_text = CARPET_OF_FLOWERS.replace("haven't", "haven\u{2019}t");
+    assert_ne!(
+        curly_text, CARPET_OF_FLOWERS,
+        "the fixture must carry the contraction"
+    );
+
+    let parsed = parse_oracle_text(
+        &curly_text,
+        "Carpet of Flowers",
+        &[],
+        &["Enchantment".to_string()],
+        &[],
+    );
+
+    assert_eq!(parsed.triggers.len(), 1);
+    assert_eq!(
+        parsed.triggers[0].condition,
+        Some(TriggerCondition::Not {
+            condition: Box::new(TriggerCondition::AddedManaWithThisAbilityThisTurn),
+        })
+    );
+}

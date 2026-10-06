@@ -27,7 +27,7 @@ use super::oracle_ir::trigger::{
 };
 use super::oracle_modal::try_parse_inline_modal_ir;
 use super::oracle_nom::condition::{
-    parse_affirmative_reflexive_connector, parse_elided_subject_state_condition,
+    parse_affirmative_reflexive_connector, parse_elided_subject_state_condition, parse_havent,
 };
 use super::oracle_nom::condition::{
     parse_inner_condition, parse_spell_history_filter, parse_there_are_battlefield_count_clause,
@@ -6360,7 +6360,9 @@ fn parse_first_time_counters_intervening_if(input: &str) -> OracleResult<'_, Tri
 fn parse_added_mana_with_this_ability_intervening_if(
     input: &str,
 ) -> OracleResult<'_, TriggerCondition> {
-    let (rest, _) = tag("if you haven't ").parse(input)?;
+    // Oracle text spells the contraction with either apostrophe, so the shared
+    // `parse_havent` combinator accepts both `haven't` and `haven\u{2019}t`.
+    let (rest, _) = (tag("if you "), parse_havent, tag(" ")).parse(input)?;
     let (rest, _) = tag("added mana with this ability this turn").parse(rest)?;
     Ok((
         rest,
