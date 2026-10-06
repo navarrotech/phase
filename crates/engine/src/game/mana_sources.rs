@@ -6885,6 +6885,27 @@ mod tests {
             );
         }
 
+        /// CR 305.6: the Exotic Orchard census of opponents' lands reads every
+        /// basic land type of an ability-less land, not only its first one
+        /// (reverting that fallback to its first match fails this).
+        #[test]
+        fn opponent_land_census_yields_every_basic_land_type() {
+            let mut state = main_phase_state();
+            let opponent_dual = add_land(&mut state, P1, "Plains Island", vec![]);
+            state
+                .objects
+                .get_mut(&opponent_dual)
+                .unwrap()
+                .card_types
+                .subtypes
+                .extend(["Plains".to_string(), "Island".to_string()]);
+
+            assert_eq!(
+                sorted(opponent_land_color_options(&state, P0)),
+                sorted(vec![ManaType::White, ManaType::Blue])
+            );
+        }
+
         /// M2 + M3: the cost-paid capture fills the could-produce set for a
         /// permanent and leaves it empty for a card in another zone.
         #[test]
