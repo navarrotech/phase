@@ -3403,13 +3403,17 @@ mod tests {
     /// The preceding v88 bump gave `WaitingFor::DeclareBlockers` its
     /// `block_capacities` (CR 509.1a + CR 101.1).
     ///
+    /// `IllegalTargetsDisposition::StillResolves` is serialized on the root
+    /// ability. An older peer would silently apply ordinary non-resolution
+    /// after target invalidation, so the handshake must refuse the mismatch.
+    ///
     /// The name embeds the numeral deliberately: `assert_eq!(PROTOCOL_VERSION,
     /// <n>)` under a function named for `<n-1>` is green, so
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_106_for_deferred_mana_and_remembered_replacement_choices() {
-        assert_eq!(PROTOCOL_VERSION, 106);
+    fn protocol_version_is_107_for_illegal_target_resolution_disposition() {
+        assert_eq!(PROTOCOL_VERSION, 107);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3420,7 +3424,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_106_for_deferred_mana_and_remembered_replacement_choices` stays
+    /// `protocol_version_is_107_for_illegal_target_resolution_disposition` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {

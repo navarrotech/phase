@@ -210,6 +210,10 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 107 — Serialized IllegalTargetsDisposition.StillResolves preserves a root
+ *       ability's printed resolution rule when its chosen target becomes
+ *       illegal. Older peers would silently apply ordinary non-resolution;
+ *       P2P moves in lockstep (wire 89).
  * 106 — Full-game replacement-choice preferences, exact source/definition
  *       identities, remembered ordering/optional actions, and prompt
  *       eligibility metadata. P2P moves in lockstep (wire 88); lobby-only
@@ -694,7 +698,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 106;
+export const PROTOCOL_VERSION = 107;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.
