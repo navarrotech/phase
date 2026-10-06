@@ -380,7 +380,11 @@ fn carpet_copy_at_retarget(
     assert!(ledger(&runner).is_empty());
 
     let copy_id = {
-        let outcome = runner.cast(favor).modes(&[0]).target_object(original_id).resolve();
+        let outcome = runner
+            .cast(favor)
+            .modes(&[0])
+            .target_object(original_id)
+            .resolve();
         let WaitingFor::CopyRetarget {
             player,
             copy_id,
@@ -402,8 +406,7 @@ fn carpet_copy_at_retarget(
 /// ability while P0's original remains open for P0.
 #[test]
 fn carpet_copy_by_opponent_does_not_suppress_original() {
-    let (mut runner, original_id, copy_id, definition) =
-        carpet_copy_at_retarget(P1, 2, 3);
+    let (mut runner, original_id, copy_id, definition) = carpet_copy_at_retarget(P1, 2, 3);
     runner
         .act(GameAction::ChooseTarget {
             target: Some(TargetRef::Player(P0)),
@@ -441,11 +444,15 @@ fn carpet_copy_by_opponent_does_not_suppress_original() {
     let projected = serde_json::to_value(ClientGameStateRef::wrap(runner.state(), Some(P0)))
         .expect("paused state projects to the client");
     let pair = serde_json::to_value((definition.clone(), P1)).expect("pair serializes");
-    assert!(projected["state"]["triggered_abilities_added_mana_this_turn"]
-        .as_array()
-        .expect("projected ledger")
-        .contains(&pair));
-    assert!(projected["state"]["stack"].to_string().contains("AddedManaWithThisAbilityThisTurn"));
+    assert!(
+        projected["state"]["triggered_abilities_added_mana_this_turn"]
+            .as_array()
+            .expect("projected ledger")
+            .contains(&pair)
+    );
+    assert!(projected["state"]["stack"]
+        .to_string()
+        .contains("AddedManaWithThisAbilityThisTurn"));
 
     let mut original_trace = Trace::default();
     drive_until(
@@ -454,12 +461,17 @@ fn carpet_copy_by_opponent_does_not_suppress_original() {
         &mut original_trace,
         |state, _| matches!(state.waiting_for, WaitingFor::OptionalEffectChoice { .. }),
     );
-    assert!(matches!(runner.state().waiting_for, WaitingFor::OptionalEffectChoice { .. }));
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::OptionalEffectChoice { .. }
+    ));
     drive_until(
         &mut runner,
         &ACCEPT_TARGETING_OPPONENT,
         &mut original_trace,
-        |state, _| state.stack.is_empty() && matches!(state.waiting_for, WaitingFor::Priority { .. }),
+        |state, _| {
+            state.stack.is_empty() && matches!(state.waiting_for, WaitingFor::Priority { .. })
+        },
     );
     assert_eq!(pool_count(&runner, P0, ManaType::Green), 3);
     assert_eq!(
@@ -472,15 +484,20 @@ fn carpet_copy_by_opponent_does_not_suppress_original() {
 /// definition/player history, so its successful add closes the original.
 #[test]
 fn carpet_copy_by_controller_suppresses_original_after_positive_deposit() {
-    let (mut runner, original_id, copy_id, definition) =
-        carpet_copy_at_retarget(P0, 0, 3);
+    let (mut runner, original_id, copy_id, definition) = carpet_copy_at_retarget(P0, 0, 3);
     runner
         .act(GameAction::KeepAllCopyTargets)
         .expect("P0 retains P1 as the copy's target");
-    let copy = runner.state().stack.iter().find(|entry| entry.id == copy_id).unwrap();
+    let copy = runner
+        .state()
+        .stack
+        .iter()
+        .find(|entry| entry.id == copy_id)
+        .unwrap();
     assert_eq!(copy.controller, P0);
     assert_eq!(
-        copy.ability().and_then(|ability| ability.trigger_definition_ref.as_ref()),
+        copy.ability()
+            .and_then(|ability| ability.trigger_definition_ref.as_ref()),
         Some(&definition)
     );
     let mut trace = Trace::default();
@@ -500,7 +517,9 @@ fn carpet_copy_by_controller_suppresses_original_after_positive_deposit() {
         &mut runner,
         &ACCEPT_TARGETING_OPPONENT,
         &mut trace,
-        |state, _| state.stack.is_empty() && matches!(state.waiting_for, WaitingFor::Priority { .. }),
+        |state, _| {
+            state.stack.is_empty() && matches!(state.waiting_for, WaitingFor::Priority { .. })
+        },
     );
     assert_eq!(pool_count(&runner, P0, ManaType::Green), 3);
     let carpet = definition.source.object_id;
@@ -533,10 +552,16 @@ fn declined_carpet_copy_leaves_original_open() {
                 .act(GameAction::KeepAllCopyTargets)
                 .expect("P0 keeps the original target");
         }
-        let copy = runner.state().stack.iter().find(|entry| entry.id == copy_id).unwrap();
+        let copy = runner
+            .state()
+            .stack
+            .iter()
+            .find(|entry| entry.id == copy_id)
+            .unwrap();
         assert_eq!(copy.controller, copy_controller);
         assert_eq!(
-            copy.ability().and_then(|ability| ability.trigger_definition_ref.as_ref()),
+            copy.ability()
+                .and_then(|ability| ability.trigger_definition_ref.as_ref()),
             Some(&definition)
         );
         let mut copy_trace = Trace::default();
@@ -559,7 +584,9 @@ fn declined_carpet_copy_leaves_original_open() {
             &mut runner,
             &ACCEPT_TARGETING_OPPONENT,
             &mut original_trace,
-            |state, _| state.stack.is_empty() && matches!(state.waiting_for, WaitingFor::Priority { .. }),
+            |state, _| {
+                state.stack.is_empty() && matches!(state.waiting_for, WaitingFor::Priority { .. })
+            },
         );
         assert_eq!(original_trace.optional_answers.len(), 1);
         assert_eq!(pool_count(&runner, P0, ManaType::Green), 3);
@@ -571,17 +598,22 @@ fn declined_carpet_copy_leaves_original_open() {
 /// its controller's record remains empty and the original may add three.
 #[test]
 fn zero_mana_opponent_copy_leaves_original_open() {
-    let (mut runner, original_id, copy_id, definition) =
-        carpet_copy_at_retarget(P1, 0, 3);
+    let (mut runner, original_id, copy_id, definition) = carpet_copy_at_retarget(P1, 0, 3);
     runner
         .act(GameAction::ChooseTarget {
             target: Some(TargetRef::Player(P0)),
         })
         .expect("P1 retargets its copy to P0");
-    let copy = runner.state().stack.iter().find(|entry| entry.id == copy_id).unwrap();
+    let copy = runner
+        .state()
+        .stack
+        .iter()
+        .find(|entry| entry.id == copy_id)
+        .unwrap();
     assert_eq!(copy.controller, P1);
     assert_eq!(
-        copy.ability().and_then(|ability| ability.trigger_definition_ref.as_ref()),
+        copy.ability()
+            .and_then(|ability| ability.trigger_definition_ref.as_ref()),
         Some(&definition)
     );
     let mut copy_trace = Trace::default();
@@ -605,7 +637,9 @@ fn zero_mana_opponent_copy_leaves_original_open() {
         &mut runner,
         &ACCEPT_TARGETING_OPPONENT,
         &mut original_trace,
-        |state, _| state.stack.is_empty() && matches!(state.waiting_for, WaitingFor::Priority { .. }),
+        |state, _| {
+            state.stack.is_empty() && matches!(state.waiting_for, WaitingFor::Priority { .. })
+        },
     );
     assert_eq!(original_trace.optional_answers.len(), 1);
     assert_eq!(pool_count(&runner, P0, ManaType::Green), 3);
@@ -1032,8 +1066,16 @@ fn ledger_serializes_deterministically_and_round_trips() {
     let base = runner.state().clone();
     let (forward, reverse) = states_with_ledgers(
         &base,
-        &[(first_ref.clone(), P0), (first_ref.clone(), P1), (second_ref.clone(), P0)],
-        &[(second_ref, P0), (first_ref.clone(), P1), (first_ref.clone(), P0)],
+        &[
+            (first_ref.clone(), P0),
+            (first_ref.clone(), P1),
+            (second_ref.clone(), P0),
+        ],
+        &[
+            (second_ref, P0),
+            (first_ref.clone(), P1),
+            (first_ref.clone(), P0),
+        ],
     );
 
     let forward_json = serde_json::to_string(&forward).expect("GameState serializes");
@@ -1059,12 +1101,11 @@ fn ledger_serializes_deterministically_and_round_trips() {
         .remove("triggered_abilities_added_mana_this_turn");
     let restored_without_history: GameState =
         serde_json::from_value(without_history).expect("missing history defaults");
-    assert!(restored_without_history.triggered_abilities_added_mana_this_turn.is_empty());
-    let (other_player, original_player) = states_with_ledgers(
-        &base,
-        &[(first_ref.clone(), P1)],
-        &[(first_ref, P0)],
-    );
+    assert!(restored_without_history
+        .triggered_abilities_added_mana_this_turn
+        .is_empty());
+    let (other_player, original_player) =
+        states_with_ledgers(&base, &[(first_ref.clone(), P1)], &[(first_ref, P0)]);
     assert_ne!(other_player, original_player);
 }
 
@@ -1444,7 +1485,10 @@ fn two_carpets_of_flowers_keep_independent_guards() {
         second_ref
     );
     assert_eq!(pool_count(&runner, P0, ManaType::Green), 3);
-    assert_eq!(ledger(&runner), &HashSet::from([(first_ref, P0), (second_ref, P0)]));
+    assert_eq!(
+        ledger(&runner),
+        &HashSet::from([(first_ref, P0), (second_ref, P0)])
+    );
 }
 
 /// HOSTILE: CR 607.1c + CR 113.2c: "this ability" is Carpet's own triggered
@@ -1495,7 +1539,10 @@ fn a_sibling_mana_trigger_on_the_same_permanent_leaves_the_carpet_guard_open() {
     let carpet_ref = main_one.only_ref_from_in(source, Phase::PreCombatMain);
     assert_ne!(carpet_ref, sibling_ref);
     assert_eq!(pool_count(&runner, P0, ManaType::Green), 3);
-    assert_eq!(ledger(&runner), &HashSet::from([(sibling_ref, P0), (carpet_ref, P0)]));
+    assert_eq!(
+        ledger(&runner),
+        &HashSet::from([(sibling_ref, P0), (carpet_ref, P0)])
+    );
 }
 
 /// CR 603.4: "this turn" ends with the turn. The ledger resets when the next
