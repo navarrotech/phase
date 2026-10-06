@@ -3548,12 +3548,7 @@ pub(crate) fn opponent_land_color_options(
             )
         });
         if !obj_had_explicit_ability {
-            if let Some(mana_type) = obj
-                .card_types
-                .subtypes
-                .iter()
-                .find_map(|s| super::mana_payment::land_subtype_to_mana_type(s))
-            {
+            for mana_type in intrinsic_basic_land_mana_types(obj) {
                 if !options.contains(&mana_type) {
                     options.push(mana_type);
                 }
@@ -3827,6 +3822,18 @@ pub(crate) enum CouldProduceDepth {
     TopLevel,
 }
 
+/// CR 305.6: Each basic land type an object carries grants its own intrinsic
+/// "{T}: Add [mana symbol]" ability, so an object with several basic land types
+/// (e.g. one that is both a Plains and an Island) could produce every one of them.
+fn intrinsic_basic_land_mana_types(
+    obj: &crate::game::game_object::GameObject,
+) -> impl Iterator<Item = ManaType> + '_ {
+    obj.card_types
+        .subtypes
+        .iter()
+        .filter_map(|subtype| super::mana_payment::land_subtype_to_mana_type(subtype))
+}
+
 /// CR 106.7 + CR 106.1b: The mana types `object_id` could produce right now —
 /// the union over its `{T}` mana abilities (the census's existing
 /// `has_tap_component` scope, stricter than CR 106.7's "ignore whether any costs
@@ -3884,13 +3891,10 @@ pub(crate) fn produceable_mana_types_of_object(
     }
     // Fallback: basic-land subtype-only objects (no explicit mana ability).
     if !obj_had_explicit_ability {
-        if let Some(mana_type) = obj
-            .card_types
-            .subtypes
-            .iter()
-            .find_map(|subtype| super::mana_payment::land_subtype_to_mana_type(subtype))
-        {
-            options.push(mana_type);
+        for mana_type in intrinsic_basic_land_mana_types(obj) {
+            if !options.contains(&mana_type) {
+                options.push(mana_type);
+            }
         }
     }
     options
@@ -6842,6 +6846,42 @@ mod tests {
             assert_eq!(
                 produceable_mana_types_of_object(&state, pool, CouldProduceDepth::Nested),
                 Vec::<ManaType>::new()
+            );
+        }
+
+        /// CR 305.6: each basic land type grants its own intrinsic mana ability,
+        /// so an object with two basic land types and no explicit mana ability
+        /// could produce both (reverting the fallback to its first match fails this).
+        #[test]
+        fn basic_land_subtype_fallback_yields_every_type() {
+            let mut state = main_phase_state();
+            let dual = add_land(&mut state, P0, "Plains Island", vec![]);
+            state
+                .objects
+                .get_mut(&dual)
+                .unwrap()
+                .card_types
+                .subtypes
+                .extend(["Plains".to_string(), "Island".to_string()]);
+            let pool = add_land(
+                &mut state,
+                P0,
+                "Reflecting Pool",
+                vec![reflecting_pool_production()],
+            );
+
+            assert_eq!(
+                produceable_mana_types_of_object(&state, dual, CouldProduceDepth::Nested),
+                vec![ManaType::White, ManaType::Blue]
+            );
+            assert_eq!(
+                sorted(produceable_mana_types_of_object(
+                    &state,
+                    pool,
+                    CouldProduceDepth::TopLevel
+                )),
+                sorted(vec![ManaType::White, ManaType::Blue]),
+                "the Reflecting Pool census reads every intrinsic type"
             );
         }
 
