@@ -29101,7 +29101,8 @@ pub enum TriggerCondition {
     /// CR 603.4 + CR 607.1c + CR 106.4: "if you haven't added mana with this ability
     /// this turn" (Carpet of Flowers) — true when THIS triggered ability's exact
     /// occurrence (`TriggerDefinitionRef`, CR 113.2c per ability, CR 400.7 per
-    /// object) is in `GameState::triggered_abilities_added_mana_this_turn`, which is
+    /// object) and this trigger's controller are in
+    /// `GameState::triggered_abilities_added_mana_this_turn`, which is
     /// written only when mana actually reached a pool, so a declined "you may"
     /// (CR 603.5) or an X of 0 leaves it false. Negation wraps via `Not`.
     /// Unanswerable without the trigger's identity: `evaluation_anchor` reports

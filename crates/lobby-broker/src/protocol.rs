@@ -60,6 +60,11 @@ pub struct TournamentRequestId(pub u64);
 /// rather than a parse error, and the handshake is the only place that pairing
 /// can be refused. See 24.
 ///
+/// 108 — `GameState::triggered_abilities_added_mana_this_turn` records
+///       (trigger definition, receiving player), so copied triggers check
+///       their own controller's successful mana history. A v107 peer cannot
+///       decode a nonempty pair ledger. P2P moves in lockstep (wire 90);
+///       lobby-only messages are unchanged.
 /// 107 — `UntilCondition::NextMatches` gains `count` ("until you exile two
 ///      nonland cards …" — Invasion of Alara, CR 608.2c), the paused loop
 ///      (`PendingExileFromTopUntil`) keeps its `hits`,
@@ -884,7 +889,7 @@ pub struct TournamentRequestId(pub u64);
 ///      payload; mulligan bottoming folded into a
 ///      `MulliganDecisionPhase::BottomCards` sub-phase on
 ///      `WaitingFor::MulliganDecision`.
-pub const PROTOCOL_VERSION: u32 = 107;
+pub const PROTOCOL_VERSION: u32 = 108;
 
 /// Minimum protocol version accepted by lobby-only brokers at the hello
 /// handshake **from clients that predate [`LOBBY_PROTOCOL_VERSION`]** — the
@@ -2139,12 +2144,12 @@ mod tests {
 
     #[test]
     fn protocol_version_tracks_full_game_wire_additions() {
-        assert_eq!(PROTOCOL_VERSION, 107);
+        assert_eq!(PROTOCOL_VERSION, 108);
         // Lobby keeps its one-version rollout window; full-game servers stay
         // current-only (`server_core::MIN_SUPPORTED_PROTOCOL == PROTOCOL_VERSION`),
         // which refuses an older full-game peer that cannot preserve the exact
         // Full-session identity across draft match attachment and follow-ups.
-        assert_eq!(MIN_SUPPORTED_PROTOCOL, 106);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL, 107);
     }
 
     #[test]

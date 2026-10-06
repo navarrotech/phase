@@ -3346,6 +3346,9 @@ mod tests {
         }
     }
 
+    /// The successful-mana-history ledger now stores the actual receiving
+    /// player with each trigger definition. A v107 peer cannot decode a
+    /// nonempty pair ledger, so it must be refused before v108 state.
     /// `UntilCondition::NextMatches.count` (CR 608.2c), the paused loop's `hits`,
     /// `ZoneChoiceCandidateSource::ParentTargets` and
     /// `SpellContext.exile_until_batch` are new in serialized
@@ -3413,8 +3416,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_107_for_counted_exile_until() {
-        assert_eq!(PROTOCOL_VERSION, 107);
+    fn protocol_version_is_108_for_player_relative_mana_history() {
+        assert_eq!(PROTOCOL_VERSION, 108);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3425,7 +3428,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_107_for_counted_exile_until` stays
+    /// `protocol_version_is_108_for_player_relative_mana_history` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {

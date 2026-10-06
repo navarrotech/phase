@@ -15499,7 +15499,7 @@ mod tests {
                 printed_index: 0,
             },
         };
-        let guarded_entry = |definition: Option<&TriggerDefinitionRef>| {
+        let guarded_entry = |definition: Option<&TriggerDefinitionRef>, controller| {
             let mut ability = ResolvedAbility::new(
                 Effect::GainLife {
                     amount: QuantityExpr::Fixed { value: 1 },
@@ -15507,13 +15507,13 @@ mod tests {
                 },
                 vec![],
                 source,
-                PlayerId(0),
+                controller,
             );
             ability.trigger_definition_ref = definition.cloned();
             StackEntry {
                 id: ObjectId(9200),
                 source_id: source,
-                controller: PlayerId(0),
+                controller,
                 kind: StackEntryKind::TriggeredAbility {
                     source_id: source,
                     ability: Box::new(ability),
@@ -15535,7 +15535,7 @@ mod tests {
         let mut state = setup();
         assert!(bind_resolution_scope(
             &mut state,
-            &guarded_entry(Some(&definition_ref)),
+            &guarded_entry(Some(&definition_ref), PlayerId(0)),
             None
         ));
 
@@ -15543,10 +15543,18 @@ mod tests {
         let mut state = setup();
         state
             .triggered_abilities_added_mana_this_turn
-            .insert(definition_ref.clone());
+            .insert((definition_ref.clone(), PlayerId(0)));
         assert!(!bind_resolution_scope(
             &mut state,
-            &guarded_entry(Some(&definition_ref)),
+            &guarded_entry(Some(&definition_ref), PlayerId(0)),
+            None
+        ));
+
+        // A copied entry controlled by P1 keeps the definition but asks P1's
+        // question; P0's record cannot close that entry's guard.
+        assert!(bind_resolution_scope(
+            &mut state,
+            &guarded_entry(Some(&definition_ref), PlayerId(1)),
             None
         ));
 
@@ -15555,7 +15563,7 @@ mod tests {
         let mut state = setup();
         assert!(!bind_resolution_scope(
             &mut state,
-            &guarded_entry(None),
+            &guarded_entry(None, PlayerId(0)),
             None
         ));
     }

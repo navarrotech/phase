@@ -6943,8 +6943,8 @@ fn rw_trigger_condition(x: &TriggerCondition) -> RwProfile {
         | TriggerCondition::ExceptFirstDrawInDrawStep
         | TriggerCondition::PlacedByAbilitySource
         // CR 603.3b: order-independent. The leaf reads only the ledger entry
-        // keyed by its own `TriggerDefinitionRef`, and the only writer of that
-        // key is a resolution carrying that same ref
+        // keyed by its own `TriggerDefinitionRef` and controller, and the only
+        // writer of that key is a resolution carrying that same ref and player
         // (`record_triggered_ability_added_mana`). A distinct-definition member
         // (a second Carpet of Flowers) writes a different key, so no member's
         // write feeds another member's read; an identical-definition pair

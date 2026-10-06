@@ -20913,7 +20913,7 @@ declare_game_state! {
     pub triggers_fired_this_game: HashSet<TriggerDefinitionRef>,
     /// CR 603.4 + CR 607.1c: Exact triggered-ability occurrences (CR 113.2c:
     /// per ability; CR 400.7: per object incarnation) that actually added
-    /// mana this turn, whether by an instruction of the ability's effect or by
+    /// mana to a player this turn, whether by the ability's effect or by
     /// a mana-adding cost of that ability paid while it resolves (CR 118.1 +
     /// CR 118.12). Written only when at least one unit reached a pool
     /// (CR 106.4), so a declined "you may" (CR 603.5), a declined cost, a
@@ -20924,7 +20924,7 @@ declare_game_state! {
     /// `project_out_resources`).
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
-    pub triggered_abilities_added_mana_this_turn: HashSet<TriggerDefinitionRef>,
+    pub triggered_abilities_added_mana_this_turn: HashSet<(TriggerDefinitionRef, PlayerId)>,
     #[serde(
         default,
         skip_serializing_if = "HashMap::is_empty",

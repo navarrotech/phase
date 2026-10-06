@@ -14357,7 +14357,8 @@ fn trigger_subject_read<'event, 'state>(
 ///
 /// `trigger_definition` is the identity of the triggered ability this check
 /// gates: the same `trigger_definition_ref` its builder installs, which is the
-/// key the "added mana with this ability" ledger records under. `None` means
+/// definition half of the "added mana with this ability" ledger key; the
+/// other half is `controller`. `None` means
 /// the gated ability carries no triggered identity.
 pub(crate) fn check_trigger_condition_with_source(
     state: &GameState,
@@ -14716,13 +14717,13 @@ fn evaluate_trigger_condition_with_source(
                 });
             matches!((via, source_id), (Some(via), Some(source)) if via == source)
         }
-        // CR 603.4 + CR 607.1c: this occurrence's own per-turn record. The boundary
+        // CR 603.4 + CR 607.1c: this occurrence's own per-player record. The boundary
         // has already rejected `None`.
         TriggerCondition::AddedManaWithThisAbilityThisTurn => {
             trigger_definition.is_some_and(|definition| {
                 state
                     .triggered_abilities_added_mana_this_turn
-                    .contains(definition)
+                    .contains(&(definition.clone(), controller))
             })
         }
         // CR 305.1 + CR 603.4: "without being played" is encoded as
@@ -31723,13 +31724,17 @@ pub mod tests {
         // CR 113.2c: another ability's record does not answer for this one.
         state
             .triggered_abilities_added_mana_this_turn
-            .insert(sibling);
+            .insert((sibling, PlayerId(0)));
         assert!(check(&state, &guard, Some(&own)));
 
         // This ability's own record closes its guard.
         state
             .triggered_abilities_added_mana_this_turn
-            .insert(own.clone());
+            .insert((own.clone(), PlayerId(1)));
+        assert!(check(&state, &guard, Some(&own)));
+        state
+            .triggered_abilities_added_mana_this_turn
+            .insert((own.clone(), PlayerId(0)));
         assert!(!check(&state, &guard, Some(&own)));
         assert!(check(&state, &leaf, Some(&own)));
         assert!(!check(&state, &guard, None));

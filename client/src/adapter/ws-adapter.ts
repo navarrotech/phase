@@ -210,6 +210,10 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 108 — GameState's triggered-ability mana ledger records the actual
+ *       receiving player alongside the exact trigger definition. A v107 peer
+ *       cannot decode a nonempty pair ledger; the exact-match handshake
+ *       refuses it. P2P moves in lockstep (wire 90).
  * 107 — UntilCondition NextMatches gains count ("until you exile two nonland
  *      cards …" — Invasion of Alara, CR 608.2c), the paused exile loop keeps
  *      its hits, ZoneChoiceCandidateSource gains ParentTargets, and
@@ -700,7 +704,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 107;
+export const PROTOCOL_VERSION = 108;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

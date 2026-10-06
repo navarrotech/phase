@@ -319,7 +319,7 @@ pub fn resolve(
         .is_empty();
     }
     record_firebending_if_marked(state, ability, produced_mana, events);
-    record_triggered_ability_added_mana(state, ability, deposited);
+    record_triggered_ability_added_mana(state, ability, recipient, deposited);
 
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::from(&ability.effect),
@@ -395,7 +395,9 @@ pub fn handle_choose_mana_effect(
         }
     }
     record_firebending_if_marked(state, ability, produced_mana, events);
-    record_triggered_ability_added_mana(state, ability, deposited);
+    if let Some(recipient) = recipient {
+        record_triggered_ability_added_mana(state, ability, recipient, deposited);
+    }
 
     events.push(GameEvent::EffectResolved {
         kind: EffectKind::from(&ability.effect),
@@ -442,8 +444,9 @@ fn record_firebending_if_marked(
 
 /// CR 106.4 + CR 607.1c: the single recording authority for "this triggered
 /// ability added mana this turn". Records the resolving ability's exact
-/// `TriggerDefinitionRef` when `deposited` is true, meaning at least one
-/// `ManaUnit` reached a pool. Two deposit sites call it: the
+/// `TriggerDefinitionRef` and actual receiving `PlayerId` when `deposited`
+/// is true, meaning at least one `ManaUnit` reached a pool. Two deposit
+/// routes call it: the
 /// `Effect::Mana` resolver (`resolve`, `handle_choose_mana_effect`), and
 /// the resolution-time `AbilityCost::EffectCost { Effect::Mana }` payment
 /// in `costs::pay_ability_cost_inner`. Paying that cost carries out the
@@ -455,6 +458,7 @@ fn record_firebending_if_marked(
 pub(crate) fn record_triggered_ability_added_mana(
     state: &mut GameState,
     ability: &ResolvedAbility,
+    player: PlayerId,
     deposited: bool,
 ) {
     // No unit reached a pool (declined, zero-count, prevented, or no legal
@@ -469,7 +473,7 @@ pub(crate) fn record_triggered_ability_added_mana(
     };
     state
         .triggered_abilities_added_mana_this_turn
-        .insert(definition_ref.clone());
+        .insert((definition_ref.clone(), player));
 }
 
 fn chosen_mana_types_for_prompt(

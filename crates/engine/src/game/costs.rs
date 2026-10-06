@@ -1475,7 +1475,7 @@ fn pay_ability_cost_inner(
                     match scope {
                         PaymentScope::Resolution { ability, .. } => {
                             super::effects::mana::record_triggered_ability_added_mana(
-                                state, ability, deposited,
+                                state, ability, player, deposited,
                             )
                         }
                         // CR 602.1a: an activation cost belongs to an activated ability,
