@@ -5474,15 +5474,15 @@ mod tests {
     use crate::game::zones::{self, create_object, move_to_zone};
     use crate::types::ability::{
         CastingPermission, ControllerRef, CopyRetargetPermission, CostPaidObjectSnapshot, Effect,
-        ModalChoice, QuantityExpr, ResolvedAbility, TargetFilter, TargetRef, TypeFilter,
-        TypedFilter,
+        ModalChoice, QuantityExpr, ResolvedAbility, TargetFilter, TargetRef,
+        TriggerBaseSetInstanceRef, TriggerDefinitionOccurrenceRef, TypeFilter, TypedFilter,
     };
     use crate::types::card_type::CoreType;
     use crate::types::game_state::{
         AutoMayChoice, MayTriggerAutoChoiceKey, MayTriggerOrigin, PendingCast, StackPaidSnapshot,
         WaitingFor,
     };
-    use crate::types::identifiers::{CardId, ObjectId, TriggerFiring};
+    use crate::types::identifiers::{CardId, ObjectId, ObjectIncarnationRef, TriggerFiring};
     use crate::types::keywords::Keyword;
     use crate::types::mana::ManaCost;
     use crate::types::phase::Phase;
@@ -15488,9 +15488,6 @@ mod tests {
     /// the recheck it feeds.
     #[test]
     fn resolution_recheck_reads_the_resolving_entrys_trigger_identity() {
-        use crate::types::ability::{TriggerBaseSetInstanceRef, TriggerDefinitionOccurrenceRef};
-        use crate::types::identifiers::ObjectIncarnationRef;
-
         let source = ObjectId(9201);
         let definition_ref = TriggerDefinitionRef {
             source: ObjectIncarnationRef::of(source, 0),
