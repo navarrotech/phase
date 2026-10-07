@@ -86,7 +86,11 @@ fn assert_auto_staged_child(runner: &GameRunner, source: ObjectId, child: Object
         .expect("the phase event must put the source's trigger on the real stack");
     assert!(ability.targets.is_empty(), "the optional root was declined");
     assert_eq!(
-        ability.sub_ability.as_deref().expect("required child").targets,
+        ability
+            .sub_ability
+            .as_deref()
+            .expect("required child")
+            .targets,
         vec![TargetRef::Object(child)],
         "the required child owns its selected target"
     );
@@ -103,7 +107,9 @@ fn overlapping_filters_auto_assign_only_the_required_child() {
         .add_creature(P0, "Generated Slot Source", 2, 2)
         .with_trigger_definition(phase_trigger(ability.clone()))
         .id();
-    let victim = scenario.add_creature(P1, "Only Opponent Creature", 2, 2).id();
+    let victim = scenario
+        .add_creature(P1, "Only Opponent Creature", 2, 2)
+        .id();
     let mut runner = scenario.build();
 
     let resolved = build_resolved_from_def(&ability, source, P0);
@@ -188,7 +194,9 @@ fn distinct_filter_pools_auto_assign_only_the_required_child() {
     )
     .expect("interactive slot authority starts");
     assert!(
-        !progress.current_legal_targets.contains(&TargetRef::Object(scout)),
+        !progress
+            .current_legal_targets
+            .contains(&TargetRef::Object(scout)),
         "choosing Scout would leave no legal completion for the required child"
     );
     let TargetSelectionAdvance::InProgress(after_root) = choose_target_for_ability(
@@ -199,8 +207,7 @@ fn distinct_filter_pools_auto_assign_only_the_required_child() {
         &progress,
         None,
     )
-    .expect("optional root can be declined")
-    else {
+    .expect("optional root can be declined") else {
         panic!("required child must remain");
     };
     let TargetSelectionAdvance::Complete(selected) = choose_target_for_ability(
@@ -211,8 +218,7 @@ fn distinct_filter_pools_auto_assign_only_the_required_child() {
         &after_root,
         Some(TargetRef::Object(knight)),
     )
-    .expect("required child accepts Knight")
-    else {
+    .expect("required child accepts Knight") else {
         panic!("two declared slots must complete selection");
     };
     assert_eq!(selected, vec![None, Some(TargetRef::Object(knight))]);
@@ -262,5 +268,8 @@ fn no_legal_required_child_removes_trigger_after_phase_event() {
     );
     assert!(source_trigger_on_stack(&runner, source).is_none());
     assert!(runner.state().pending_trigger_entry.is_none());
-    assert!(matches!(runner.state().waiting_for, WaitingFor::Priority { .. }));
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { .. }
+    ));
 }
