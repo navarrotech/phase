@@ -1848,6 +1848,7 @@ mod erratic_explosion;
 mod event_deadline_duration;
 mod exchange_control_of_a_spell;
 mod exchange_control_up_to_one_target;
+mod generated_target_slot_ownership;
 mod exploit_ceased_exploiter_lki;
 mod extra_turn_quantity;
 mod fathom_trawl_revealed_population;
