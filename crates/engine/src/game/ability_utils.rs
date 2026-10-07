@@ -21,6 +21,7 @@ use crate::types::game_state::{
 use crate::types::identifiers::{ObjectId, ObjectIncarnationRef};
 use crate::types::player::PlayerId;
 use crate::types::zones::Zone;
+use rand::seq::IndexedRandom;
 
 use super::engine::EngineError;
 use super::players;
@@ -1464,7 +1465,7 @@ pub fn auto_select_targets_for_ability(
     ability: &ResolvedAbility,
     target_slots: &[TargetSelectionSlot],
     constraints: &[TargetSelectionConstraint],
-) -> Result<Option<Vec<TargetRef>>, EngineError> {
+) -> Result<Option<Vec<Option<TargetRef>>>, EngineError> {
     // CR 601.2c + CR 115.1: if any slot is announced by a player other than the
     // controller ("of an opponent's choice"), the choice is not the controller's
     // to auto-resolve even when only one legal combination exists — force the
@@ -1667,8 +1668,9 @@ pub fn ability_definition_supported(def: &AbilityDefinition) -> bool {
 /// same RNG state and legal-target set, the same target is chosen on every run.
 /// This preserves replay/test reproducibility.
 ///
-/// Errors out if any slot has no legal target — the caller has already verified
-/// `target_slots.is_empty()` does not hold.
+/// Errors out if a required slot has no legal target — the caller has already
+/// verified `target_slots.is_empty()` does not hold. Each optional empty slot
+/// retains its position for the chain assigner.
 ///
 /// Limitation (out of scope for the H1 audit fix): when an ability has a
 /// `multi_target` spec ("any number of random target creatures") the slot
@@ -1681,10 +1683,8 @@ pub fn random_select_targets_for_ability(
     state: &mut GameState,
     target_slots: &[TargetSelectionSlot],
     constraints: &[TargetSelectionConstraint],
-) -> Result<Vec<TargetRef>, EngineError> {
-    use rand::seq::IndexedRandom; // rand 0.9: `choose` on `[T]` lives here.
-
-    let mut chosen: Vec<TargetRef> = Vec::with_capacity(target_slots.len());
+) -> Result<Vec<Option<TargetRef>>, EngineError> {
+    let mut chosen: Vec<Option<TargetRef>> = Vec::with_capacity(target_slots.len());
     for slot in target_slots {
         // CR 115.3: The same target can't be chosen multiple times for one
         // instance of "target". The interactive `legal_targets_for_slot`
@@ -1694,7 +1694,7 @@ pub fn random_select_targets_for_ability(
         let candidate_targets: Vec<TargetRef> = slot
             .legal_targets
             .iter()
-            .filter(|t| !chosen.contains(t))
+            .filter(|target| !chosen.iter().flatten().any(|picked| picked == *target))
             .cloned()
             .collect();
         if candidate_targets.is_empty() {
@@ -1704,6 +1704,7 @@ pub fn random_select_targets_for_ability(
             // set (after CR 115.3 uniqueness filtering) cannot be satisfied
             // unless the slot is optional.
             if slot.optional {
+                chosen.push(None);
                 continue;
             }
             return Err(EngineError::ActionNotAllowed(
@@ -1713,12 +1714,13 @@ pub fn random_select_targets_for_ability(
         let pick = candidate_targets.choose(&mut state.rng).cloned().ok_or(
             EngineError::ActionNotAllowed("Random selection failed to draw a target".to_string()),
         )?;
-        chosen.push(pick);
+        chosen.push(Some(pick));
     }
     // Multi-slot constraints (e.g., DifferentTargetPlayers) — reuse the same
     // validator the controller-choice path uses so random selection respects
     // every constraint declared on the ability.
-    validate_target_constraints(Some(state), &chosen, constraints, None)?;
+    let selected: Vec<TargetRef> = chosen.iter().flatten().cloned().collect();
+    validate_target_constraints(Some(state), &selected, constraints, None)?;
     Ok(chosen)
 }
 
@@ -8033,7 +8035,7 @@ fn build_target_assignments_for_ability_with_limit(
     target_slots: &[TargetSelectionSlot],
     constraints: &[TargetSelectionConstraint],
     limit: Option<usize>,
-) -> Vec<Vec<TargetRef>> {
+) -> Vec<Vec<Option<TargetRef>>> {
     let specs = target_slot_specs(state, ability);
     let view = AbilityTargetingView {
         state,
@@ -8051,8 +8053,8 @@ fn build_target_assignments_for_ability_with_limit(
 fn build_target_assignments_with_specs(
     view: &AbilityTargetingView<'_>,
     index: usize,
-    current: &mut Vec<TargetRef>,
-    out: &mut Vec<Vec<TargetRef>>,
+    current: &mut Vec<Option<TargetRef>>,
+    out: &mut Vec<Vec<Option<TargetRef>>>,
     limit: Option<usize>,
 ) {
     if limit.is_some_and(|limit| out.len() >= limit) {
@@ -8060,7 +8062,7 @@ fn build_target_assignments_with_specs(
     }
 
     if index == view.target_slots.len() {
-        if validate_target_prefix_with_specs(
+        if validate_selected_slots_with_specs(
             view.state,
             view.ability,
             view.specs,
@@ -8077,24 +8079,36 @@ fn build_target_assignments_with_specs(
 
     let slot = &view.target_slots[index];
     if slot.optional {
-        build_target_assignments_with_specs(view, index + 1, current, out, limit);
+        current.push(None);
+        if validate_selected_slots_with_specs(
+            view.state,
+            view.ability,
+            view.specs,
+            view.target_slots,
+            current,
+            view.constraints,
+        )
+        .is_ok()
+        {
+            build_target_assignments_with_specs(view, index + 1, current, out, limit);
+        }
+        current.pop();
     }
 
-    let selected_slots: Vec<Option<TargetRef>> = current.iter().cloned().map(Some).collect();
     let legal_targets = legal_targets_for_spec_slot(
         view.state,
         view.ability,
         view.specs,
         view.target_slots,
         index,
-        &selected_slots,
+        current,
     );
     for target in legal_targets {
         if limit.is_some_and(|limit| out.len() >= limit) {
             return;
         }
-        current.push(target);
-        if validate_target_prefix_with_specs(
+        current.push(Some(target));
+        if validate_selected_slots_with_specs(
             view.state,
             view.ability,
             view.specs,
@@ -9209,26 +9223,12 @@ fn assign_targets_recursive(
     // would bind it as subject A. `minimum_targets_in_chain` gates all three
     // companion terms off for a paired node for exactly this reason (§5.8).
     //
-    // PRODUCER-AGNOSTIC BY CONSTRUCTION. `assign_targets_in_chain` has 18
-    // production call sites and `targets` arrives from three different
-    // producers: a player's `GameAction::SelectTargets`
-    // (the `assign_targets_in_chain` call in `casting_targets::handle_select_targets`, the `assign_targets_in_chain` call in `engine_stack::restamp_pending_die_result`),
-    // `auto_select_targets_for_ability` / `auto_select_targets` when EXACTLY
-    // ONE legal assignment exists, and `random_select_targets_for_ability`
-    // under `TargetSelectionMode::Random`. (CR 115.1d: a triggered ability's
-    // targets are chosen as it is put on the stack — that is the timing all
-    // three share. The RANDOMNESS itself is a card-specific instruction, e.g.
-    // Karona, False God Avatar's "chosen at random"; NO CR licenses random
-    // target selection generally, so none is cited for it.) All three deliver
-    // a flat slice in the COLLECT PASS's slot order, and this block consumes a
-    // prefix of it by ordinal — so it must NOT discriminate on the producer.
-    // Making this node a sink additionally exposes the chain-level leftover
-    // check (`next_target != targets.len()`) to paired nodes for the first
-    // time at every one of those sites; on the trigger route
-    // (the `assign_targets_in_chain` call in `triggers::prepare_trigger_targets`)
-    // an error there is turned into
-    // `PreparedTriggerTargets::NeedsFallbackPush` and the trigger is DROPPED
-    // SILENTLY.
+    // The compact assigner still serves external `GameAction::SelectTargets`,
+    // stack restamping, and generic Aura/mutate auto-selection. It consumes
+    // the targets in declared order. Spec-aware automatic and random selection
+    // instead retain every slot's ordinal, including a declined optional slot,
+    // and use `assign_selected_slots_in_chain` so a later child keeps its own
+    // target. Both assignment paths make this paired node a target sink.
     //
     // This is what makes the resolvers' positional consumption sound: after
     // this block a paired-subject node holds exactly its own claimed entries
@@ -13278,6 +13278,92 @@ mod tests {
             0,
             "an optional paired slot reserves no required target"
         );
+    }
+
+    /// CR 115.6 + CR 601.2c: declining an optional paired root does not
+    /// transfer its later ordinary child's required target to the root.
+    #[test]
+    fn selected_slots_keep_optional_paired_root_and_required_child_ownership() {
+        let mut state = GameState::new_two_player(43);
+        let source = create_creature(&mut state, PlayerId(0), CardId(1), "Source");
+        let opponent_creature =
+            create_creature(&mut state, PlayerId(1), CardId(2), "Opponent creature");
+        let own_creature = create_creature(&mut state, PlayerId(0), CardId(3), "Own creature");
+        let mut ability = ResolvedAbility::new(
+            Effect::ExchangeControl {
+                target_a: TargetFilter::SelfRef,
+                target_b: TargetFilter::Typed(
+                    TypedFilter::creature().controller(ControllerRef::Opponent),
+                ),
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        )
+        .sub_ability(ResolvedAbility::new(
+            Effect::Destroy {
+                target: TargetFilter::Typed(TypedFilter::creature()),
+                cant_regenerate: false,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        ));
+        ability.multi_target = Some(MultiTargetSpec::up_to(QuantityExpr::Fixed { value: 1 }));
+
+        let slots = build_target_slots(&state, &ability).expect("both declared slots build");
+        let specs = target_slot_specs(&state, &ability);
+        assert_eq!(slots.len(), 2, "root and child each declare a slot");
+        assert!(slots[0].optional);
+        assert!(!slots[1].optional);
+        let constraints = [TargetSelectionConstraint::DifferentObjectControllers];
+        let child_only = vec![None, Some(TargetRef::Object(opponent_creature))];
+        validate_selected_slots_with_specs(
+            &state,
+            &ability,
+            &specs,
+            &slots,
+            &child_only,
+            &constraints,
+        )
+        .expect("the optional root may be declined while child chooses B");
+        let mut declined = ability.clone();
+        assign_selected_slots_in_chain(&state, &mut declined, &child_only)
+            .expect("the required child owns B");
+        assert!(declined.targets.is_empty());
+        assert_eq!(
+            declined.sub_ability.as_ref().unwrap().targets,
+            vec![TargetRef::Object(opponent_creature)]
+        );
+
+        let filled = vec![
+            Some(TargetRef::Object(opponent_creature)),
+            Some(TargetRef::Object(own_creature)),
+        ];
+        validate_selected_slots_with_specs(&state, &ability, &specs, &slots, &filled, &constraints)
+            .expect("different controllers permit a filled root and child");
+        let mut assigned = ability.clone();
+        assign_selected_slots_in_chain(&state, &mut assigned, &filled)
+            .expect("each chosen object stays on its declared node");
+        assert_eq!(assigned.targets, vec![TargetRef::Object(opponent_creature)]);
+        assert_eq!(
+            assigned.sub_ability.as_ref().unwrap().targets,
+            vec![TargetRef::Object(own_creature)]
+        );
+
+        let same_controller = vec![
+            Some(TargetRef::Object(opponent_creature)),
+            Some(TargetRef::Object(opponent_creature)),
+        ];
+        assert!(validate_selected_slots_with_specs(
+            &state,
+            &ability,
+            &specs,
+            &slots,
+            &same_controller,
+            &constraints,
+        )
+        .is_err());
     }
 
     /// V6c-i (round-6 plan) — Cliffside Market's `(Controller, Player)` shape
@@ -18619,7 +18705,7 @@ mod tests {
                 let auto =
                     auto_select_targets_for_ability(runner.state(), &ability, &slots, &[]).unwrap();
                 if count == 1 {
-                    assert_eq!(auto, Some(vec![TargetRef::Object(own[0])]));
+                    assert_eq!(auto, Some(vec![Some(TargetRef::Object(own[0]))]));
                 } else {
                     assert!(
                         auto.is_none(),
@@ -21746,7 +21832,9 @@ mod tests {
             random_select_targets_for_ability(&mut state, std::slice::from_ref(&slot), &[])
                 .expect("random selection succeeds when legal targets exist");
         assert_eq!(chosen.len(), 1);
-        assert!(slot.legal_targets.contains(&chosen[0]));
+        assert!(slot
+            .legal_targets
+            .contains(chosen[0].as_ref().expect("required slot has a target")));
     }
 
     /// CR 115.1 + CR 701.9b: Determinism check — two independent runs with the
@@ -21808,7 +21896,50 @@ mod tests {
         };
         let chosen = random_select_targets_for_ability(&mut state, &[slot], &[])
             .expect("optional empty slot resolves to empty selection");
-        assert!(chosen.is_empty());
+        assert_eq!(chosen, vec![None]);
+    }
+
+    /// CR 115.6 + CR 601.2c: an empty optional random slot still occupies its
+    /// declared position when the following required slot has a legal target.
+    #[test]
+    fn random_select_targets_preserves_empty_slot_before_required_child() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_creature(&mut state, PlayerId(0), CardId(1), "Source");
+        let mut ability = ResolvedAbility::new(
+            Effect::ExchangeControl {
+                target_a: TargetFilter::SelfRef,
+                target_b: TargetFilter::Typed(
+                    TypedFilter::creature().controller(ControllerRef::Opponent),
+                ),
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        )
+        .sub_ability(ResolvedAbility::new(
+            Effect::Destroy {
+                target: TargetFilter::Typed(TypedFilter::creature()),
+                cant_regenerate: false,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        ));
+        ability.multi_target = Some(MultiTargetSpec::up_to(QuantityExpr::Fixed { value: 1 }));
+        let slots = build_target_slots(&state, &ability).expect("optional root and required child");
+        assert_eq!(slots.len(), 2);
+        assert!(slots[0].optional && slots[0].legal_targets.is_empty());
+        assert!(slots[1].legal_targets.contains(&TargetRef::Object(source)));
+        let selected = random_select_targets_for_ability(&mut state, &slots, &[])
+            .expect("the required child has one legal random choice");
+        assert_eq!(selected, vec![None, Some(TargetRef::Object(source))]);
+        assign_selected_slots_in_chain(&state, &mut ability, &selected)
+            .expect("the selected child target remains on the child node");
+        assert!(ability.targets.is_empty());
+        assert_eq!(
+            ability.sub_ability.as_ref().unwrap().targets,
+            vec![TargetRef::Object(source)]
+        );
     }
 
     /// CR 115.1 + CR 701.9b: Multi-slot `Random`-mode resolves each slot
@@ -21842,8 +21973,12 @@ mod tests {
             random_select_targets_for_ability(&mut state, &[slot_a.clone(), slot_b.clone()], &[])
                 .expect("multi-slot random selection succeeds");
         assert_eq!(chosen.len(), 2);
-        assert!(slot_a.legal_targets.contains(&chosen[0]));
-        assert!(slot_b.legal_targets.contains(&chosen[1]));
+        assert!(slot_a
+            .legal_targets
+            .contains(chosen[0].as_ref().expect("first required slot has a target")));
+        assert!(slot_b
+            .legal_targets
+            .contains(chosen[1].as_ref().expect("second required slot has a target")));
     }
 
     /// CR 115.3: Multi-slot random selection must not pick the same target
@@ -21885,7 +22020,7 @@ mod tests {
         let chosen =
             random_select_targets_for_ability(&mut state, &[slot_required, slot_optional], &[])
                 .expect("required + optional resolves with one target");
-        assert_eq!(chosen, vec![shared]);
+        assert_eq!(chosen, vec![Some(shared), None]);
     }
 
     /// CR 115.1: `build_resolved_from_def` propagates `target_selection_mode`

@@ -3298,7 +3298,7 @@ fn try_begin_deferred_else_branch_target_selection(
     )
     .map_err(|e| EffectError::InvalidParam(e.to_string()))?
     {
-        crate::game::ability_utils::assign_targets_in_chain(state, else_resolved, &selected)
+        crate::game::ability_utils::assign_selected_slots_in_chain(state, else_resolved, &selected)
             .map_err(|e| EffectError::InvalidParam(e.to_string()))?;
         return Ok(false);
     }
@@ -3613,7 +3613,7 @@ fn try_materialize_reflexive_trigger_inner(
         )
         .map_err(|e| EffectError::InvalidParam(e.to_string()))?;
         let mut reflexive_clone = reflexive.clone();
-        crate::game::ability_utils::assign_targets_in_chain(state, &mut reflexive_clone, &chosen)
+        crate::game::ability_utils::assign_selected_slots_in_chain(state, &mut reflexive_clone, &chosen)
             .map_err(|e| EffectError::InvalidParam(e.to_string()))?;
         resolve_ability_chain(state, &reflexive_clone, events, depth + 1)?;
         return Ok(true);
