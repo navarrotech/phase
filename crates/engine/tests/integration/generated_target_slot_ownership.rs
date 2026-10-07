@@ -193,29 +193,28 @@ fn distinct_filter_pools_auto_assign_only_the_required_child() {
         &resolved.target_constraints,
     )
     .expect("interactive slot authority starts");
+    assert_eq!(
+        runner.state().objects[&scout].controller,
+        runner.state().objects[&knight].controller,
+        "[Scout, Knight] violates DifferentObjectControllers"
+    );
+    // The selection authority eliminates [Scout, Knight] and automatically
+    // advances past the now-empty optional root to the required child.
+    assert_eq!(progress.current_slot, 1);
+    assert_eq!(progress.selected_slots, vec![None]);
     assert!(
         !progress
             .current_legal_targets
             .contains(&TargetRef::Object(scout)),
         "choosing Scout would leave no legal completion for the required child"
     );
-    let TargetSelectionAdvance::InProgress(after_root) = choose_target_for_ability(
-        runner.state(),
-        &resolved,
-        &slots,
-        &resolved.target_constraints,
-        &progress,
-        None,
-    )
-    .expect("optional root can be declined") else {
-        panic!("required child must remain");
-    };
+    assert_eq!(progress.current_legal_targets, vec![TargetRef::Object(knight)]);
     let TargetSelectionAdvance::Complete(selected) = choose_target_for_ability(
         runner.state(),
         &resolved,
         &slots,
         &resolved.target_constraints,
-        &after_root,
+        &progress,
         Some(TargetRef::Object(knight)),
     )
     .expect("required child accepts Knight") else {
