@@ -9,8 +9,8 @@ use crate::types::player::PlayerId;
 
 use super::ability_utils::{
     assign_selected_slots_in_chain, auto_select_targets_for_ability,
-    begin_target_selection_for_ability,
-    build_target_slots, declared_targets_in_chain, random_select_targets_for_ability,
+    begin_target_selection_for_ability, build_target_slots, declared_targets_in_chain,
+    random_select_targets_for_ability,
 };
 use super::casting::emit_targeting_events;
 use super::engine::EngineError;

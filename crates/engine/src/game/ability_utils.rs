@@ -21973,12 +21973,16 @@ mod tests {
             random_select_targets_for_ability(&mut state, &[slot_a.clone(), slot_b.clone()], &[])
                 .expect("multi-slot random selection succeeds");
         assert_eq!(chosen.len(), 2);
-        assert!(slot_a
-            .legal_targets
-            .contains(chosen[0].as_ref().expect("first required slot has a target")));
-        assert!(slot_b
-            .legal_targets
-            .contains(chosen[1].as_ref().expect("second required slot has a target")));
+        assert!(slot_a.legal_targets.contains(
+            chosen[0]
+                .as_ref()
+                .expect("first required slot has a target")
+        ));
+        assert!(slot_b.legal_targets.contains(
+            chosen[1]
+                .as_ref()
+                .expect("second required slot has a target")
+        ));
     }
 
     /// CR 115.3: Multi-slot random selection must not pick the same target

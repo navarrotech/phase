@@ -52,10 +52,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use super::ability_utils::{
     ability_target_legality_needs_chosen_x, additional_cost_instead_spell_has_legal_targets,
     assign_selected_slots_in_chain, assign_targets_in_chain, auto_select_targets,
-    auto_select_targets_for_ability,
-    begin_target_selection, begin_target_selection_for_ability, build_resolved_from_def,
-    build_target_slots, build_target_slots_for_announcement, compute_unavailable_modes,
-    declared_targets_in_chain, filter_references_target_player,
+    auto_select_targets_for_ability, begin_target_selection, begin_target_selection_for_ability,
+    build_resolved_from_def, build_target_slots, build_target_slots_for_announcement,
+    compute_unavailable_modes, declared_targets_in_chain, filter_references_target_player,
     has_legal_target_assignment_for_ability, modal_choice_for_player,
     simple_legal_target_assignment_exists_for_ability, target_constraints_from_modal,
     unresolved_x_target_construction_error, TargetSlotBuildOutcome,

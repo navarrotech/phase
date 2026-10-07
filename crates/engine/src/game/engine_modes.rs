@@ -5,10 +5,9 @@ use crate::types::mana::ManaCost;
 
 use super::ability_utils::{
     assign_selected_slots_in_chain, auto_select_targets_for_ability,
-    begin_target_selection_for_ability,
-    build_chained_resolved, build_target_slots_labelled, cap_distribution_target_slots,
-    random_select_targets_for_ability, record_modal_mode_choices, selected_mode_labels,
-    target_constraints_from_modal, validate_modal_indices,
+    begin_target_selection_for_ability, build_chained_resolved, build_target_slots_labelled,
+    cap_distribution_target_slots, random_select_targets_for_ability, record_modal_mode_choices,
+    selected_mode_labels, target_constraints_from_modal, validate_modal_indices,
 };
 use super::engine::EngineError;
 use super::engine_stack;
