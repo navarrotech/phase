@@ -208,7 +208,10 @@ fn distinct_filter_pools_auto_assign_only_the_required_child() {
             .contains(&TargetRef::Object(scout)),
         "choosing Scout would leave no legal completion for the required child"
     );
-    assert_eq!(progress.current_legal_targets, vec![TargetRef::Object(knight)]);
+    assert_eq!(
+        progress.current_legal_targets,
+        vec![TargetRef::Object(knight)]
+    );
     let TargetSelectionAdvance::Complete(selected) = choose_target_for_ability(
         runner.state(),
         &resolved,
