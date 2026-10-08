@@ -933,6 +933,154 @@ fn a_dredge_pause_on_each_of_three_legs_parks_only_later_legs() {
     );
 }
 
+/// CR 702.24a + CR 121.2a + CR 614.11a + CR 616.1: instruction size survives a
+/// pause. A "Draw two cards." upkeep at two age counters pays two two-card legs;
+/// Dredge pauses each card in turn. While the first leg is unfinished the park
+/// owes the whole second leg at its printed size, and once the second leg is
+/// issued the park owes nothing — that leg's own second draw belongs to its draw
+/// frame.
+#[test]
+fn a_dredge_pause_inside_a_two_card_leg_parks_the_later_leg_whole() {
+    let (mut runner, enchantment, ()) = upkeep_board(
+        "Draw-Two Vortex",
+        DRAW_TWO_VORTEX_ORACLE,
+        1,
+        &STAGED_LIBRARY,
+        |scenario| {
+            scenario
+                .add_creature_to_graveyard(P0, "Stinkweed Imp", 1, 2)
+                .from_oracle_text(STINKWEED_IMP_ORACLE);
+        },
+    );
+    advance_through_upkeep(&mut runner);
+    let prompt = unless_prompt_cost(&runner);
+    let before = ZoneSizes::of(&runner, P0);
+
+    runner
+        .act(GameAction::PayUnlessCost { pay: true })
+        .expect("paying is legal");
+    // One Dredge pause per card: two in the first leg, two in the second.
+    let expected_suffixes = [Some(draw_cost(2)), Some(draw_cost(2)), None, None];
+    let mut events = Vec::new();
+    for (pause, expected_suffix) in expected_suffixes.into_iter().enumerate() {
+        assert_replacement_choice(&runner, &format!("Dredge pauses draw {}", pause + 1));
+        assert_eq!(
+            parked_unpaid_suffix(&runner),
+            expected_suffix.map(|cost| UnpaidCostSuffix { payer: P0, cost }),
+            "the park at draw {} owes only the later leg, at its printed size",
+            pause + 1
+        );
+        let result = runner
+            .act(GameAction::ChooseReplacement {
+                index: DECLINE_REPLACEMENT,
+            })
+            .expect("declining Dredge is legal");
+        events.extend(result.events);
+    }
+
+    assert!(
+        !matches!(
+            runner.state().waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ),
+        "four declined draws settle the payment, got {:?}",
+        runner.state().waiting_for
+    );
+    let after = ZoneSizes::of(&runner, P0);
+    assert_eq!(after.hand, before.hand + 4, "two legs of two cards each");
+    assert_eq!(after.library, before.library - 4);
+    assert_eq!(zone_of(&runner, enchantment), Zone::Battlefield);
+    assert!(runner.state().pending_cost_move_resume.is_none());
+    assert!(runner.state().active_draw_sequence().is_none());
+    assert!(upkeep_ability_resolved(&events, enchantment));
+
+    assert_eq!(
+        prompt,
+        upkeep_draw_cost(2, 2),
+        "CR 702.24a: the two-card instruction once per age counter"
+    );
+}
+
+/// CR 121.2a + CR 614.11a: the later leg parked across a Dredge pause is still
+/// a two-card instruction when it is issued. Alms Collector turns each two-card
+/// leg into one card for each player, so Dredge pauses once per leg, and the
+/// second leg — issued from the parked suffix — is replaced exactly like the
+/// first. A suffix that had shrunk to one card would escape Alms Collector and
+/// draw P0 an extra card.
+#[test]
+fn a_two_card_leg_resumed_from_a_dredge_park_keeps_its_instruction_size() {
+    let (mut runner, enchantment, ()) = upkeep_board(
+        "Draw-Two Vortex",
+        DRAW_TWO_VORTEX_ORACLE,
+        1,
+        &STAGED_LIBRARY,
+        |scenario| {
+            scenario.with_library_top(P1, &STAGED_LIBRARY);
+            scenario.add_creature_from_oracle(P1, "Alms Collector", 3, 4, ALMS_COLLECTOR_ORACLE);
+            scenario
+                .add_creature_to_graveyard(P0, "Stinkweed Imp", 1, 2)
+                .from_oracle_text(STINKWEED_IMP_ORACLE);
+        },
+    );
+    advance_through_upkeep(&mut runner);
+    let prompt = unless_prompt_cost(&runner);
+    let before = ZoneSizes::of(&runner, P0);
+    let opponent_before = ZoneSizes::of(&runner, P1);
+
+    runner
+        .act(GameAction::PayUnlessCost { pay: true })
+        .expect("paying is legal");
+    // One Dredge pause per leg: Alms Collector leaves P0 one card per leg.
+    let expected_suffixes = [Some(draw_cost(2)), None];
+    let mut events = Vec::new();
+    for (leg, expected_suffix) in expected_suffixes.into_iter().enumerate() {
+        assert_replacement_choice(&runner, &format!("Dredge pauses leg {}", leg + 1));
+        assert_eq!(
+            parked_unpaid_suffix(&runner),
+            expected_suffix.map(|cost| UnpaidCostSuffix { payer: P0, cost }),
+            "the park at leg {} owes only the later leg, at its printed size",
+            leg + 1
+        );
+        let result = runner
+            .act(GameAction::ChooseReplacement {
+                index: DECLINE_REPLACEMENT,
+            })
+            .expect("declining Dredge is legal");
+        events.extend(result.events);
+    }
+
+    assert!(
+        !matches!(
+            runner.state().waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ),
+        "two declined draws settle the payment, got {:?}",
+        runner.state().waiting_for
+    );
+    let after = ZoneSizes::of(&runner, P0);
+    let opponent_after = ZoneSizes::of(&runner, P1);
+    assert_eq!(
+        (
+            after.hand - before.hand,
+            opponent_after.hand - opponent_before.hand
+        ),
+        (2, 2),
+        "Alms Collector turns each two-card leg, parked or not, into one card for each player"
+    );
+    assert_eq!(after.library, before.library - 2);
+    assert_eq!(opponent_after.library, opponent_before.library - 2);
+    assert_eq!(zone_of(&runner, enchantment), Zone::Battlefield);
+    assert!(runner.state().pending_cost_move_resume.is_none());
+    assert!(runner.state().active_draw_sequence().is_none());
+    assert!(upkeep_ability_resolved(&events, enchantment));
+
+    assert_eq!(
+        prompt,
+        upkeep_draw_cost(2, 2),
+        "CR 702.24a: the two-card instruction once per age counter"
+    );
+}
+
 /// CR 121.2a: every instruction gets its own instruction-level replacement
 /// consult. Quantum Riddler adds one card to an instruction drawn with one or
 /// fewer cards in hand: the first instruction (hand 0) draws two, the second
