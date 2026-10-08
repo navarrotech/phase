@@ -591,6 +591,9 @@ pub struct TriggerSourceContext {
     pub additional_cost_payments: Vec<AdditionalCostInstancePayment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cast_cost_paid_object: Option<CostPaidObjectSnapshot>,
+    /// CR 201.5a: the granter stamped on the trigger definition this context was handed with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granting_object: Option<ObjectIncarnationRef>,
 }
 
 impl std::fmt::Debug for TriggerSourceContext {
@@ -667,8 +670,11 @@ impl std::fmt::Debug for TriggerSourceContext {
                 &self.additional_cost_payment_count,
             )
             .field("additional_cost_payments", &self.additional_cost_payments)
-            .field("cast_cost_paid_object", &self.cast_cost_paid_object)
-            .finish()
+            .field("cast_cost_paid_object", &self.cast_cost_paid_object);
+        if self.granting_object.is_some() {
+            debug.field("granting_object", &self.granting_object);
+        }
+        debug.finish()
     }
 }
 
@@ -2778,6 +2784,13 @@ pub struct PendingRepeatIteration {
     pub iterated_counter_kinds: Vec<crate::types::counter::CounterType>,
     pub next_iteration: usize,
     pub total_iterations: usize,
+    /// CR 405.3 + CR 707.10: set on a loop that puts copies of several spells
+    /// on the stack as one batch. `Some(n)`: the controller has already fixed
+    /// the order of `tracked_members[..n]`, and picks the spell for iteration
+    /// `n` before it runs (`WaitingFor::SpellCopyOrderChoice`). `None` for
+    /// every other loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copy_order_fixed: Option<usize>,
 }
 
 /// CR 705.2: The controller-relevant result of the most recent coin flip
@@ -6618,6 +6631,18 @@ pub enum BatchCompletion {
 /// the terminal batch belongs to the still-stashed resolving Ripple ability;
 /// the post-announcement boundary then combines this cast's triggers with the
 /// earlier accepted casts' parked observers before ordering the one batch.
+/// CR 608.2n + CR 608.2g: the move of a resolving instant or sorcery to the
+/// zone it goes to "as the final part" of its resolution, held back while the
+/// spell is paused on its own during-resolution free-cast window (Finale of
+/// Promise, Collected Conjuring). The spell stays on the stack until the window
+/// and the rest of its instructions are done; the destination is the one
+/// `resolve_top` selected.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeferredSpellDelivery {
+    pub object_id: ObjectId,
+    pub destination: crate::types::zones::Zone,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingResolutionCompletion {
     pub player: PlayerId,
@@ -14668,6 +14693,18 @@ pub enum WaitingFor {
         choices: Vec<ObjectId>,
         count: u32,
     },
+    /// CR 405.3 + CR 707.10: an effect that puts copies of several spells on
+    /// the stack at once ("copy each of those spells twice" — Finale of
+    /// Promise) lets their controller choose the copies' relative order. Asked
+    /// one copy at a time: `choices` are the distinct spells that still have a
+    /// copy to make, and the chosen spell's next copy goes on the stack next,
+    /// above the copies already made. Raised only while two or more spells
+    /// remain; the answer is a single-object `SelectCards`.
+    SpellCopyOrderChoice {
+        player: PlayerId,
+        source_id: ObjectId,
+        choices: Vec<ObjectId>,
+    },
     /// CR 701.55a: Player chooses one branch while facing a villainous choice,
     /// or another inline resolution-time "choose A or B" effect.
     ChooseOneOfBranch {
@@ -16838,6 +16875,7 @@ impl WaitingFor {
             WaitingFor::ChooseFromZoneChoice { .. } => "ChooseFromZoneChoice",
             WaitingFor::BeholdChoice { .. } => "BeholdChoice",
             WaitingFor::EmpowerJaceChoice { .. } => "EmpowerJaceChoice",
+            WaitingFor::SpellCopyOrderChoice { .. } => "SpellCopyOrderChoice",
             WaitingFor::ChooseOneOfBranch { .. } => "ChooseOneOfBranch",
             WaitingFor::ConniveDiscard { .. } => "ConniveDiscard",
             WaitingFor::DiscardChoice { .. } => "DiscardChoice",
@@ -17002,6 +17040,7 @@ impl WaitingFor {
             | WaitingFor::ChooseFromZoneChoice { player, .. }
             | WaitingFor::BeholdChoice { player, .. }
             | WaitingFor::EmpowerJaceChoice { player, .. }
+            | WaitingFor::SpellCopyOrderChoice { player, .. }
             | WaitingFor::ChooseOneOfBranch { player, .. }
             | WaitingFor::LearnChoice { player, .. }
             | WaitingFor::ManifestDreadChoice { player, .. }
@@ -17355,6 +17394,7 @@ impl WaitingFor {
             | WaitingFor::ChooseFromZoneChoice { .. }
             | WaitingFor::BeholdChoice { .. }
             | WaitingFor::EmpowerJaceChoice { .. }
+            | WaitingFor::SpellCopyOrderChoice { .. }
             | WaitingFor::ChooseOneOfBranch { .. }
             | WaitingFor::ConniveDiscard { .. }
             | WaitingFor::DiscardChoice { .. }
@@ -20130,7 +20170,8 @@ declare_game_state! {
     /// O(1) presence index over `StaticModeKind` discriminants — "does any functioning
     /// static of kind K exist on the board?" Rebuilt wholesale from `game_functioning_statics`
     /// as a byproduct of the layers pipeline (`layers::refresh_static_mode_presence`), so it is
-    /// exactly `.any(kind)` for every kind. Lets discriminant-only scan gates (e.g. the
+    /// the `.any(kind)` fold for every kind, plus `Goaded` for every def
+    /// `combat::static_designates_goad` admits. Lets discriminant-only scan gates (e.g. the
     /// hexproof scans in `static_abilities`) skip an O(battlefield) `.any()` when zero statics
     /// of that kind exist.
     ///
@@ -21994,6 +22035,9 @@ declare_game_state! {
     /// that spell's cast triggers into the same deferred ordering batch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_resolution_completion: Option<PendingResolutionCompletion>,
+    /// CR 608.2n + CR 608.2g: see [`DeferredSpellDelivery`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_spell_delivery: Option<DeferredSpellDelivery>,
     /// CR 107.3i: the X announced for an in-flight COST, keyed by the object whose cost
     /// it is. CR 107.3i: "Normally, all instances of X on an object have the same value
     /// at any given time" — so a triggered ability of that SAME object which fires
@@ -22858,14 +22902,16 @@ pub struct EndEffectPermission {
 
 /// Exact object bindings captured when a transient continuous effect begins.
 ///
-/// CR 400.7 + CR 611.2b: both fields name the particular objects the resolved
-/// effect may affect or whose state may sustain its duration.  They travel in
-/// the same journaled install command as the rest of the effect, rather than
-/// being attached after installation, so replay cannot observe a partial TCE.
+/// CR 400.7 + CR 611.2b: `affected_recipient` and `duration_subject` name the
+/// particular objects the resolved effect may affect or whose state may sustain
+/// its duration.  They travel in the same journaled install command as the rest
+/// of the effect, rather than being attached after installation, so replay
+/// cannot observe a partial TCE.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TransientContinuousEffectBindings {
     pub affected_recipient: Option<ObjectIncarnationRef>,
     pub duration_subject: Option<ObjectIncarnationRef>,
+    pub granting_object: Option<ObjectIncarnationRef>,
 }
 
 /// A runtime-generated continuous effect stored at state level.
@@ -22912,12 +22958,15 @@ pub struct TransientContinuousEffect {
     pub duration_event_source: Option<Box<TriggerSourceContext>>,
     /// CR 116.2c: see [`EndEffectPermission`]. `None` for every effect with no
     /// printed termination permission. Set inside the single construction
-    /// authority (`add_transient_continuous_effect_with_end_permission`), so it
+    /// authority (`add_transient_continuous_effect_inner`), so it
     /// rides inside the journaled `ResolvedContinuousEffectCommand` rather than
     /// being post-stamped. Backward-compatible across the WASM/multiplayer
     /// serialization boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub end_permission: Option<EndEffectPermission>,
+    /// CR 201.5a: the object that granted the ability that created this effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granting_object: Option<ObjectIncarnationRef>,
     /// Snapshot of the originating object's or dungeon's name, captured at construction.
     /// The originating spell/ability typically moves to a new zone (graveyard,
     /// stack→exile, etc.) with a new ObjectId per CR 400.7 after resolution,
@@ -27738,6 +27787,7 @@ impl GameState {
             resolving_stack_entry: None,
             resolving_trigger_firing: None,
             pending_resolution_completion: None,
+            deferred_spell_delivery: None,
             resolution_source_relatch: None,
             last_loop_action_sequence: Vec::new(),
             current_trigger_events: Vec::new(),
@@ -28391,7 +28441,7 @@ impl GameState {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn add_transient_continuous_effect_inner(
+    pub(crate) fn add_transient_continuous_effect_inner(
         &mut self,
         source_id: ObjectId,
         controller: PlayerId,
@@ -28555,6 +28605,7 @@ impl GameState {
                 duration_subject: bindings.duration_subject,
                 duration_event_source,
                 end_permission,
+                granting_object: bindings.granting_object,
                 source_name,
             },
             expected_installed_count: self.transient_continuous_effects.len(),
@@ -30270,6 +30321,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         resolving_stack_entry: _,
         resolving_trigger_firing: _,
         pending_resolution_completion: _,
+        deferred_spell_delivery: _,
         current_trigger_events: _,
         stack_trigger_event_batches: _,
         stack_trigger_firings: _,
@@ -30567,6 +30619,7 @@ impl PartialEq for GameState {
             && self.resolution_stack.game_state_eq(&other.resolution_stack)
             && self.payment_transaction == other.payment_transaction
             && self.pending_resolution_completion == other.pending_resolution_completion
+            && self.deferred_spell_delivery == other.deferred_spell_delivery
             // CR 104.4b: volatile resolution-scoped flip result. A flip already
             // advances `state.rng`, so iterations differ regardless; comparing
             // this field never masks a real repeat (safe to include).
@@ -32601,6 +32654,7 @@ mod tests {
             condition: None,
             duration_subject: Some(ObjectIncarnationRef::of(ObjectId(9), 3)),
             end_permission: None,
+            granting_object: None,
             duration_event_source: None,
             source_name: String::new(),
         };
@@ -41975,6 +42029,7 @@ mod tests {
                 TransientContinuousEffectBindings {
                     affected_recipient: Some(recipient),
                     duration_subject: Some(copy_source),
+                    granting_object: None,
                 },
             )
             .expect("the fixture's duration begins");
@@ -42071,6 +42126,7 @@ mod tests {
                 TransientContinuousEffectBindings {
                     affected_recipient: Some(recipient_ref),
                     duration_subject: Some(source_ref),
+                    granting_object: None,
                 },
             )
             .expect("the fixture's duration begins");

@@ -20109,7 +20109,10 @@ fn resolution_optional_payment_sacrifice_allowlist_fails_closed() {
     );
     for forbidden in [
         AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::SelfRef, 1)),
-        AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::GrantingObject, 1)),
+        AbilityCost::Sacrifice(SacrificeCost::count(
+            TargetFilter::GrantingObject { bound: None },
+            1,
+        )),
         AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::Any, 1)),
         AbilityCost::Sacrifice(SacrificeCost::count(typed.clone(), 0)),
         AbilityCost::Sacrifice(SacrificeCost::count(typed.clone(), u32::MAX)),
@@ -28083,6 +28086,17 @@ fn cast_trigger_lowers_to_control_next_turn_effect() {
     }
 }
 
+/// CR 603.8 + CR 603.4: a state trigger's own condition is its trigger event, so
+/// the parser lowers it inside `TriggerCondition::EventTime` (read when the game
+/// state matches, never rechecked on resolution). Returns the wrapped head and
+/// fails the test if the wrapper is missing.
+fn state_trigger_head(def: &TriggerDefinition) -> &TriggerCondition {
+    match &def.condition {
+        Some(TriggerCondition::EventTime { condition }) => condition,
+        other => panic!("expected an EventTime-wrapped state-trigger condition, got {other:?}"),
+    }
+}
+
 #[test]
 fn state_trigger_control_no_islands() {
     let def = parse_trigger_line(
@@ -28090,7 +28104,7 @@ fn state_trigger_control_no_islands() {
         "Dandân",
     );
     assert_eq!(def.mode, TriggerMode::StateCondition);
-    if let Some(TriggerCondition::ControlsNone { filter }) = &def.condition {
+    if let TriggerCondition::ControlsNone { filter } = state_trigger_head(&def) {
         if let TargetFilter::Typed(tf) = filter {
             assert!(
                 tf.type_filters
@@ -28121,7 +28135,7 @@ fn state_trigger_control_no_other_creatures() {
         "Emperor Crocodile",
     );
     assert_eq!(def.mode, TriggerMode::StateCondition);
-    if let Some(TriggerCondition::ControlsNone { filter }) = &def.condition {
+    if let TriggerCondition::ControlsNone { filter } = state_trigger_head(&def) {
         if let TargetFilter::Typed(tf) = filter {
             assert!(tf.properties.contains(&FilterProp::Another));
             assert!(tf.type_filters.contains(&TypeFilter::Creature));
@@ -28141,7 +28155,7 @@ fn state_trigger_control_no_artifacts() {
         "Covetous Dragon",
     );
     assert_eq!(def.mode, TriggerMode::StateCondition);
-    if let Some(TriggerCondition::ControlsNone { filter }) = &def.condition {
+    if let TriggerCondition::ControlsNone { filter } = state_trigger_head(&def) {
         if let TargetFilter::Typed(tf) = filter {
             assert!(tf.type_filters.contains(&TypeFilter::Artifact));
         } else {
@@ -28164,7 +28178,7 @@ fn state_trigger_control_a_creature_with_toughness() {
         "Endangered Armodon",
     );
     assert_eq!(def.mode, TriggerMode::StateCondition);
-    if let Some(TriggerCondition::ControlsType { filter }) = &def.condition {
+    if let TriggerCondition::ControlsType { filter } = state_trigger_head(&def) {
         if let TargetFilter::Typed(tf) = filter {
             assert!(
                 tf.type_filters.contains(&TypeFilter::Creature),
@@ -28316,11 +28330,11 @@ fn state_trigger_has_no_ice_counters() {
         "Dark Depths",
     );
     assert_eq!(def.mode, TriggerMode::StateCondition);
-    if let Some(TriggerCondition::HasCounters {
+    if let TriggerCondition::HasCounters {
         counters,
         minimum,
         maximum,
-    }) = &def.condition
+    } = state_trigger_head(&def)
     {
         assert_eq!(
             *counters,
@@ -28347,11 +28361,11 @@ fn state_trigger_has_no_plus1_counters() {
         "Afiya Grove",
     );
     assert_eq!(def.mode, TriggerMode::StateCondition);
-    if let Some(TriggerCondition::HasCounters {
+    if let TriggerCondition::HasCounters {
         counters,
         minimum,
         maximum,
-    }) = &def.condition
+    } = state_trigger_head(&def)
     {
         assert_eq!(*counters, CounterMatch::OfType(CounterType::Plus1Plus1));
         assert_eq!(*minimum, 0);
@@ -28369,11 +28383,11 @@ fn state_trigger_has_no_counters_bare() {
         "TestCard",
     );
     assert_eq!(def.mode, TriggerMode::StateCondition);
-    if let Some(TriggerCondition::HasCounters {
+    if let TriggerCondition::HasCounters {
         counters,
         minimum,
         maximum,
-    }) = &def.condition
+    } = state_trigger_head(&def)
     {
         assert_eq!(*counters, CounterMatch::Any);
         assert_eq!(*minimum, 0);
@@ -28392,11 +28406,11 @@ fn state_trigger_has_twenty_or_more_charge_counters() {
         "Darksteel Reactor",
     );
     assert_eq!(def.mode, TriggerMode::StateCondition);
-    if let Some(TriggerCondition::HasCounters {
+    if let TriggerCondition::HasCounters {
         counters,
         minimum,
         maximum,
-    }) = &def.condition
+    } = state_trigger_head(&def)
     {
         assert_eq!(
             *counters,
@@ -28528,6 +28542,118 @@ fn darksteel_reactor_state_trigger_fires_and_wins_game_at_twenty_counters() {
         ),
         "game must end with player 0 as winner after Darksteel Reactor fires; got {:?}",
         state.waiting_for,
+    );
+}
+
+/// CR 603.8 + CR 122.1: the source-counter state-condition authority accepts
+/// both surface grammars (possessive / existential) in the depletion and
+/// threshold forms, and is all-consuming — trailing text after the counter
+/// phrase is not a source-counter state condition.
+#[test]
+fn source_counter_state_condition_accepts_whole_condition_only() {
+    for accepted in [
+        "there are four or more page counters on ~",
+        "~ has no ice counters on it",
+        "~ has twenty or more charge counters on it",
+    ] {
+        assert!(
+            parse_source_counter_state_condition(accepted).is_some(),
+            "{accepted:?} must be recognized as a source-counter state condition"
+        );
+    }
+    for rejected in [
+        "there are four or more page counters on ~ and you control an artifact",
+        "~ has no ice counters on it during your turn",
+        "you control no islands",
+    ] {
+        assert!(
+            parse_source_counter_state_condition(rejected).is_none(),
+            "{rejected:?} must not be recognized as a source-counter state condition"
+        );
+    }
+}
+
+/// CR 608.2k + CR 603.8 + CR 400.7: in a source-counter state trigger, the body's
+/// bare "it" ("exile it") names the ability's own source, so it lowers to
+/// `SelfRef` (whose resolver applies the new-object guard) rather than the
+/// untargeted `ParentTarget` fallback. Verbatim Oracle text (MTGJSON).
+#[test]
+fn source_counter_state_trigger_bare_it_binds_source() {
+    const MAZEMIND_TOME: &str = "{T}, Put a page counter on this artifact: Scry 1. (Look at the top card of your library. You may put that card on the bottom.)\n{2}, {T}, Put a page counter on this artifact: Draw a card.\nWhen there are four or more page counters on this artifact, exile it. If you do, you gain 4 life.";
+    const NINE_LIVES: &str = "Hexproof\nIf a source would deal damage to you, prevent that damage and put an incarnation counter on this enchantment.\nWhen there are nine or more incarnation counters on this enchantment, exile it.\nWhen this enchantment leaves the battlefield, you lose the game.";
+    for (oracle, name, core_type, keywords) in [
+        (MAZEMIND_TOME, "Mazemind Tome", "Artifact", vec![]),
+        (
+            NINE_LIVES,
+            "Nine Lives",
+            "Enchantment",
+            vec!["Hexproof".to_string()],
+        ),
+    ] {
+        let parsed = parse_oracle_text(oracle, name, &keywords, &[core_type.to_string()], &[]);
+        let state_trigger = parsed
+            .triggers
+            .iter()
+            .find(|t| t.mode == TriggerMode::StateCondition)
+            .unwrap_or_else(|| panic!("{name} must parse a StateCondition trigger"));
+        let execute = state_trigger
+            .execute
+            .as_deref()
+            .expect("state trigger must have an execute ability");
+        assert!(
+            matches!(
+                execute.effect.as_ref(),
+                Effect::ChangeZone {
+                    destination: Zone::Exile,
+                    target: TargetFilter::SelfRef,
+                    ..
+                }
+            ),
+            "{name}: \"exile it\" must exile the source (SelfRef), got {:?}",
+            execute.effect
+        );
+    }
+}
+
+/// CR 608.2k: the source pin is the OUTERMOST antecedent — a typed referent
+/// introduced earlier in the same chain still owns a later bare "it". Synthetic
+/// source-counter state trigger whose body targets a creature and then refers
+/// back to it.
+#[test]
+fn source_counter_state_trigger_chain_typed_referent_keeps_parent_target() {
+    let parsed = parse_oracle_text(
+        "When there are three or more charge counters on this artifact, tap target creature. Put a stun counter on it.",
+        "Corvane Stunlatch",
+        &[],
+        &["Artifact".to_string()],
+        &[],
+    );
+    let state_trigger = parsed
+        .triggers
+        .iter()
+        .find(|t| t.mode == TriggerMode::StateCondition)
+        .expect("the synthetic line must parse a StateCondition trigger");
+    let effects = trigger_chain_effects(state_trigger);
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::SetTapState {
+                target: TargetFilter::Typed(_),
+                ..
+            }
+        )),
+        "reach guard: the chain must open with the typed tap target, got {effects:?}"
+    );
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::PutCounter {
+                target: TargetFilter::ParentTarget,
+                ..
+            }
+        )),
+        "\"put a stun counter on it\" must stay bound to the tapped creature \
+         (ParentTarget), not the source, got {effects:?}"
     );
 }
 
@@ -32774,23 +32900,13 @@ fn dance_of_the_dead_etb_lowers_to_reanimator_chain_tapped_4767() {
 
 // --- issue #640: reanimator-Aura GRANT-shape ETB whole-body recognizer (Necromancy) ---
 
-/// Verbatim Necromancy Oracle text (Scryfall, 2026-07). Unlike Animate Dead,
-/// Necromancy is a plain (non-Aura) Enchantment whose ETB ability BOTH becomes
-/// an Aura AND targets the graveyard creature to reanimate ("Put target creature
-/// card from a graveyard onto the battlefield ...").
+/// Verbatim Necromancy Oracle text.
 const NECROMANCY_ORACLE: &str = "You may cast this spell as though it had flash. If you cast it any time a sorcery couldn't have been cast, the controller of the permanent it becomes sacrifices it at the beginning of the next cleanup step.\nWhen this enchantment enters, if it's on the battlefield, it becomes an Aura with \"enchant creature put onto the battlefield with Necromancy.\" Put target creature card from a graveyard onto the battlefield under your control and attach this enchantment to it. When this enchantment leaves the battlefield, that creature's controller sacrifices it.";
 
-/// SHAPE test — assert Necromancy's ETB trigger lowers to the 4-node
-/// reanimator-Aura chain with the GRANT shape: the root `ChangeZone` targets a
-/// genuinely-parsed creature-card-in-a-graveyard `Typed` filter (NOT
-/// `AttachedTo`, unlike the swap shape — this is the #640 fix), and the
-/// `GenericEffect` grants the Aura subtype and the Enchant keyword for the first
-/// time (`AddSubtype` + `AddKeyword`, with NO `RemoveKeyword`). Runtime behavior
-/// is exercised separately in `casting_tests.rs`.
+/// CR 201.5a: the granted enchant restriction names Necromancy where the masker refuses the
+/// name, so the ETB line lowers to the granter residual rather than the reanimator chain.
 #[test]
-fn necromancy_etb_lowers_to_reanimator_grant_chain_640() {
-    use crate::types::zones::Zone;
-
+fn necromancy_etb_lowers_to_the_granter_residual() {
     let parsed = parse_oracle_text(
         NECROMANCY_ORACLE,
         "Necromancy",
@@ -32798,9 +32914,39 @@ fn necromancy_etb_lowers_to_reanimator_grant_chain_640() {
         &["Enchantment".to_string()],
         &[],
     );
-    // Necromancy has TWO enters-battlefield triggers: its first ability (the
-    // cleanup-step sacrifice for flash-casts) and this reanimator ETB. Select
-    // the reanimator one by its root `Effect::ChangeZone` body.
+    assert!(
+        !parsed.triggers.iter().any(|t| matches!(
+            t.execute.as_deref().map(|d| d.effect.as_ref()),
+            Some(Effect::ChangeZone { .. })
+        )),
+        "{parsed:#?}"
+    );
+    assert!(
+        parsed.abilities.iter().any(|def| matches!(
+            &*def.effect,
+            Effect::Unimplemented { name, .. } if name == "granter_reference_unreached"
+        )),
+        "{parsed:#?}"
+    );
+}
+
+/// Necromancy's printed text with a granted enchant restriction that does not name the card.
+const REANIMATOR_AURA_GRANT_ORACLE: &str = "You may cast this spell as though it had flash. If you cast it any time a sorcery couldn't have been cast, the controller of the permanent it becomes sacrifices it at the beginning of the next cleanup step.\nWhen this enchantment enters, if it's on the battlefield, it becomes an Aura with \"enchant creature put onto the battlefield with this enchantment.\" Put target creature card from a graveyard onto the battlefield under your control and attach this enchantment to it. When this enchantment leaves the battlefield, that creature's controller sacrifices it.";
+
+/// SHAPE test — the GRANT-shape ETB lowers to the 4-node reanimator-Aura chain: the root
+/// `ChangeZone` targets the graveyard creature card itself (not `AttachedTo`), and the
+/// `GenericEffect` grants the Aura subtype and Enchant keyword with no `RemoveKeyword`.
+#[test]
+fn reanimator_aura_grant_etb_lowers_to_grant_chain() {
+    let parsed = parse_oracle_text(
+        REANIMATOR_AURA_GRANT_ORACLE,
+        "Necro Probe",
+        &[],
+        &["Enchantment".to_string()],
+        &[],
+    );
+    // The first ability's cleanup-step sacrifice is also an enters trigger; select the
+    // reanimator one by its root `Effect::ChangeZone` body.
     let root = parsed
         .triggers
         .iter()
@@ -32809,7 +32955,7 @@ fn necromancy_etb_lowers_to_reanimator_grant_chain_640() {
         .find(|def| matches!(def.effect.as_ref(), Effect::ChangeZone { .. }))
         .unwrap_or_else(|| {
             panic!(
-                "Necromancy: expected a reanimator ETB trigger with a root ChangeZone, got {:?}",
+                "expected a reanimator ETB trigger with a root ChangeZone, got {:?}",
                 parsed.triggers
             )
         });
@@ -32818,7 +32964,7 @@ fn necromancy_etb_lowers_to_reanimator_grant_chain_640() {
     // graveyard-creature-card filter (NOT AttachedTo).
     assert!(
         root.forward_result,
-        "Necromancy: root ChangeZone must set forward_result"
+        "root ChangeZone must set forward_result"
     );
     let Effect::ChangeZone {
         origin,
@@ -32829,36 +32975,26 @@ fn necromancy_etb_lowers_to_reanimator_grant_chain_640() {
         ..
     } = root.effect.as_ref()
     else {
-        panic!(
-            "Necromancy: expected root Effect::ChangeZone, got {:?}",
-            root.effect
-        );
+        panic!("expected root Effect::ChangeZone, got {:?}", root.effect);
     };
-    assert_eq!(*origin, Some(Zone::Graveyard), "Necromancy: origin");
-    assert_eq!(*destination, Zone::Battlefield, "Necromancy: destination");
-    assert_eq!(
-        *enters_under,
-        Some(ControllerRef::You),
-        "Necromancy: enters_under"
-    );
-    // Untapped: "onto the battlefield" with no trailing " tapped".
+    assert_eq!(*origin, Some(Zone::Graveyard), "origin");
+    assert_eq!(*destination, Zone::Battlefield, "destination");
+    assert_eq!(*enters_under, Some(ControllerRef::You), "enters_under");
     assert!(
         !enter_tapped.is_tapped(),
-        "Necromancy: creature enters untapped ({enter_tapped:?})"
+        "creature enters untapped ({enter_tapped:?})"
     );
-    // The #640 fix: the target is a genuinely-parsed creature-card-in-a-graveyard
-    // filter (owner-agnostic — "a graveyard"), NOT `TargetFilter::AttachedTo`.
     assert_ne!(
         *target,
         TargetFilter::AttachedTo,
-        "Necromancy: ETB must target the graveyard creature itself, not AttachedTo"
+        "ETB must target the graveyard creature itself, not AttachedTo"
     );
     assert_eq!(
         *target,
         TargetFilter::Typed(TypedFilter::creature().properties(vec![FilterProp::InZone {
             zone: Zone::Graveyard
         }])),
-        "Necromancy: ETB ChangeZone target"
+        "ETB ChangeZone target"
     );
 
     // Node 2: GenericEffect grants (not swaps) — AddSubtype{Aura} + AddKeyword,
@@ -32866,29 +33002,26 @@ fn necromancy_etb_lowers_to_reanimator_grant_chain_640() {
     let generic = root
         .sub_ability
         .as_deref()
-        .expect("Necromancy: ChangeZone has no GenericEffect sub");
+        .expect("ChangeZone has no GenericEffect sub");
     let Effect::GenericEffect {
         static_abilities,
         duration,
         ..
     } = generic.effect.as_ref()
     else {
-        panic!(
-            "Necromancy: expected GenericEffect, got {:?}",
-            generic.effect
-        );
+        panic!("expected GenericEffect, got {:?}", generic.effect);
     };
     assert_eq!(
         *duration,
         Some(Duration::Permanent),
-        "Necromancy: grant is stamped to Duration::Permanent (CR 611.2a)"
+        "grant is stamped to Duration::Permanent (CR 611.2a)"
     );
-    assert_eq!(static_abilities.len(), 1, "Necromancy: one grant static");
+    assert_eq!(static_abilities.len(), 1, "one grant static");
     let sd = &static_abilities[0];
     assert_eq!(
         sd.affected,
         Some(TargetFilter::OriginalSource),
-        "Necromancy: grant must target OriginalSource (the enchantment), not SelfRef"
+        "grant must target OriginalSource (the enchantment), not SelfRef"
     );
     assert_eq!(
         sd.modifications,
@@ -32900,63 +33033,52 @@ fn necromancy_etb_lowers_to_reanimator_grant_chain_640() {
                 keyword: Keyword::Enchant(TargetFilter::ParentTarget),
             },
         ],
-        "Necromancy: grant modifications (AddSubtype + AddKeyword, no RemoveKeyword)"
+        "grant modifications (AddSubtype + AddKeyword, no RemoveKeyword)"
     );
 
     // Node 3: Attach — SelfRef (the enchantment) onto ParentTarget (the creature).
     let attach = generic
         .sub_ability
         .as_deref()
-        .expect("Necromancy: GenericEffect has no Attach sub");
+        .expect("GenericEffect has no Attach sub");
     let Effect::Attach {
         attachment, target, ..
     } = attach.effect.as_ref()
     else {
-        panic!("Necromancy: expected Attach, got {:?}", attach.effect);
+        panic!("expected Attach, got {:?}", attach.effect);
     };
-    assert_eq!(
-        *attachment,
-        TargetFilter::SelfRef,
-        "Necromancy: attach attachment"
-    );
-    assert_eq!(
-        *target,
-        TargetFilter::ParentTarget,
-        "Necromancy: attach host"
-    );
+    assert_eq!(*attachment, TargetFilter::SelfRef, "attach attachment");
+    assert_eq!(*target, TargetFilter::ParentTarget, "attach host");
 
     // Node 4: CreateDelayedTrigger — WhenLeavesPlayFiltered{SelfRef} -> Sacrifice{ParentTarget}.
     let delayed = attach
         .sub_ability
         .as_deref()
-        .expect("Necromancy: Attach has no CreateDelayedTrigger sub");
+        .expect("Attach has no CreateDelayedTrigger sub");
     let Effect::CreateDelayedTrigger {
         condition, effect, ..
     } = delayed.effect.as_ref()
     else {
-        panic!(
-            "Necromancy: expected CreateDelayedTrigger, got {:?}",
-            delayed.effect
-        );
+        panic!("expected CreateDelayedTrigger, got {:?}", delayed.effect);
     };
     assert_eq!(
         *condition,
         DelayedTriggerCondition::WhenLeavesPlayFiltered {
             filter: TargetFilter::SelfRef,
         },
-        "Necromancy: delayed leaves-battlefield condition on the enchantment (SelfRef)"
+        "delayed leaves-battlefield condition on the enchantment (SelfRef)"
     );
     let Effect::Sacrifice { target, .. } = effect.effect.as_ref() else {
-        panic!("Necromancy: expected Sacrifice, got {:?}", effect.effect);
+        panic!("expected Sacrifice, got {:?}", effect.effect);
     };
     assert_eq!(
         *target,
         TargetFilter::ParentTarget,
-        "Necromancy: sacrifice targets the reanimated creature"
+        "sacrifice targets the reanimated creature"
     );
     assert!(
         delayed.sub_ability.is_none(),
-        "Necromancy: chain ends at the delayed trigger"
+        "chain ends at the delayed trigger"
     );
 }
 
