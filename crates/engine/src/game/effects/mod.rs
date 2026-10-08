@@ -20707,18 +20707,12 @@ fn expand_per_counter(base: &AbilityCost, n: u32) -> AbilityCost {
                     target: TargetFilter::SelfRef,
                 }),
             },
-            // CR 702.24a: Psychic Vortex-class cumulative upkeep repeats "draw a
-            // card" once for every age counter. The scaled N stands for N
-            // repetitions of the one-card instruction, which the cost authority
-            // issues as N separate instructions (CR 121.2a). N stays aggregated
-            // here so the prompt shows the whole cost and the CR 121.2b
-            // choice-time gate measures the whole set. Unlike the `PutCounter`
-            // arm above, the aggregate is never performed as one event.
-            Effect::Draw { count, target } => AbilityCost::EffectCost {
-                effect: Box::new(Effect::Draw {
-                    count: count.scaled_by(n),
-                    target: target.clone(),
-                }),
+            // CR 702.24a: "pay [cost] for each age counter" is N separate payments of the printed draw instruction, so
+            // repetition is the Composite's arity. CR 121.2a: each leg keeps its printed size, so an instruction-level
+            // replacement (Alms Collector) sees that instruction, never the repetition. Unlike the `PutCounter` arm
+            // above, scaling the count would merge N instructions into one.
+            Effect::Draw { .. } => AbilityCost::Composite {
+                costs: vec![base.clone(); n as usize],
             },
             // CR 702.24a: Every age counter requires a separate instance of
             // the fixed mana-producing cost. Combining its fixed color vector
@@ -25470,23 +25464,34 @@ mod tests {
         assert_eq!(amount, QuantityExpr::Fixed { value: 6 });
     }
 
-    /// CR 702.24a: a draw cost keeps its drawer and scales its count by the
-    /// age counters; zero counters still short-circuit to a zero mana cost.
+    /// CR 702.24a + CR 121.2a: a draw cost repeats its printed instruction once per age counter; zero counters still
+    /// short-circuit to a zero mana cost.
     #[test]
-    fn expand_per_counter_draw_scales_count() {
-        let base = AbilityCost::EffectCost {
+    fn expand_per_counter_draw_repeats_the_instruction() {
+        let draw = |value: i32| AbilityCost::EffectCost {
             effect: Box::new(Effect::Draw {
-                count: QuantityExpr::Fixed { value: 1 },
+                count: QuantityExpr::Fixed { value },
                 target: TargetFilter::Controller,
             }),
         };
+        let base = draw(1);
         assert_eq!(
             expand_per_counter(&base, 3),
-            AbilityCost::EffectCost {
-                effect: Box::new(Effect::Draw {
-                    count: QuantityExpr::Fixed { value: 3 },
-                    target: TargetFilter::Controller,
-                }),
+            AbilityCost::Composite {
+                costs: vec![draw(1), draw(1), draw(1)],
+            }
+        );
+        // The instruction keeps its printed size; repetition never scales it.
+        assert_eq!(
+            expand_per_counter(&draw(2), 2),
+            AbilityCost::Composite {
+                costs: vec![draw(2), draw(2)],
+            }
+        );
+        assert_eq!(
+            expand_per_counter(&base, 1),
+            AbilityCost::Composite {
+                costs: vec![draw(1)],
             }
         );
         assert_eq!(

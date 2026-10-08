@@ -2,10 +2,12 @@
 //!
 //! "Cumulative upkeep—Draw a card." CR 702.24a: at the beginning of the
 //! controller's upkeep an age counter goes on the permanent, then the controller
-//! may pay "draw a card" once for each age counter, or sacrifice it. Each payment
-//! is its own one-card draw instruction (CR 121.2a; Alms Collector's ruling: count
-//! the word "draw"). The second ability, "At the beginning of your end step,
-//! sacrifice a land and discard your hand", keeps working.
+//! may pay "draw a card" once for each age counter, or sacrifice it. CR 702.24a
+//! supplies the repetition — one payment of the printed "draw a card" per age
+//! counter — and CR 121.2a governs instruction-level replacement of each such
+//! instruction (Alms Collector's ruling: count the word "draw"). The second
+//! ability, "At the beginning of your end step, sacrifice a land and discard your
+//! hand", keeps working.
 //!
 //! Every row drives the real upkeep trigger through `PayUnlessCost` /
 //! `ChooseReplacement`, and every negative row carries a positive reach guard in
@@ -55,6 +57,13 @@ unless they discard a card.";
 
 const DIVINATION_ORACLE: &str = "Draw two cards.";
 
+/// NOT a printed card: the parser-produced Draw-N cumulative-upkeep base (probe P4), used to pin
+/// instruction size separately from repetition.
+const DRAW_TWO_VORTEX_ORACLE: &str =
+    "Cumulative upkeep\u{2014}Draw two cards. (At the beginning of \
+your upkeep, put an age counter on this permanent, then sacrifice it unless you pay its upkeep \
+cost for each age counter on it.)";
+
 /// Enough cards that every row's draws, and Dredge 5, stay legal.
 const STAGED_LIBRARY: [&str; 12] = [
     "Library 1",
@@ -95,8 +104,7 @@ impl ZoneSizes {
     }
 }
 
-/// The cumulative-upkeep cost after CR 702.24a expansion: "draw a card" `draws`
-/// times, drawn by the controller.
+/// One `draws`-card draw instruction by the controller.
 fn draw_cost(draws: i32) -> AbilityCost {
     AbilityCost::EffectCost {
         effect: Box::new(Effect::Draw {
@@ -106,10 +114,20 @@ fn draw_cost(draws: i32) -> AbilityCost {
     }
 }
 
-/// P0's untap step with Psychic Vortex on the battlefield carrying
-/// `age_counters_before` age counters, P0's library staged with `library`, and
-/// whatever `setup` adds. The upkeep tick adds one more age counter.
-fn vortex_board<Fixture>(
+/// CR 702.24a: the upkeep cost after expansion — the printed `size`-card instruction once per age counter.
+fn upkeep_draw_cost(age_counters: usize, size: i32) -> AbilityCost {
+    AbilityCost::Composite {
+        costs: vec![draw_cost(size); age_counters],
+    }
+}
+
+/// P0's untap step with the cumulative-upkeep enchantment `name` (Oracle text
+/// `oracle`) on the battlefield carrying `age_counters_before` age counters, P0's
+/// library staged with `library`, and whatever `setup` adds. The upkeep tick adds
+/// one more age counter.
+fn upkeep_board<Fixture>(
+    name: &str,
+    oracle: &str,
     age_counters_before: u32,
     library: &[&str],
     setup: impl FnOnce(&mut GameScenario) -> Fixture,
@@ -117,21 +135,34 @@ fn vortex_board<Fixture>(
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::Untap);
     scenario.with_library_top(P0, library);
-    let vortex = scenario
-        .add_enchantment_from_oracle(P0, "Psychic Vortex", PSYCHIC_VORTEX_ORACLE)
-        .id();
+    let enchantment = scenario.add_enchantment_from_oracle(P0, name, oracle).id();
     let fixture = setup(&mut scenario);
     let mut runner = scenario.build();
     if age_counters_before > 0 {
         runner
             .state_mut()
             .objects
-            .get_mut(&vortex)
-            .expect("Psychic Vortex exists")
+            .get_mut(&enchantment)
+            .expect("the cumulative-upkeep enchantment exists")
             .counters
             .insert(CounterType::Age, age_counters_before);
     }
-    (runner, vortex, fixture)
+    (runner, enchantment, fixture)
+}
+
+/// `upkeep_board` with Psychic Vortex itself.
+fn vortex_board<Fixture>(
+    age_counters_before: u32,
+    library: &[&str],
+    setup: impl FnOnce(&mut GameScenario) -> Fixture,
+) -> (GameRunner, ObjectId, Fixture) {
+    upkeep_board(
+        "Psychic Vortex",
+        PSYCHIC_VORTEX_ORACLE,
+        age_counters_before,
+        library,
+        setup,
+    )
 }
 
 /// Advances from the untap step through the cumulative-upkeep trigger. A
@@ -142,19 +173,26 @@ fn advance_through_upkeep(runner: &mut GameRunner) {
     runner.advance_until_stack_empty();
 }
 
-/// Reach guard: the upkeep offered P0 the expanded draw cost.
-fn assert_draw_cost_prompt(runner: &GameRunner, draws: i32) {
+/// Reach guard: the upkeep is waiting on P0's unless payment; returns the offered cost so a test can compare it
+/// after its behavioural rows.
+fn unless_prompt_cost(runner: &GameRunner) -> AbilityCost {
     match &runner.state().waiting_for {
         WaitingFor::UnlessPayment { player, cost, .. } => {
             assert_eq!(*player, P0, "Psychic Vortex's controller pays its upkeep");
-            assert_eq!(
-                *cost,
-                draw_cost(draws),
-                "CR 702.24a: the cost is \"draw a card\" once per age counter"
-            );
+            cost.clone()
         }
         other => panic!("expected Psychic Vortex's cumulative-upkeep prompt, got {other:?}"),
     }
+}
+
+/// Reach guard: the upkeep offered P0 the expanded draw cost (CR 702.24a: the printed instruction once per age
+/// counter).
+fn assert_draw_cost_prompt(runner: &GameRunner, age_counters: usize, size: i32) {
+    assert_eq!(
+        unless_prompt_cost(runner),
+        upkeep_draw_cost(age_counters, size),
+        "CR 702.24a: the printed instruction once per age counter"
+    );
 }
 
 /// CR 118.12: the paid epilogue ran — the cumulative-upkeep ability (whose
@@ -204,7 +242,7 @@ fn paying_draws_a_card_per_age_counter_and_keeps_vortex() {
     for (age_counters_before, draws) in [(1u32, 2usize), (0, 1)] {
         let (mut runner, vortex, ()) = vortex_board(age_counters_before, &STAGED_LIBRARY, |_| ());
         advance_through_upkeep(&mut runner);
-        assert_draw_cost_prompt(&runner, draws as i32);
+        assert_draw_cost_prompt(&runner, draws, 1);
         let before = ZoneSizes::of(&runner, P0);
 
         let result = runner
@@ -235,7 +273,7 @@ fn paying_draws_a_card_per_age_counter_and_keeps_vortex() {
 fn declining_sacrifices_vortex_without_drawing() {
     let (mut runner, vortex, ()) = vortex_board(1, &STAGED_LIBRARY, |_| ());
     advance_through_upkeep(&mut runner);
-    assert_draw_cost_prompt(&runner, 2);
+    assert_draw_cost_prompt(&runner, 2, 1);
     let before = ZoneSizes::of(&runner, P0);
 
     runner
@@ -261,7 +299,7 @@ fn paying_from_a_short_library_keeps_vortex_and_loses_the_game() {
     for (age_counters_before, library) in [(0u32, &[][..]), (1, &["Only Card"][..])] {
         let (mut runner, vortex, ()) = vortex_board(age_counters_before, library, |_| ());
         advance_through_upkeep(&mut runner);
-        assert_draw_cost_prompt(&runner, age_counters_before as i32 + 1);
+        assert_draw_cost_prompt(&runner, age_counters_before as usize + 1, 1);
 
         let result = runner
             .act(GameAction::PayUnlessCost { pay: true })
@@ -329,7 +367,7 @@ fn a_dredge_pause_carries_the_unissued_draw_and_parks_it_again() {
             .id()
     });
     advance_through_upkeep(&mut runner);
-    assert_draw_cost_prompt(&runner, 2);
+    assert_draw_cost_prompt(&runner, 2, 1);
     let before = ZoneSizes::of(&runner, P0);
 
     runner
@@ -397,7 +435,7 @@ fn declining_dredge_on_both_draws_draws_two_cards() {
             .from_oracle_text(STINKWEED_IMP_ORACLE);
     });
     advance_through_upkeep(&mut runner);
-    assert_draw_cost_prompt(&runner, 2);
+    assert_draw_cost_prompt(&runner, 2, 1);
     let before = ZoneSizes::of(&runner, P0);
 
     runner
@@ -435,7 +473,7 @@ fn a_skipped_draw_still_pays_and_the_next_draw_follows() {
         );
     });
     advance_through_upkeep(&mut runner);
-    assert_draw_cost_prompt(&runner, 2);
+    assert_draw_cost_prompt(&runner, 2, 1);
     let before = ZoneSizes::of(&runner, P0);
 
     runner
@@ -486,7 +524,7 @@ fn skipping_every_draw_still_pays_the_cost() {
         );
     });
     advance_through_upkeep(&mut runner);
-    assert_draw_cost_prompt(&runner, 2);
+    assert_draw_cost_prompt(&runner, 2, 1);
     let before = ZoneSizes::of(&runner, P0);
 
     runner
@@ -512,7 +550,7 @@ fn skipping_every_draw_still_pays_the_cost() {
         scenario.add_artifact_from_oracle(P1, "Possessed Portal", POSSESSED_PORTAL_ORACLE);
     });
     advance_through_upkeep(&mut runner);
-    assert_draw_cost_prompt(&runner, 2);
+    assert_draw_cost_prompt(&runner, 2, 1);
     let before = ZoneSizes::of(&runner, P0);
 
     let result = runner
@@ -547,7 +585,7 @@ fn a_skip_inside_an_instruction_finishes_it_before_the_next_instruction() {
         );
     });
     advance_through_upkeep(&mut runner);
-    assert_draw_cost_prompt(&runner, 2);
+    assert_draw_cost_prompt(&runner, 2, 1);
     let before = ZoneSizes::of(&runner, P0);
     assert_eq!(
         before.hand, 0,
@@ -611,7 +649,7 @@ fn a_skip_inside_an_instruction_finishes_it_before_the_next_instruction() {
 fn a_cant_draw_effect_refuses_the_payment_and_sacrifices_vortex() {
     let (mut runner, _vortex, ()) = vortex_board(0, &STAGED_LIBRARY, |_| ());
     advance_through_upkeep(&mut runner);
-    assert_draw_cost_prompt(&runner, 1);
+    assert_draw_cost_prompt(&runner, 1, 1);
 
     for maralen_controller in [P0, P1] {
         let (mut runner, vortex, ()) = vortex_board(0, &STAGED_LIBRARY, |scenario| {
@@ -645,7 +683,7 @@ fn a_cant_draw_effect_arriving_at_the_prompt_refuses_payment() {
     let mut events = Vec::new();
     engine::game::zones::move_to_zone(runner.state_mut(), maralen, Zone::Exile, &mut events);
     advance_through_upkeep(&mut runner);
-    assert_draw_cost_prompt(&runner, 1);
+    assert_draw_cost_prompt(&runner, 1, 1);
 
     engine::game::zones::move_to_zone(runner.state_mut(), maralen, Zone::Battlefield, &mut events);
 
@@ -673,7 +711,7 @@ fn a_per_turn_draw_limit_refuses_two_draws_but_not_one() {
         );
     });
     advance_through_upkeep(&mut runner);
-    assert_draw_cost_prompt(&runner, 1);
+    assert_draw_cost_prompt(&runner, 1, 1);
     let before = ZoneSizes::of(&runner, P0);
     runner
         .act(GameAction::PayUnlessCost { pay: true })
@@ -700,15 +738,24 @@ fn a_per_turn_draw_limit_refuses_two_draws_but_not_one() {
 
 /// CR 702.24a + CR 121.2a (Alms Collector ruling: count the word "draw"): two
 /// age counters mean two instructions to draw one card, never one instruction
-/// to draw two, so Alms Collector ("two or more cards") never applies.
+/// to draw two, so Alms Collector ("two or more cards") never applies. The
+/// Divination cast on the same board is the reach guard that Alms Collector is
+/// live: its one two-card instruction becomes one card for each player.
 #[test]
 fn each_age_counter_is_its_own_one_card_instruction() {
-    let (mut runner, vortex, ()) = vortex_board(1, &STAGED_LIBRARY, |scenario| {
+    let (mut runner, vortex, divination) = vortex_board(1, &STAGED_LIBRARY, |scenario| {
         scenario.with_library_top(P1, &["Opponent 1", "Opponent 2", "Opponent 3"]);
         scenario.add_creature_from_oracle(P1, "Alms Collector", 3, 4, ALMS_COLLECTOR_ORACLE);
+        scenario
+            .add_spell_to_hand_from_oracle(P0, "Divination", false, DIVINATION_ORACLE)
+            .with_mana_cost(ManaCost::Cost {
+                shards: vec![ManaCostShard::Blue],
+                generic: 0,
+            })
+            .id()
     });
     advance_through_upkeep(&mut runner);
-    assert_draw_cost_prompt(&runner, 2);
+    let prompt = unless_prompt_cost(&runner);
     let before = ZoneSizes::of(&runner, P0);
     let opponent_before = ZoneSizes::of(&runner, P1);
 
@@ -725,6 +772,165 @@ fn each_age_counter_is_its_own_one_card_instruction() {
         "Alms Collector must not apply to one-card instructions"
     );
     assert_eq!(zone_of(&runner, vortex), Zone::Battlefield);
+
+    // Reach guard: Alms Collector applies to an ordinary two-card instruction on this board. The paid upkeep
+    // leaves P0 with priority in the upkeep; pass through the draw step to this turn's main phase.
+    for _ in 0..4 {
+        if runner.state().phase == Phase::PreCombatMain {
+            break;
+        }
+        runner.pass_both_players();
+    }
+    assert_eq!(runner.state().phase, Phase::PreCombatMain);
+    runner.state_mut().players[P0.0 as usize]
+        .mana_pool
+        .add(ManaUnit::new(ManaType::Blue, ObjectId(0), false, vec![]));
+    let outcome = runner.cast(divination).resolve();
+    outcome.assert_hand_drawn(P0, 1);
+    outcome.assert_hand_drawn(P1, 1);
+
+    assert_eq!(
+        prompt,
+        upkeep_draw_cost(2, 1),
+        "CR 702.24a: the printed instruction once per age counter"
+    );
+}
+
+/// CR 702.24a + CR 121.2a: instruction size and repetition are independent. A
+/// "Draw two cards." upkeep at two age counters is two two-card instructions,
+/// and Alms Collector applies to each (one card for each player per instruction).
+#[test]
+fn a_draw_two_upkeep_repeats_a_two_card_instruction() {
+    let (mut runner, enchantment, ()) = upkeep_board(
+        "Draw-Two Vortex",
+        DRAW_TWO_VORTEX_ORACLE,
+        1,
+        &STAGED_LIBRARY,
+        |scenario| {
+            scenario.with_library_top(P1, &STAGED_LIBRARY);
+            scenario.add_creature_from_oracle(P1, "Alms Collector", 3, 4, ALMS_COLLECTOR_ORACLE);
+        },
+    );
+    advance_through_upkeep(&mut runner);
+    let prompt = unless_prompt_cost(&runner);
+    let before = ZoneSizes::of(&runner, P0);
+    let opponent_before = ZoneSizes::of(&runner, P1);
+
+    runner
+        .act(GameAction::PayUnlessCost { pay: true })
+        .expect("paying is legal");
+
+    let after = ZoneSizes::of(&runner, P0);
+    let opponent_after = ZoneSizes::of(&runner, P1);
+    assert_eq!(
+        (
+            after.hand - before.hand,
+            opponent_after.hand - opponent_before.hand
+        ),
+        (2, 2),
+        "Alms Collector turns each two-card instruction into one card for each player"
+    );
+    assert_eq!(after.library, before.library - 2);
+    assert_eq!(opponent_after.library, opponent_before.library - 2);
+    assert_eq!(zone_of(&runner, enchantment), Zone::Battlefield);
+
+    assert_eq!(
+        prompt,
+        upkeep_draw_cost(2, 2),
+        "CR 702.24a: the two-card instruction once per age counter"
+    );
+}
+
+/// CR 121.2b: a one-card-per-turn limit forbids a cost that includes one
+/// instruction to draw two cards, even at a single age counter.
+#[test]
+fn a_per_turn_draw_limit_refuses_a_two_card_instruction() {
+    let add_spirit = |scenario: &mut GameScenario| {
+        scenario.add_creature_from_oracle(
+            P1,
+            "Spirit of the Labyrinth",
+            3,
+            1,
+            SPIRIT_OF_THE_LABYRINTH_ORACLE,
+        );
+    };
+
+    // Reach guard: the printed one-card upkeep is offered under the same limit.
+    let (mut runner, _vortex, ()) = vortex_board(0, &STAGED_LIBRARY, add_spirit);
+    advance_through_upkeep(&mut runner);
+    assert_draw_cost_prompt(&runner, 1, 1);
+
+    let (mut runner, enchantment, ()) = upkeep_board(
+        "Draw-Two Vortex",
+        DRAW_TWO_VORTEX_ORACLE,
+        0,
+        &STAGED_LIBRARY,
+        add_spirit,
+    );
+    advance_through_upkeep(&mut runner);
+    assert!(
+        !matches!(runner.state().waiting_for, WaitingFor::UnlessPayment { .. }),
+        "a two-card draw instruction can't be chosen under a one-card limit, got {:?}",
+        runner.state().waiting_for
+    );
+    assert_eq!(zone_of(&runner, enchantment), Zone::Graveyard);
+}
+
+/// CR 702.24a + CR 614.11a + CR 616.1: at three age counters, Dredge pauses each
+/// one-card leg in turn. Each park carries only the legs not yet paid (a
+/// one-leg tail collapses to its leaf); a paused leg's own draw belongs to its
+/// draw frame, never to the parked suffix.
+#[test]
+fn a_dredge_pause_on_each_of_three_legs_parks_only_later_legs() {
+    let (mut runner, vortex, ()) = vortex_board(2, &STAGED_LIBRARY, |scenario| {
+        scenario
+            .add_creature_to_graveyard(P0, "Stinkweed Imp", 1, 2)
+            .from_oracle_text(STINKWEED_IMP_ORACLE);
+    });
+    advance_through_upkeep(&mut runner);
+    let prompt = unless_prompt_cost(&runner);
+    let before = ZoneSizes::of(&runner, P0);
+
+    runner
+        .act(GameAction::PayUnlessCost { pay: true })
+        .expect("paying is legal");
+    let expected_suffixes = [
+        Some(AbilityCost::Composite {
+            costs: vec![draw_cost(1), draw_cost(1)],
+        }),
+        Some(draw_cost(1)),
+        None,
+    ];
+    let mut events = Vec::new();
+    for (leg, expected_suffix) in expected_suffixes.into_iter().enumerate() {
+        assert_replacement_choice(&runner, &format!("Dredge pauses leg {}", leg + 1));
+        assert_eq!(
+            parked_unpaid_suffix(&runner),
+            expected_suffix.map(|cost| UnpaidCostSuffix { payer: P0, cost }),
+            "the park after leg {} carries only the later legs",
+            leg + 1
+        );
+        let result = runner
+            .act(GameAction::ChooseReplacement {
+                index: DECLINE_REPLACEMENT,
+            })
+            .expect("declining Dredge is legal");
+        events.extend(result.events);
+    }
+
+    let after = ZoneSizes::of(&runner, P0);
+    assert_eq!(after.hand, before.hand + 3);
+    assert_eq!(after.library, before.library - 3);
+    assert_eq!(zone_of(&runner, vortex), Zone::Battlefield);
+    assert!(runner.state().pending_cost_move_resume.is_none());
+    assert!(runner.state().active_draw_sequence().is_none());
+    assert!(upkeep_ability_resolved(&events, vortex));
+
+    assert_eq!(
+        prompt,
+        upkeep_draw_cost(3, 1),
+        "CR 702.24a: the printed instruction once per age counter"
+    );
 }
 
 /// CR 121.2a: every instruction gets its own instruction-level replacement
@@ -738,7 +944,7 @@ fn each_instruction_is_consulted_for_instruction_replacements() {
         scenario.add_creature_from_oracle(P0, "Quantum Riddler", 4, 6, QUANTUM_RIDDLER_ORACLE);
     });
     advance_through_upkeep(&mut runner);
-    assert_draw_cost_prompt(&runner, 2);
+    assert_draw_cost_prompt(&runner, 2, 1);
     let before = ZoneSizes::of(&runner, P0);
     assert_eq!(before.hand, 0);
 

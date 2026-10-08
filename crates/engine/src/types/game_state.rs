@@ -7945,7 +7945,7 @@ pub enum PendingCostMoveResume {
     /// upkeep, and the draw cost (Psychic Vortex, Decoy Gambit). The resume reads
     /// `pending_effect` and `trigger_event` to settle the parked payment
     /// instead of orphaning the pending ability, and `unpaid_suffix` to pay the
-    /// part of the cost the pause left unissued. `cost`, `effect_description`
+    /// legs of the cost not yet paid. `cost`, `effect_description`
     /// and `remaining` complete the serialized checkpoint payload, are read on
     /// no resume path, and are carried forward unchanged when the resume parks
     /// again. CR 118.12: BOTH replacement
@@ -7965,9 +7965,10 @@ pub enum PendingCostMoveResume {
         effect_description: Option<String>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         remaining: Vec<PlayerId>,
-        /// CR 702.24a: the instructions of the cost not yet issued when the
-        /// payment paused. `None` when the pause came on the last instruction,
-        /// which is every pause of a cost performed as a single event.
+        /// CR 702.24a + CR 118.12: the legs of the cost not yet paid when the payment paused — a `Composite`
+        /// tail, or its single last leg. `None` when the pause came on the last leg, which is every pause of a
+        /// cost performed as a single event. A leg's own unfinished instruction is owned by the active draw frame
+        /// (CR 614.11a), never by this suffix.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         unpaid_suffix: Option<Box<UnpaidCostSuffix>>,
     },
@@ -8053,7 +8054,7 @@ pub struct RandomDiscardUnlessPaymentResume {
     pub remaining_count: u32,
 }
 
-/// CR 118.12 + CR 702.24a + CR 616.1: the unpaid remainder of an unless
+/// CR 118.12 + CR 702.24a + CR 616.1: the unpaid legs of an unless
 /// effect-cost whose payment paused on a replacement choice, and the payer who
 /// owes it. A remainder is not resumable without its payer, which the parked
 /// unless-payment does not otherwise record. Boxed for the

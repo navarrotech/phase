@@ -14700,12 +14700,10 @@ impl AbilityCost {
     /// - The draw target set is closed to the two context-ref players. An
     ///   object reference never draws, and an announced player target is not a
     ///   cost the payer can carry out without a choice.
-    /// - An effect-cost `Draw { count: N }` is paid as N one-card instructions:
-    ///   the CR 702.24a repetition of "draw a card", each consulted on its own
-    ///   for instruction-level replacements (CR 121.2a). That is exact for every
-    ///   printed draw cost, all of which are "draw a card". A printed multi-card
-    ///   draw cost is a single instruction and would need its instruction size
-    ///   carried separately from the repetition count.
+    /// - An effect-cost `Draw { count: N }` is ONE N-card draw instruction wherever it is paid (CR 121.2 +
+    ///   CR 121.2a: an instruction-level replacement such as Alms Collector sees N). Repetition, such as
+    ///   cumulative upkeep's "for each age counter" (CR 702.24a), is a `Composite` of that instruction, never a
+    ///   scaled count.
     pub fn supports_effect_cost_payment(&self) -> bool {
         let AbilityCost::EffectCost { effect } = self else {
             return false;
@@ -14725,6 +14723,22 @@ impl AbilityCost {
                 target: TargetFilter::Controller | TargetFilter::OriginalController,
             } => !count.is_up_to(),
             _ => false,
+        }
+    }
+
+    /// CR 118.1 + CR 702.24a: a cost every leg of which is a deterministic effect cost
+    /// (`supports_effect_cost_payment`) — the leaf itself, or the `Composite` that `expand_per_counter` builds from an
+    /// effect-cost base. The single resolution payment authority pays it with no prompt; a replacement choice on one
+    /// leg pauses the payment, and the unpaid later legs are paid when it resumes.
+    pub fn supports_deterministic_effect_cost_payment(&self) -> bool {
+        match self {
+            AbilityCost::Composite { costs } => {
+                !costs.is_empty()
+                    && costs
+                        .iter()
+                        .all(Self::supports_deterministic_effect_cost_payment)
+            }
+            leaf => leaf.supports_effect_cost_payment(),
         }
     }
 
@@ -37966,6 +37980,43 @@ mod tests {
             !draw_cost(QuantityExpr::Fixed { value: 1 }, TargetFilter::SelfRef)
                 .supports_cumulative_upkeep_payment()
         );
+    }
+
+    /// CR 118.1 + CR 702.24a: the routing predicate admits a deterministic effect-cost leaf and any non-empty
+    /// `Composite` (nested or not) whose every leg is one; a single unsupported leg refuses the whole.
+    #[test]
+    fn deterministic_effect_cost_composites_are_supported() {
+        let draw = |target: TargetFilter| AbilityCost::EffectCost {
+            effect: Box::new(Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target,
+            }),
+        };
+        let draw_one = draw(TargetFilter::Controller);
+        let composite = |costs: Vec<AbilityCost>| AbilityCost::Composite { costs };
+
+        assert!(draw_one.supports_deterministic_effect_cost_payment());
+        assert!(composite(vec![draw_one.clone(), draw_one.clone()])
+            .supports_deterministic_effect_cost_payment());
+        assert!(
+            composite(vec![draw_one.clone(), composite(vec![draw_one.clone()])])
+                .supports_deterministic_effect_cost_payment()
+        );
+        assert!(!composite(vec![]).supports_deterministic_effect_cost_payment());
+        // A mana leaf is not an effect cost.
+        let mana_one = AbilityCost::Mana {
+            cost: ManaCost::generic(1),
+        };
+        assert!(!composite(vec![draw_one.clone(), mana_one])
+            .supports_deterministic_effect_cost_payment());
+        // One unsupported leg (an announced player target) refuses the whole.
+        assert!(
+            !composite(vec![draw_one.clone(), draw(TargetFilter::Player)])
+                .supports_deterministic_effect_cost_payment()
+        );
+        // CR 702.24a: the printed base is the leaf; the expanded Composite is judged by the routing predicate, not
+        // the synthesis predicate.
+        assert!(!composite(vec![draw_one.clone(), draw_one]).supports_cumulative_upkeep_payment());
     }
 
     #[test]
