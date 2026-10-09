@@ -242,8 +242,12 @@ pub(crate) fn push_copy_to_stack(
     // CR 707.10: Copying a spell on the stack is not casting it. A copied
     // carrier must not inherit the original spell's cast coordinate.
     if matches!(entry.kind, StackEntryKind::Spell { .. }) {
+        // CR 707.10 + CR 400.7: a copy is a new spell, so it gets its own
+        // identity rather than the original's.
+        let announcement = state.mint_spell_announcement();
         if let Some(object) = state.objects.get_mut(&entry.id) {
             object.cast_occurrence = None;
+            object.spell_announcement = Some(announcement);
         }
         if let Some(ability) = entry.ability_mut() {
             ability.set_cast_occurrence_recursive(None);
@@ -298,11 +302,20 @@ fn journal_stack_push(
 ) {
     let resulting_position = state.stack.len();
     let cause = state.current_or_begin_rules_execution_node();
+    let spell_announcement = matches!(entry.kind, StackEntryKind::Spell { .. })
+        .then(|| {
+            state
+                .objects
+                .get(&entry.id)
+                .and_then(|obj| obj.spell_announcement)
+        })
+        .flatten();
     let command = ResolvedStackPushCommand {
         entry: Box::new(entry.clone()),
         trigger_firing,
         origin,
         resulting_position,
+        spell_announcement,
         cause,
     };
     state
@@ -365,6 +378,13 @@ pub fn apply_resolved_stack_push(
     state.stack.push_back(command.entry.as_ref().clone());
     if let Some(firing) = command.trigger_firing {
         state.stack_trigger_firings.insert(command.entry.id, firing);
+    }
+    // CR 601.2a + CR 707.10: install the recorded spell identity; never remint.
+    if let Some(announcement) = command.spell_announcement {
+        if let Some(obj) = state.objects.get_mut(&command.entry.id) {
+            obj.spell_announcement = Some(announcement);
+        }
+        state.next_spell_announcement = state.next_spell_announcement.max(announcement.0);
     }
     Ok(())
 }
@@ -1826,6 +1846,13 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
             if ability.controller != live_controller {
                 ability.set_controller_recursive(live_controller);
             }
+        }
+    }
+
+    // CR 612.1 + CR 608.2b + CR 113.1c: a text change on a spell applies before the legality recheck and target binding below, and an ability on the stack is not a spell so only spell entries are rewritten.
+    if is_spell {
+        if let Some(ability) = ability.as_mut() {
+            super::text_substitution::restamp_resolving_spell_text(state, entry.id, ability);
         }
     }
 
@@ -6666,6 +6693,7 @@ mod tests {
             target: TargetRef::Object(ObjectId(999)), // target doesn't matter for this test
             source_id: spell_id,
             source_controller: PlayerId(0),
+            targeter: None,
         };
 
         // Build a triggered ability that would want to resolve TriggeringSpellController
