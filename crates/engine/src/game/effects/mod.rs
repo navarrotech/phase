@@ -33,8 +33,8 @@ use crate::types::game_state::{
     PendingContinuation, PendingCostMoveResume, PendingDiscardBatchCompletion,
     PendingPlayerScopeLinkedExile, PendingPlayerScopeSacrificeChoice,
     PendingPlayerScopeSacrificeCompletion, PendingPlayerScopeSacrificeFollowUp,
-    RepeatUntilStopWitness, ResolutionOptionalPaymentOption, ReturnResultOccurrenceId, WaitingFor,
-    ZoneChangeRecord, ZoneOpponentChooserPurpose,
+    RepeatUntilStopWitness, ResolutionOptionalPaymentOption, ResolutionPaymentOrigin,
+    ReturnResultOccurrenceId, WaitingFor, ZoneChangeRecord, ZoneOpponentChooserPurpose,
 };
 use crate::types::identifiers::{ObjectId, ObjectIncarnationRef, TrackedSetId};
 use crate::types::mana::ManaCost;
@@ -1236,6 +1236,7 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
             attachment_remainder: _,
             player_scope_linked_exile,
             player_scope_queue_end,
+            head_payment_origin,
         } = cont;
         debug_assert!(
             pending_return_result_producer.is_none(),
@@ -1280,9 +1281,16 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
                     // CR 608.2c: Preserve the completed result when pruning resumes at an independent sibling.
                     remaining.context.forwarded_result_context =
                         chain.context.forwarded_result_context.clone();
+                    // CR 118.12 + CR 608.2c: the latch belongs to the head; it
+                    // travels into the pruned chain only when the head survives
+                    // the prune (it is then `remaining`'s first node).
+                    if !effect_chain_depends_on_missing_forward_result(&chain.effect) {
+                        state.resolving_head_payment_origin = head_payment_origin;
+                    }
                     let _ = resolve_ability_chain(state, &remaining, events, 1);
                 }
             } else {
+                state.resolving_head_payment_origin = head_payment_origin;
                 let _ = resolve_ability_chain(state, &chain, events, 1);
             }
         }
@@ -1295,6 +1303,7 @@ pub(crate) fn drain_pending_continuation(state: &mut GameState, events: &mut Vec
         let completed_scope = std::mem::take(&mut state.resolving_player_scope_linked_exile);
         state.resolving_player_scope_linked_exile = previous_scope;
         state.resolving_continuation_attach_host = None;
+        state.resolving_head_payment_origin = ResolutionPaymentOrigin::FreshChoice;
         if !waits_for_resolution_choice(&state.waiting_for)
             && state.active_ability_continuation().is_none()
         {
@@ -2783,7 +2792,12 @@ pub(crate) fn active_player_action_completion_requires(
 }
 
 fn prepend_to_pending_continuation(state: &mut GameState, head: ResolvedAbility) {
-    prepend_to_pending_continuation_with_producer(state, head, None);
+    prepend_to_pending_continuation_with_producer(
+        state,
+        head,
+        None,
+        ResolutionPaymentOrigin::FreshChoice,
+    );
 }
 
 fn prepend_to_pending_continuation_with_producer(
@@ -2793,10 +2807,12 @@ fn prepend_to_pending_continuation_with_producer(
         ReturnResultOccurrenceId,
         crate::types::ability::ReturnResultId,
     )>,
+    head_payment_origin: ResolutionPaymentOrigin,
 ) {
     let make_pending = |state: &GameState, chain: Box<ResolvedAbility>| {
         let mut pending = PendingContinuation::new(chain, state);
         pending.pending_return_result_producer = pending_return_result_producer;
+        pending.head_payment_origin = head_payment_origin;
         pending
     };
     if state
@@ -2818,6 +2834,23 @@ fn prepend_to_pending_continuation_with_producer(
         return;
     }
 
+    // CR 118.12 + CR 608.2c: a latched record's head is a choice already made,
+    // bound to that head alone. Splicing a later instruction ahead of it would
+    // move the latch onto that instruction (or re-gate the latched head as a
+    // tail node). Park the new head as its own record instead: it still
+    // resolves first, and the latched record drains right after it, so the
+    // order written is unchanged.
+    if state
+        .active_ability_continuation()
+        .is_some_and(|existing| !existing.head_payment_origin.is_fresh_choice())
+    {
+        tracing::debug!(
+            "parking a later instruction above a latched PayCost remainder instead of splicing"
+        );
+        state.park_ability_continuation(make_pending(state, Box::new(head)));
+        return;
+    }
+
     if state.active_ability_continuation().is_some() {
         let frame = state
             .take_active_ability_continuation()
@@ -2836,6 +2869,8 @@ fn prepend_to_pending_continuation_with_producer(
             attachment_remainder,
             player_scope_linked_exile,
             player_scope_queue_end,
+            // The existing record is fresh: a latched one was parked above.
+            head_payment_origin: _,
         } = existing;
         assert!(
             pending_return_result_producer.is_none() || existing_return_result_producer.is_none(),
@@ -2859,6 +2894,9 @@ fn prepend_to_pending_continuation_with_producer(
                 attachment_remainder,
                 player_scope_linked_exile,
                 player_scope_queue_end,
+                // CR 118.12: the latch belongs to the chain's head, which is
+                // now the spliced instruction.
+                head_payment_origin,
             },
             choose_zone_trigger_context: frame.choose_zone_trigger_context,
         });
@@ -2909,6 +2947,9 @@ pub(crate) fn prepend_remaining_pay_cost_continuation(
     remaining_payment.controller = payer;
     remaining_payment.optional = false;
     remaining_payment.optional_for = None;
+    // CR 118.12: the root's condition held when payment began; the remainder is
+    // unconditional, so it is the first instruction the drained chain resolves.
+    remaining_payment.condition = None;
     remaining_payment.effect = Effect::PayCost {
         cost: remaining_cost,
         scale: None,
@@ -2927,8 +2968,14 @@ pub(crate) fn prepend_remaining_pay_cost_continuation(
 
     // CR 118.12 + CR 608.2c: when payment pauses before later sub-costs are
     // paid, resume by paying those costs before following the original
-    // sub-ability chain.
-    prepend_to_pending_continuation(state, remaining_payment);
+    // sub-ability chain, through the authority's latched entry — the choice to
+    // pay was already made.
+    prepend_to_pending_continuation_with_producer(
+        state,
+        remaining_payment,
+        None,
+        ResolutionPaymentOrigin::LatchedSuffix,
+    );
 }
 
 /// CR 118.12 + CR 608.2c: A deferred life-payment root resumes after the
@@ -2944,13 +2991,23 @@ pub(crate) fn prepend_remaining_pay_cost_before_parked_rider(
     remaining_payment.controller = payer;
     remaining_payment.optional = false;
     remaining_payment.optional_for = None;
+    // CR 118.12: the root's condition held when payment began; the remainder is
+    // unconditional, so it is the first instruction the drained chain resolves.
+    remaining_payment.condition = None;
     remaining_payment.effect = Effect::PayCost {
         cost: remaining_cost,
         scale: None,
         payer: TargetFilter::Controller,
     };
     remaining_payment.sub_ability = None;
-    prepend_to_pending_continuation(state, remaining_payment);
+    // CR 118.12: the unpaid suffix resumes through the authority's latched
+    // entry — the choice to pay was already made.
+    prepend_to_pending_continuation_with_producer(
+        state,
+        remaining_payment,
+        None,
+        ResolutionPaymentOrigin::LatchedSuffix,
+    );
 }
 
 pub(crate) fn parent_referent_context_from_events(
@@ -18443,6 +18500,7 @@ fn resolve_chain_body(
                     state,
                     sub_clone,
                     pending_return_result_producer,
+                    ResolutionPaymentOrigin::FreshChoice,
                 );
             }
             // CR 701.57c + CR 608.2h: an unconditional Discover follow-up stashed

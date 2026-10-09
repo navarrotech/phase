@@ -2671,6 +2671,37 @@ pub struct PendingContinuation {
     /// placeholder `chain` is never resolved when this is set.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub(crate) player_scope_queue_end: bool,
+    /// CR 118.12: how this chain's head `Effect::PayCost` enters the payment
+    /// authority. `LatchedSuffix` only for the unpaid remainder that
+    /// `effects::prepend_remaining_pay_cost_continuation` /
+    /// `prepend_remaining_pay_cost_before_parked_rider` queue after a paused
+    /// payment, and only for the head: `drain_pending_continuation` hands it to
+    /// `GameState::resolving_head_payment_origin`, and `effects::pay::resolve`
+    /// takes it once. Legacy saves default to `FreshChoice`.
+    #[serde(
+        default,
+        skip_serializing_if = "ResolutionPaymentOrigin::is_fresh_choice"
+    )]
+    pub(crate) head_payment_origin: ResolutionPaymentOrigin,
+}
+
+/// CR 118.12 + CR 614.17b: how a resolution-time payment enters the single
+/// payment authority. A fresh payment is the payer's choice to pay, which a
+/// cost including an impossible event can't be (CR 614.17b). A latched payment
+/// resumes legs of a choice already made: a later can't-effect cannot unmake
+/// it (CR 614.17a), and it still clamps each event as it happens (CR 118.11).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ResolutionPaymentOrigin {
+    #[default]
+    FreshChoice,
+    LatchedSuffix,
+}
+
+impl ResolutionPaymentOrigin {
+    /// Serde skip predicate: a fresh head is the default and is not serialized.
+    pub(crate) fn is_fresh_choice(&self) -> bool {
+        matches!(self, Self::FreshChoice)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2716,6 +2747,7 @@ impl PendingContinuation {
             attachment_remainder: None,
             player_scope_linked_exile: state.resolving_player_scope_linked_exile.clone(),
             player_scope_queue_end: false,
+            head_payment_origin: ResolutionPaymentOrigin::FreshChoice,
         }
     }
 
@@ -2740,6 +2772,7 @@ impl PendingContinuation {
             attachment_remainder: None,
             player_scope_linked_exile: state.resolving_player_scope_linked_exile.clone(),
             player_scope_queue_end: false,
+            head_payment_origin: ResolutionPaymentOrigin::FreshChoice,
         }
     }
 }
@@ -21483,6 +21516,12 @@ declare_game_state! {
     #[serde(skip)]
     pub resolving_continuation_attach_host: Option<AttachTarget>,
 
+    /// Execution-local view of the drained continuation's `head_payment_origin`,
+    /// or of a replayed transaction root (`payment_transaction::replay`). Taken
+    /// once by `effects::pay::resolve`; never serialized.
+    #[serde(skip)]
+    pub(crate) resolving_head_payment_origin: ResolutionPaymentOrigin,
+
     /// Execution-local view of the active generated player-scope continuation.
     /// The serialized authority lives on `PendingContinuation`; every pause
     /// re-parks it before control returns to callers.
@@ -27721,6 +27760,7 @@ impl GameState {
             payment_transaction_replay: false,
             payment_transaction_just_handled: false,
             resolving_continuation_attach_host: None,
+            resolving_head_payment_origin: ResolutionPaymentOrigin::FreshChoice,
             resolving_player_scope_linked_exile: None,
             merged_card_component_route: None,
             resolution_coin_flip: None,
@@ -30262,6 +30302,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         payment_transaction_replay: _,
         payment_transaction_just_handled: _,
         resolving_continuation_attach_host: _,
+        resolving_head_payment_origin: _,
         resolving_player_scope_linked_exile: _,
         merged_card_component_route: _,
         resolution_coin_flip: _,
@@ -44046,6 +44087,47 @@ mod tests {
             deserialized.active_spend_only_on_x_count, None,
             "deserialized active_spend_only_on_x_count must be None"
         );
+    }
+
+    /// CR 118.12: a continuation record without `head_payment_origin` (every save written before the field
+    /// existed, and every fresh record, which skips it) deserializes as a fresh choice; a latched record
+    /// round-trips latched.
+    ///
+    /// Revert probe: dropping `skip_serializing_if` writes the key for a fresh record; dropping
+    /// `serde(default)` fails to read the legacy record.
+    #[test]
+    fn a_legacy_pending_continuation_without_a_payment_origin_is_fresh() {
+        let state = GameState::new_two_player(7);
+        let chain = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                player: TargetFilter::Controller,
+            },
+            Vec::new(),
+            ObjectId(1),
+            PlayerId(0),
+        );
+        let fresh = PendingContinuation::new(Box::new(chain), &state);
+        let fresh_json = serde_json::to_value(&fresh).unwrap();
+        assert!(
+            fresh_json.get("head_payment_origin").is_none(),
+            "a fresh head is the default and is not serialized: {fresh_json}"
+        );
+        let legacy: PendingContinuation = serde_json::from_value(fresh_json).unwrap();
+        assert_eq!(
+            legacy.head_payment_origin,
+            ResolutionPaymentOrigin::FreshChoice
+        );
+
+        let mut latched = fresh;
+        latched.head_payment_origin = ResolutionPaymentOrigin::LatchedSuffix;
+        let latched_json = serde_json::to_string(&latched).unwrap();
+        let restored: PendingContinuation = serde_json::from_str(&latched_json).unwrap();
+        assert_eq!(
+            restored.head_payment_origin,
+            ResolutionPaymentOrigin::LatchedSuffix
+        );
+        assert_eq!(restored, latched);
     }
 }
 

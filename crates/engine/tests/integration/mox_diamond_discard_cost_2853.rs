@@ -14,15 +14,19 @@
 //!
 //! CR 614.12a / CR 614.12: a declined/unpayable alternative routes to the
 //! owner's graveyard; CR 701.9a: discarding moves a card from hand to graveyard.
+//!
+//! CR 614.17b + CR 118.12: a MayCost that includes an impossible draw is
+//! refused at the accept; a resumed paid remainder is not re-gated.
 
 use engine::game::effects::change_zone::resolve;
-use engine::game::scenario::{GameScenario, P0};
+use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{
-    AbilityCost, QuantityExpr, ReplacementMode, ResolvedAbility, TargetFilter,
+    AbilityCost, Effect, QuantityExpr, ReplacementMode, ResolvedAbility, TargetFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::game_state::WaitingFor;
 use engine::types::identifiers::ObjectId;
+use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
 
@@ -326,4 +330,206 @@ fn may_cost_discard_choice_resume_pays_remaining_composite_suffix() {
         Zone::Battlefield,
         "Mox Diamond enters only after all composite cost components are paid"
     );
+}
+
+/// Maralen of the Mornsong, verbatim Oracle text: a CR 121.3 can't-draw effect.
+const MARALEN_ORACLE: &str = "Players can't draw cards.\nAt the beginning of each player's draw \
+step, that player loses 3 life, searches their library for a card, puts it into their hand, then shuffles.";
+
+/// P0's library: draw outcomes are read on its size (6 = no card drawn).
+const STAGED_LIBRARY: [&str; 6] = ["L1", "L2", "L3", "L4", "L5", "L6"];
+
+/// One one-card draw instruction by the controller.
+fn draw_cost(cards: i32) -> AbilityCost {
+    AbilityCost::EffectCost {
+        effect: Box::new(Effect::Draw {
+            count: QuantityExpr::Fixed { value: cards },
+            target: TargetFilter::Controller,
+        }),
+    }
+}
+
+/// When Maralen joins the board in a MayCost draw row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MaralenArrival {
+    Never,
+    BeforeTheAccept,
+    AtTheDiscardChoice,
+}
+
+/// A Mox Diamond whose MayCost is `Composite[<parsed discard>, Draw 1]` (the composite precedent above,
+/// with its PayLife leg swapped for a draw leg), two Forests in P0's hand, and P0's library staged. With
+/// `AtTheDiscardChoice`, Maralen is built and moved to exile so the caller can return her mid-payment.
+/// Returns the runner, Mox Diamond, both Forests and Maralen (if built).
+fn mox_with_a_draw_leg(
+    arrival: MaralenArrival,
+) -> (GameRunner, ObjectId, ObjectId, ObjectId, Option<ObjectId>) {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_library_top(P0, &STAGED_LIBRARY);
+    let mox = scenario
+        .add_creature_to_hand(P0, "Mox Diamond", 0, 0)
+        .as_artifact()
+        .from_oracle_text(MOX_DIAMOND_ORACLE)
+        .id();
+    let forest_a = scenario.add_land_to_hand(P0, "Forest").id();
+    let forest_b = scenario.add_land_to_hand(P0, "Forest").id();
+    let maralen = (arrival != MaralenArrival::Never).then(|| {
+        scenario
+            .add_creature_from_oracle(P1, "Maralen of the Mornsong", 2, 3, MARALEN_ORACLE)
+            .id()
+    });
+    let mut runner = scenario.build();
+    engine::game::layers::evaluate_layers(runner.state_mut());
+    if let (MaralenArrival::AtTheDiscardChoice, Some(maralen)) = (arrival, maralen) {
+        engine::game::zones::move_to_zone(
+            runner.state_mut(),
+            maralen,
+            Zone::Exile,
+            &mut Vec::new(),
+        );
+    }
+
+    let obj = runner.state_mut().objects.get_mut(&mox).unwrap();
+    let replacement_index = obj
+        .replacement_definitions
+        .iter_unchecked()
+        .position(|definition| matches!(definition.mode, ReplacementMode::MayCost { .. }))
+        .expect("Mox Diamond replacement should parse as MayCost");
+    let replacement = &mut obj.replacement_definitions[replacement_index];
+    let (discard_cost, decline) = match &replacement.mode {
+        ReplacementMode::MayCost { cost, decline } => (cost.clone(), decline.clone()),
+        other => panic!("expected MayCost, got {other:?}"),
+    };
+    replacement.mode = ReplacementMode::MayCost {
+        cost: AbilityCost::Composite {
+            costs: vec![discard_cost, draw_cost(1)],
+        },
+        decline,
+    };
+    (runner, mox, forest_a, forest_b, maralen)
+}
+
+fn library_size(runner: &GameRunner) -> usize {
+    runner.state().players[0].library.len()
+}
+
+/// CR 614.12a + CR 118.12: control row for the draw-leg MayCost — with no can't-draw effect, the accept
+/// pays the discard leg (after its choice) and then the draw leg, and Mox Diamond enters.
+#[test]
+fn a_composite_may_cost_with_a_draw_leg_pays_every_leg() {
+    let (mut runner, mox, forest_a, _forest_b, _) = mox_with_a_draw_leg(MaralenArrival::Never);
+    enter_via_change_zone(runner.state_mut(), mox);
+    runner
+        .act(GameAction::ChooseReplacement { index: 0 })
+        .expect("accepting the composite MayCost is legal");
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::DiscardChoice { .. }
+    ));
+    runner
+        .act(GameAction::SelectCards {
+            cards: vec![forest_a],
+        })
+        .expect("selecting the land resumes the remaining draw leg");
+    assert_eq!(runner.state().objects[&mox].zone, Zone::Battlefield);
+    assert_eq!(runner.state().objects[&forest_a].zone, Zone::Graveyard);
+    assert_eq!(
+        library_size(&runner),
+        STAGED_LIBRARY.len() - 1,
+        "the draw leg drew a card"
+    );
+}
+
+/// CR 614.17b + CR 121.3: accepting is the choice to pay, and a cost that includes a draw Maralen forbids
+/// can't be chosen. The accept is refused as a whole before any leg is paid, so the "If you don't" branch
+/// puts Mox Diamond into its owner's graveyard.
+///
+/// Revert probe: passing `LatchedSuffix` from the accept branch skips the fresh gate, and the accept raises
+/// a `DiscardChoice`.
+#[test]
+fn a_may_cost_including_an_impossible_draw_is_refused_at_accept() {
+    let (mut runner, mox, forest_a, forest_b, _) =
+        mox_with_a_draw_leg(MaralenArrival::BeforeTheAccept);
+    enter_via_change_zone(runner.state_mut(), mox);
+    // Reach guard: the MayCost replacement was offered.
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::ReplacementChoice { .. }
+    ));
+
+    runner
+        .act(GameAction::ChooseReplacement { index: 0 })
+        .expect("accepting resolves");
+
+    assert!(
+        !matches!(runner.state().waiting_for, WaitingFor::DiscardChoice { .. }),
+        "no leg of a refused choice is started"
+    );
+    assert_eq!(
+        runner.state().objects[&mox].zone,
+        Zone::Graveyard,
+        "the refused cost routes Mox Diamond to its owner's graveyard"
+    );
+    assert_eq!(runner.state().objects[&forest_a].zone, Zone::Hand);
+    assert_eq!(runner.state().objects[&forest_b].zone, Zone::Hand);
+    assert_eq!(library_size(&runner), STAGED_LIBRARY.len());
+    assert!(runner.state().pending_replacement.is_none());
+}
+
+/// CR 118.12 + CR 614.17a + CR 118.11: Maralen arrives after the accept, while the discard leg's choice is
+/// open. The accepted MayCost latched the choice, so its remaining draw leg is paid without re-gating —
+/// clamped as it happens — and Mox Diamond enters.
+///
+/// Revert probe: passing `FreshChoice` from the resume branch re-gates the draw leg, which is refused, and
+/// Mox Diamond goes to its owner's graveyard.
+#[test]
+fn a_may_cost_draw_leg_resumed_after_a_discard_choice_stays_paid() {
+    let (mut runner, mox, forest_a, forest_b, maralen) =
+        mox_with_a_draw_leg(MaralenArrival::AtTheDiscardChoice);
+    enter_via_change_zone(runner.state_mut(), mox);
+    runner
+        .act(GameAction::ChooseReplacement { index: 0 })
+        .expect("accepting is legal while no can't-draw effect exists");
+
+    // Reach guards: the resume will enter the paid-cost branch carrying the draw leg.
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::DiscardChoice { .. }
+    ));
+    let pending = runner
+        .state()
+        .pending_replacement
+        .as_ref()
+        .expect("the accepted MayCost is parked at the discard choice");
+    assert!(pending.may_cost_paid);
+    assert_eq!(pending.may_cost_remaining, Some(draw_cost(1)));
+
+    let maralen = maralen.expect("Maralen was built for this row");
+    engine::game::zones::move_to_zone(
+        runner.state_mut(),
+        maralen,
+        Zone::Battlefield,
+        &mut Vec::new(),
+    );
+    runner
+        .act(GameAction::SelectCards {
+            cards: vec![forest_a],
+        })
+        .expect("selecting the land resumes the remaining draw leg");
+
+    assert_eq!(
+        runner.state().objects[&mox].zone,
+        Zone::Battlefield,
+        "the latched remainder is paid"
+    );
+    assert_eq!(runner.state().objects[&forest_a].zone, Zone::Graveyard);
+    assert_eq!(runner.state().objects[&forest_b].zone, Zone::Hand);
+    assert_eq!(
+        library_size(&runner),
+        STAGED_LIBRARY.len(),
+        "the draw leg was paid and clamped by Maralen"
+    );
+    assert!(runner.state().pending_replacement.is_none());
+    assert!(!runner.state().replacement_may_cost_paused);
 }

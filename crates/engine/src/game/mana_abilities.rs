@@ -3638,12 +3638,14 @@ pub(crate) fn resume_mana_ability_root(
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
     match resume {
+        // CR 118.12 + CR 605.3b: the paused root resumes a choice its fresh
+        // entry already gated.
         ManaAbilityResume::EffectPayCost {
             payer,
             return_to,
             ability,
             cost,
-        } => match super::costs::pay_ability_cost_for_resolution(
+        } => match super::costs::resume_ability_cost_for_resolution(
             state,
             payer,
             cost.as_ref(),

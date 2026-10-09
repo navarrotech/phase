@@ -697,6 +697,73 @@ fn a_cant_draw_effect_arriving_at_the_prompt_refuses_payment() {
     assert_eq!(zone_of(&runner, vortex), Zone::Graveyard);
 }
 
+/// CR 118.12 + CR 614.17a + CR 118.11: a can't-draw effect that arrives after P0 chose to pay does not unpay
+/// the choice. The parked suffix resumes through the authority's latched entry: each remaining draw is
+/// clamped as it happens, the upkeep settles paid, and Psychic Vortex stays.
+///
+/// Revert probe: resuming the suffix through the fresh entry fails it under Maralen, which trips the resume
+/// root's "a resumed unless-cost suffix failed at resolution" `debug_assert!`.
+#[test]
+fn a_cant_draw_effect_arriving_mid_payment_does_not_unpay_the_chosen_upkeep() {
+    let (mut runner, vortex, maralen) = vortex_board(1, &STAGED_LIBRARY, |scenario| {
+        scenario
+            .add_creature_to_graveyard(P0, "Stinkweed Imp", 1, 2)
+            .from_oracle_text(STINKWEED_IMP_ORACLE);
+        scenario
+            .add_creature_from_oracle(P0, "Maralen of the Mornsong", 2, 3, MARALEN_ORACLE)
+            .id()
+    });
+    let mut events = Vec::new();
+    engine::game::zones::move_to_zone(runner.state_mut(), maralen, Zone::Exile, &mut events);
+    advance_through_upkeep(&mut runner);
+    assert_draw_cost_prompt(&runner, 2, 1);
+    let before = ZoneSizes::of(&runner, P0);
+
+    let mut settled_events = runner
+        .act(GameAction::PayUnlessCost { pay: true })
+        .expect("paying is legal while no can't-draw effect exists")
+        .events;
+    assert_replacement_choice(&runner, "Dredge must pause the first draw instruction");
+    // Reach guard: the second instruction is parked as the latched suffix.
+    assert_eq!(
+        parked_unpaid_suffix(&runner),
+        Some(UnpaidCostSuffix {
+            payer: P0,
+            cost: draw_cost(1),
+        })
+    );
+
+    // Maralen arrives after the choice to pay was made.
+    engine::game::zones::move_to_zone(runner.state_mut(), maralen, Zone::Battlefield, &mut events);
+    for _ in 0..3 {
+        if !matches!(
+            runner.state().waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ) {
+            break;
+        }
+        let result = runner
+            .act(GameAction::ChooseReplacement {
+                index: DECLINE_REPLACEMENT,
+            })
+            .expect("declining Dredge is legal");
+        settled_events.extend(result.events);
+    }
+
+    assert_eq!(
+        zone_of(&runner, vortex),
+        Zone::Battlefield,
+        "the upkeep was paid"
+    );
+    assert!(runner.state().pending_cost_move_resume.is_none());
+    assert!(upkeep_ability_resolved(&settled_events, vortex));
+    assert_eq!(
+        ZoneSizes::of(&runner, P0).hand,
+        before.hand,
+        "every draw after Maralen arrived is clamped"
+    );
+}
+
 /// CR 121.2b: a one-card-per-turn limit forbids paying a cost that includes
 /// drawing two cards, but not one that includes drawing one.
 #[test]

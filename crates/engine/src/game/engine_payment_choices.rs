@@ -1115,6 +1115,8 @@ pub(super) fn handle_unless_payment(
     // mirroring the CR 119.8 analogue (`life_costs::can_pay_life_cost` is the
     // choice-time half; `PayLifeCostResult::Prohibited` is the payment-time half).
     // Only the pay branch is refused; `PayUnlessCost { pay: false }` stays legal.
+    // The authority's fresh entry re-asks the same question on the same cost;
+    // for every arm below it is an idempotent backstop.
     if pay
         && costs::resolution_cost_includes_impossible_event(
             state,
@@ -2056,6 +2058,15 @@ pub(crate) fn finish_successful_unless_payment(
 /// CR 118.12 + CR 605.3b + CR 616.1: Continue an unless payment after its
 /// leading mana component was committed and a Phyrexian-style life replacement
 /// finished. The exact suffix remains a payment, not a completed unless cost.
+///
+/// CR 118.12: a latched resume by rule. It re-enters `handle_unless_payment`
+/// with the suffix after the paid mana prefix of the whole unless cost. That
+/// function's entry re-check and the authority's fresh entry ask the same
+/// CR 614.17b question, which can answer `true` only for a draw or counter leg.
+/// No admitted unless cost puts a draw leg after a mana leaf
+/// (`supports_deterministic_effect_cost_payment`), and no printed or
+/// `expand_per_counter`-synthesized mana-led unless cost carries a counter leg,
+/// so fresh and latched coincide on every shape that reaches here.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn continue_unless_payment_after_paid_mana_prefix(
     state: &mut GameState,
@@ -2525,15 +2536,15 @@ pub(super) fn resume_ward_sacrifice_payment(
 ///
 /// A draw leg parks only for a genuine CR 614.1 replacement on one of its draws: Dredge, an optional skip
 /// (CR 614.1b), or a CR 616.1 ordering. A can't-draw or per-turn draw limit is a static clamp that
-/// `draw::allowed_draw_count` applies to each draw and that the unless paths refuse at choice time through
-/// `costs::resolution_cost_includes_impossible_event` (every drawer's total across the cost's legs), so it
-/// never parks here.
+/// `draw::allowed_draw_count` applies to each draw and that the authority's fresh entry refuses at choice time
+/// through `costs::resolution_cost_includes_impossible_event` (every drawer's total across the cost's legs), so
+/// it never parks here.
 ///
 /// CR 702.24a: each age counter's instruction is a `Composite` leg. A pause leaves the later legs unpaid; they
-/// travel in `unpaid_suffix` with their payer, and this root pays them through the single cost authority,
-/// parking again, with the checkpoint payload carried forward unchanged, if a later leg pauses in turn. The
-/// paused leg's own remaining draws belong to its active draw frame (CR 614.11a), never to the suffix. It
-/// calls the authority directly rather than re-entering `handle_unless_payment`, whose live CR 614.17b
+/// travel in `unpaid_suffix` with their payer, and this root pays them through the authority's latched entry
+/// (`costs::resume_ability_cost_for_resolution`), parking again, with the checkpoint payload carried forward
+/// unchanged, if a later leg pauses in turn. The paused leg's own remaining draws belong to its active draw
+/// frame (CR 614.11a), never to the suffix. It calls the authority directly rather than re-entering `handle_unless_payment`, whose live CR 614.17b
 /// re-check would re-gate a choice CR 118.12 has already latched.
 ///
 /// CR 614.11a: by the time this root runs, the paused instruction has completed.
@@ -2596,7 +2607,7 @@ pub(super) fn resume_counter_addition_unless_payment(
             payer,
             cost: suffix_cost,
         } = *suffix;
-        match costs::pay_ability_cost_for_resolution(
+        match costs::resume_ability_cost_for_resolution(
             state,
             payer,
             &suffix_cost,
@@ -2619,9 +2630,11 @@ pub(super) fn resume_counter_addition_unless_payment(
                     });
                 return Ok(state.waiting_for.clone());
             }
-            // The admitted shapes' only `Failed` is the activation-scoped CR
-            // 614.17b gate, so a resolution-scope suffix cannot fail. Should one,
-            // the choice CR 118.12 latched still stands: settle PAID, loudly.
+            // The latched entry never applies the CR 614.17b choice gate, so a
+            // draw leg never fails here; each draw is still clamped as it happens
+            // (CR 118.11 + CR 614.17a). Counter legs keep their in-arm CR 614.17a
+            // refusal. Should a leg fail, the choice CR 118.12 latched still
+            // stands: settle PAID, loudly.
             PaymentOutcome::Failed { reason } => {
                 debug_assert!(
                     false,
