@@ -106,6 +106,11 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
+ *  103 — game_setup and state_update carry GameState, whose parked unless-cost
+ *       resume now carries its unpaid legs (unpaid_suffix) and whose queued
+ *       continuations carry a PayCost remainder's payment origin
+ *       (head_payment_origin). A v102 peer drops both silently, so first contact
+ *       rejects the skew. Bumped with full-game protocol 121.
  *  102 — GameState carries the CR 601.2a spell announcement and the
  *       BecomesTarget targeter. Bumped with full-game protocol 120. (101 is
  *       reserved for the Legends of Jidoor PR.)
@@ -596,7 +601,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 102 as const;
+export const WIRE_PROTOCOL_VERSION = 103 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {
