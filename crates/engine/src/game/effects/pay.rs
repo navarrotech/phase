@@ -4467,15 +4467,20 @@ mod tests {
         }
 
         /// A latched remainder whose root carries an "instead" override that holds on this board: the
-        /// override gains 3 life in place of the head, then its own tail pays a fresh one-card draw cost.
-        fn queue_remainder_replaced_by_an_override(state: &mut GameState, source: ObjectId) {
+        /// override resolves `override_effect` in place of the head, then its own `override_tail`.
+        fn queue_remainder_replaced_by_an_override(
+            state: &mut GameState,
+            source: ObjectId,
+            override_effect: Effect,
+            override_tail: Effect,
+        ) {
             let mut root = ResolvedAbility::new(pay_cost(two_draw_legs()), vec![], source, P0);
-            let mut override_clause = ResolvedAbility::new(gain_life(3), vec![], source, P0);
+            let mut override_clause = ResolvedAbility::new(override_effect, vec![], source, P0);
             override_clause.condition = Some(AbilityCondition::ConditionInstead {
                 inner: Box::new(at_least_opponents(1)),
             });
             override_clause.sub_ability = Some(Box::new(ResolvedAbility::new(
-                pay_cost(draw_cost(1)),
+                override_tail,
                 vec![],
                 source,
                 P0,
@@ -4506,7 +4511,12 @@ mod tests {
             let life_before = runner.life(P0);
             let state = runner.state_mut();
             let hand_before = hand_size(state);
-            queue_remainder_replaced_by_an_override(state, source);
+            queue_remainder_replaced_by_an_override(
+                state,
+                source,
+                gain_life(3),
+                pay_cost(draw_cost(1)),
+            );
             crate::game::effects::drain_pending_continuation(state, &mut Vec::new());
             assert_eq!(hand_size(state), hand_before + 1, "the tail drew");
             assert!(!state.cost_payment_failed_flag);
@@ -4520,7 +4530,12 @@ mod tests {
             let life_before = runner.life(P0);
             let state = runner.state_mut();
             let hand_before = hand_size(state);
-            queue_remainder_replaced_by_an_override(state, source);
+            queue_remainder_replaced_by_an_override(
+                state,
+                source,
+                gain_life(3),
+                pay_cost(draw_cost(1)),
+            );
             crate::game::effects::drain_pending_continuation(state, &mut Vec::new());
             assert!(
                 state.cost_payment_failed_flag,
@@ -4532,6 +4547,56 @@ mod tests {
                 runner.life(P0),
                 life_before + 3,
                 "the override replaced the head"
+            );
+        }
+
+        /// CR 118.12 + CR 614.17b (V2h(v), paying override; helper-contract fixture mirroring
+        /// `a_replaced_latched_head_does_not_latch_the_pay_cost_in_its_tail`): when the "instead" override
+        /// that replaces a latched head pays a cost itself, that payment takes the head's place in the node
+        /// but not its latch. Nobody chose to pay it, so it is a fresh choice that Maralen refuses.
+        ///
+        /// Revert probe: dropping `!head_was_swapped` from the effect loop's hand-back hands the latch to
+        /// the swapped-in `PayCost`, which then pays latched: the draw is clamped and the flag stays false.
+        #[test]
+        fn a_paying_override_of_a_latched_head_does_not_inherit_its_latch() {
+            // Reach guard: the walker swaps the head for the paying override and runs its tail. P0 has not
+            // drawn this turn, so Spirit admits the override's fresh choice.
+            let (mut runner, source) = board(Restriction::Spirit, false);
+            let life_before = runner.life(P0);
+            let state = runner.state_mut();
+            let hand_before = hand_size(state);
+            queue_remainder_replaced_by_an_override(
+                state,
+                source,
+                pay_cost(draw_cost(1)),
+                gain_life(3),
+            );
+            crate::game::effects::drain_pending_continuation(state, &mut Vec::new());
+            assert_eq!(hand_size(state), hand_before + 1, "the override drew");
+            assert!(!state.cost_payment_failed_flag);
+            assert_eq!(runner.life(P0), life_before + 3, "the override's tail ran");
+
+            let (mut runner, source) = board(Restriction::Maralen, false);
+            let life_before = runner.life(P0);
+            let state = runner.state_mut();
+            let hand_before = hand_size(state);
+            queue_remainder_replaced_by_an_override(
+                state,
+                source,
+                pay_cost(draw_cost(1)),
+                gain_life(3),
+            );
+            crate::game::effects::drain_pending_continuation(state, &mut Vec::new());
+            assert!(
+                state.cost_payment_failed_flag,
+                "the override's PayCost is a fresh choice, and Maralen refuses it"
+            );
+            assert_eq!(hand_size(state), hand_before);
+            assert!(state.active_ability_continuation().is_none());
+            assert_eq!(
+                runner.life(P0),
+                life_before + 3,
+                "the override replaced the head and its tail ran"
             );
         }
 

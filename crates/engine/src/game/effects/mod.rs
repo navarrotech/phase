@@ -15396,23 +15396,24 @@ fn resolve_chain_body(
     // CR 608.2c: "Instead" kicker — check if a sub overrides the parent.
     // When condition is met, replace the current ability's effect with the sub's
     // effect, preserving the full resolution flow (tracked sets, continuations).
-    let ability = if let Some(ref sub) = ability.sub_ability {
-        // CR 608.2c: "Instead" kicker — swap parent effect with override sub's effect.
-        let should_swap = instead_swap_applies(state, ability, sub);
-        if should_swap {
-            // CR 608.2c: Single-authority swap helper preserves
-            // every effect-shape field on the sub (player_scope, optional,
-            // multi_target, repeat_for, …) and every runtime-context field on
-            // the parent (controller, targets, chosen_x, …). See
-            // `ability_utils::apply_instead_swap` for the full field map.
-            // Issue #310: a hand-rolled clone here previously dropped
-            // `sub.player_scope`.
+    // The verdict outlives the swap: the effect loop reads it to keep this
+    // node's payment latch away from a swapped-in override.
+    let head_was_swapped = ability
+        .sub_ability
+        .as_deref()
+        .is_some_and(|sub| instead_swap_applies(state, ability, sub));
+    let ability = match ability.sub_ability.as_deref() {
+        // CR 608.2c: "Instead" kicker — swap parent effect with override sub's
+        // effect. Single-authority swap helper preserves every effect-shape
+        // field on the sub (player_scope, optional, multi_target, repeat_for,
+        // …) and every runtime-context field on the parent (controller,
+        // targets, chosen_x, …). See `ability_utils::apply_instead_swap` for
+        // the full field map. Issue #310: a hand-rolled clone here previously
+        // dropped `sub.player_scope`.
+        Some(sub) if head_was_swapped => {
             Cow::Owned(super::ability_utils::apply_instead_swap(ability, sub))
-        } else {
-            Cow::Borrowed(ability)
         }
-    } else {
-        Cow::Borrowed(ability)
+        _ => Cow::Borrowed(ability),
     };
     let ability = ability.as_ref();
 
@@ -16936,9 +16937,13 @@ fn resolve_chain_body(
                     // CR 118.12: this node's latch goes to its own `PayCost`
                     // step, once. `pay::resolve` takes it as its first act,
                     // before anything it causes can resolve a nested chain. A
-                    // head an "instead" override replaced pays nothing, so the
-                    // latch is dropped with it.
+                    // head an "instead" override replaced never receives it,
+                    // even when the override pays a cost of its own: nobody
+                    // chose to pay that cost, so CR 614.17b gates it as a fresh
+                    // choice, and the unclaimed latch drops (and logs) with its
+                    // guard.
                     if iteration == 0
+                        && !head_was_swapped
                         && head_payment_origin.is_latched()
                         && matches!(iter_effective.effect, Effect::PayCost { .. })
                     {
