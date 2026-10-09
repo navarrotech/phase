@@ -3348,8 +3348,11 @@ mod tests {
 
     /// `PendingCostMoveResume::CounterAdditionUnlessPayment` gains `unpaid_suffix`
     /// (`UnpaidCostSuffix`, CR 118.12 + CR 702.24a) and `PendingContinuation` gains
-    /// `head_payment_origin` (`ResolutionPaymentOrigin`, CR 614.17a); a v120 peer drops
-    /// both keys silently, so it must be refused before it receives v121 state.
+    /// `head_payment_origin` (`ResolutionPaymentOrigin`, CR 614.17a); a v121 peer drops
+    /// both keys silently, so it must be refused before it receives v122 state.
+    /// The successful-mana-history ledger now stores the actual receiving
+    /// player with each trigger definition. A v120 peer cannot decode a
+    /// nonempty pair ledger, so it must be refused before v121 state.
     /// The CR 601.2a spell announcement adds `GameObject::spell_announcement`,
     /// `GameState::next_spell_announcement` and `GameEvent::BecomesTarget.targeter`;
     /// a v119 peer cannot decode v120 state, so it must be refused before state
@@ -3469,8 +3472,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_121_for_draw_cost_resumption() {
-        assert_eq!(PROTOCOL_VERSION, 121);
+    fn protocol_version_is_122_for_draw_cost_resumption() {
+        assert_eq!(PROTOCOL_VERSION, 122);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3481,7 +3484,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_121_for_draw_cost_resumption` stays
+    /// `protocol_version_is_122_for_draw_cost_resumption` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {
