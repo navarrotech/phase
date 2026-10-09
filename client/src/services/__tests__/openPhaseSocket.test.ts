@@ -96,11 +96,11 @@ describe("openPhaseSocket", () => {
   it("resolves with serverInfo once ServerHello arrives and sends ClientHello", async () => {
     const promise = openPhaseSocket("ws://test");
     const ws = MockWebSocket.instances[0];
-    ws.deliverMessage(helloFrame({ protocol_version: 108 }));
+    ws.deliverMessage(helloFrame({ protocol_version: 121 }));
 
     const socket = await promise;
     expect(socket.serverInfo.mode).toBe("Full");
-    expect(socket.serverInfo.protocolVersion).toBe(108);
+    expect(socket.serverInfo.protocolVersion).toBe(121);
     expect(ws.send).toHaveBeenCalledWith(
       expect.stringContaining('"type":"ClientHello"'),
     );
@@ -286,10 +286,10 @@ describe("openPhaseSocket", () => {
     expect(ws.close).toHaveBeenCalled();
   });
 
-  it("rejects Full v107 before it can read player-relative mana history", async () => {
+  it("rejects Full v120 before it can read player-relative mana history", async () => {
     const promise = openPhaseSocket("ws://test");
     const ws = MockWebSocket.instances[0];
-    ws.deliverMessage(helloFrame({ protocol_version: 107 }));
+    ws.deliverMessage(helloFrame({ protocol_version: 120 }));
 
     await expect(promise).rejects.toMatchObject({
       kind: "protocol_mismatch",
