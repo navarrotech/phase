@@ -15106,6 +15106,50 @@ fn counter_tail_family_has_runtime_evidence(effect: &Effect) -> bool {
     )
 }
 
+/// CR 118.12: the payment origin a chain body took from its drained head.
+///
+/// The body has many early returns (fan-outs, skips, prompts, `?`), and all but
+/// one of them lose a latched origin. Holding it here gives that loss a single
+/// exit point: dropping the latch without handing it to the head's own
+/// `PayCost` logs once, wherever the body returned.
+struct HeadPaymentLatch<'a> {
+    origin: ResolutionPaymentOrigin,
+    ability: &'a ResolvedAbility,
+    depth: u32,
+}
+
+impl<'a> HeadPaymentLatch<'a> {
+    fn take(state: &mut GameState, ability: &'a ResolvedAbility, depth: u32) -> Self {
+        Self {
+            origin: std::mem::take(&mut state.resolving_head_payment_origin),
+            ability,
+            depth,
+        }
+    }
+
+    fn is_latched(&self) -> bool {
+        !self.origin.is_fresh_choice()
+    }
+
+    /// Hands the origin to its consumer, leaving this latch fresh and silent.
+    fn hand_back(&mut self) -> ResolutionPaymentOrigin {
+        std::mem::take(&mut self.origin)
+    }
+}
+
+impl Drop for HeadPaymentLatch<'_> {
+    fn drop(&mut self) {
+        if self.is_latched() {
+            tracing::debug!(
+                source = ?self.ability.source_id,
+                effect = ?EffectKind::from(&self.ability.effect),
+                depth = self.depth,
+                "dropping a latched payment origin: the chain body ended without handing it to its head PayCost"
+            );
+        }
+    }
+}
+
 /// One full pass of an ability's resolution chain — the parent effect (with its
 /// `repeat_for` count loop) and the entire `sub_ability` chain. This is one
 /// "process" for the purposes of "repeat this process" (CR 608.2c). Extracted
@@ -15135,8 +15179,9 @@ fn resolve_chain_body(
     // chain's head — and to no other. Take it before any fan-out, skip, or
     // descent below can reach another node; only this node's own `PayCost`
     // step receives it back (see the effect loop), so a head that is skipped or
-    // replaced leaves every later `PayCost` in the chain a fresh choice.
-    let head_payment_origin = std::mem::take(&mut state.resolving_head_payment_origin);
+    // replaced leaves every later `PayCost` in the chain a fresh choice. A latch
+    // the body never hands back is logged when the guard drops.
+    let mut head_payment_origin = HeadPaymentLatch::take(state, ability, depth);
 
     // CR 608.2c + CR 701.20b + CR 603.3d: A multi-target reveal-all producer whose
     // per-target referent (the revealed card) is consumed by later co-instructions
@@ -16893,15 +16938,11 @@ fn resolve_chain_body(
                     // before anything it causes can resolve a nested chain. A
                     // head an "instead" override replaced pays nothing, so the
                     // latch is dropped with it.
-                    if iteration == 0 && !head_payment_origin.is_fresh_choice() {
-                        if matches!(iter_effective.effect, Effect::PayCost { .. }) {
-                            state.resolving_head_payment_origin = head_payment_origin;
-                        } else {
-                            tracing::debug!(
-                                effect = ?EffectKind::from(&iter_effective.effect),
-                                "dropping a latched payment origin: the chain head is not a PayCost"
-                            );
-                        }
+                    if iteration == 0
+                        && head_payment_origin.is_latched()
+                        && matches!(iter_effective.effect, Effect::PayCost { .. })
+                    {
+                        state.resolving_head_payment_origin = head_payment_origin.hand_back();
                     }
                     let resolved = if ability.repeat_for.is_some() {
                         with_iteration_return_result_occurrence(state, iter_effective, |state| {
@@ -21012,6 +21053,31 @@ fn resolve_add_pending_enters_modifications(
 mod tests {
     use super::*;
     use crate::database::synthesis::synthesize_extort;
+
+    /// CR 118.12: a chain body's latch is taken off the state, handed back to
+    /// its consumer exactly once, and is fresh (so its drop is silent) after.
+    #[test]
+    fn head_payment_latch_hands_back_its_origin_once() {
+        let mut state = GameState::new_two_player(42);
+        state.resolving_head_payment_origin = ResolutionPaymentOrigin::LatchedSuffix;
+        let ability = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                player: TargetFilter::Controller,
+            },
+            vec![],
+            ObjectId(1),
+            PlayerId(0),
+        );
+
+        let mut latch = HeadPaymentLatch::take(&mut state, &ability, 0);
+        assert!(state.resolving_head_payment_origin.is_fresh_choice());
+        assert!(latch.is_latched());
+
+        assert_eq!(latch.hand_back(), ResolutionPaymentOrigin::LatchedSuffix);
+        assert!(!latch.is_latched());
+        assert_eq!(latch.hand_back(), ResolutionPaymentOrigin::FreshChoice);
+    }
 
     /// CR 608.2c: the pile placement after a reveal-only until-loop is bound to the
     /// exact cards that reveal looked at, on the continuation itself — so an
