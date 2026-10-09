@@ -1029,10 +1029,7 @@ pub(crate) fn activate_mana_source_option_with_output(
         )
         .map_err(|error| EngineError::InvalidAction(error.to_string()))?;
         debug_assert!(tapped, "preflighted land tap must transition status");
-        events.push(GameEvent::PermanentTapped {
-            object_id: option.object_id,
-            caused_by: None,
-        });
+        events.push(GameEvent::permanent_tapped(state, option.object_id, None));
         // CR 305.6 + CR 605.3: tapping a basic land for mana activates its
         // intrinsic mana ability; observe its triggers at that boundary.
         let activation_event = super::casting_targets::emit_ability_activated(
@@ -2268,12 +2265,8 @@ pub(crate) fn feasible_mana_capacity(
                     land_filter: TargetFilter::CostPaidObject,
                 } = produced
                 {
-                    let options = unbound_cost_referent_mana_types(
-                        state,
-                        controller,
-                        object_id,
-                        &ability.cost,
-                    );
+                    let options =
+                        unbound_cost_referent_mana_types(state, controller, object_id, ability);
                     if options.is_empty() {
                         0
                     } else {
@@ -2333,10 +2326,10 @@ pub(crate) fn unbound_cost_referent_mana_types(
     state: &GameState,
     controller: PlayerId,
     source_id: ObjectId,
-    cost: &Option<AbilityCost>,
+    ability: &AbilityDefinition,
 ) -> Vec<ManaType> {
     let Some((_, candidates)) =
-        mana_abilities::sacrifice_cost_choice(state, controller, source_id, cost)
+        mana_abilities::sacrifice_cost_choice(state, controller, source_id, ability)
     else {
         return Vec::new();
     };
@@ -2436,7 +2429,7 @@ fn profile_kind_from_production(
     state: &GameState,
     object_id: ObjectId,
     controller: PlayerId,
-    cost: &Option<AbilityCost>,
+    ability: &AbilityDefinition,
     produced: &ManaProduction,
     resolved: &crate::types::ability::ResolvedAbility,
 ) -> Option<ActivatableManaProfileKind> {
@@ -2484,7 +2477,7 @@ fn profile_kind_from_production(
             count,
             land_filter: TargetFilter::CostPaidObject,
         } => {
-            let options = unbound_cost_referent_mana_types(state, controller, object_id, cost);
+            let options = unbound_cost_referent_mana_types(state, controller, object_id, ability);
             if options.is_empty() {
                 return None;
             }
@@ -2593,16 +2586,9 @@ fn activatable_mana_profiles_for_object(
             }
             let resolved =
                 super::ability_utils::build_resolved_from_def(ability, object_id, controller);
-            profile_kind_from_production(
-                state,
-                object_id,
-                controller,
-                &ability.cost,
-                produced,
-                &resolved,
-            )
-            .and_then(|kind| profile_kind_allowed_for_context(kind, payment_context))
-            .map(|kind| ActivatableManaProfile { object_id, kind })
+            profile_kind_from_production(state, object_id, controller, ability, produced, &resolved)
+                .and_then(|kind| profile_kind_allowed_for_context(kind, payment_context))
+                .map(|kind| ActivatableManaProfile { object_id, kind })
         })
         .collect()
 }
@@ -6965,9 +6951,9 @@ mod tests {
                 "Opponent Swamp",
                 vec![fixed(ManaColor::Black)],
             );
-            let cost = state.objects[&squandered].abilities[0].cost.clone();
+            let ability = state.objects[&squandered].abilities[0].clone();
 
-            let options = unbound_cost_referent_mana_types(&state, P0, squandered, &cost);
+            let options = unbound_cost_referent_mana_types(&state, P0, squandered, &ability);
             assert_eq!(
                 sorted(options),
                 sorted(vec![ManaType::Green, ManaType::Blue]),
@@ -6978,12 +6964,12 @@ mod tests {
             let squandered = add_squandered(&mut wilds_only);
             add_land(&mut wilds_only, P0, "Evolving Wilds", vec![]);
             assert!(
-                unbound_cost_referent_mana_types(&wilds_only, P0, squandered, &cost).is_empty()
+                unbound_cost_referent_mana_types(&wilds_only, P0, squandered, &ability).is_empty()
             );
 
+            let tap_only = ability.clone().cost(AbilityCost::Tap);
             assert!(
-                unbound_cost_referent_mana_types(&state, P0, squandered, &Some(AbilityCost::Tap))
-                    .is_empty(),
+                unbound_cost_referent_mana_types(&state, P0, squandered, &tap_only).is_empty(),
                 "a cost with no non-self sacrifice has no referent candidates"
             );
         }
