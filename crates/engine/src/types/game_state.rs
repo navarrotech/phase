@@ -2676,8 +2676,9 @@ pub struct PendingContinuation {
     /// `effects::prepend_remaining_pay_cost_continuation` /
     /// `prepend_remaining_pay_cost_before_parked_rider` queue after a paused
     /// payment, and only for the head: `drain_pending_continuation` hands it to
-    /// `GameState::resolving_head_payment_origin`, and `effects::pay::resolve`
-    /// takes it once. Legacy saves default to `FreshChoice`.
+    /// `GameState::resolving_head_payment_origin`, the chain walker binds it to
+    /// the head node, and `effects::pay::resolve` takes it once. Legacy saves
+    /// default to `FreshChoice`.
     #[serde(
         default,
         skip_serializing_if = "ResolutionPaymentOrigin::is_fresh_choice"
@@ -21517,8 +21518,10 @@ declare_game_state! {
     pub resolving_continuation_attach_host: Option<AttachTarget>,
 
     /// Execution-local view of the drained continuation's `head_payment_origin`,
-    /// or of a replayed transaction root (`payment_transaction::replay`). Taken
-    /// once by `effects::pay::resolve`; never serialized.
+    /// or of a replayed transaction root (`payment_transaction::replay`). The
+    /// chain walker takes it as it enters the chain's first node and hands it
+    /// back only to that node's own `PayCost` step, where `effects::pay::resolve`
+    /// takes it once; no later node can see it. Never serialized.
     #[serde(skip)]
     pub(crate) resolving_head_payment_origin: ResolutionPaymentOrigin,
 

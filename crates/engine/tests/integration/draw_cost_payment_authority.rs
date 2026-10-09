@@ -468,9 +468,11 @@ fn pay_staged_draw_cost_around_a_concession(legs: usize, concede: bool) -> (i64,
 /// Every replay re-materializes the choice latched: the remaining draws are clamped, never unpaid, and the
 /// rider runs once.
 ///
-/// Revert probes: (A) `replay` not installing `LatchedSuffix` re-gates the root fresh, so the replay fails
-/// and the flag is set; (B) the prepend helpers queueing `FreshChoice` re-gate the remainder head, with the
-/// same failing flag.
+/// Revert probes: (A) `replay` not installing `LatchedSuffix` re-gates the root fresh, so the replay after
+/// the concession refuses the payment and the post-concession reach guard
+/// `is_dredge_prompt_for_p0(&staged_payment_shadow_for_test(state))` fails; (B) the prepend helpers queueing
+/// `FreshChoice` re-gate the remainder head, which is refused before the Draw arm, so the per-leg
+/// "leg 2 raised its Dredge prompt" assertion fails.
 #[test]
 fn another_players_concession_does_not_unpay_a_staged_draw_cost() {
     // Control: without the concession both legs draw.

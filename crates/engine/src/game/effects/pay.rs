@@ -4021,7 +4021,8 @@ mod tests {
         use super::*;
         use crate::game::scenario::{GameRunner, GameScenario, P0, P1};
         use crate::types::ability::{
-            AbilityCondition, Comparator, ForwardedResultContext, PlayerFilter, SubAbilityLink,
+            AbilityCondition, Comparator, ForwardedResultContext, PlayerFilter, RepeatContinuation,
+            SubAbilityLink,
         };
         use crate::types::actions::GameAction;
         use crate::types::game_state::PendingContinuation;
@@ -4074,6 +4075,19 @@ mod tests {
         fn two_draw_legs() -> AbilityCost {
             AbilityCost::Composite {
                 costs: vec![draw_cost(1), draw_cost(1)],
+            }
+        }
+
+        /// "P0 has at least `count` opponents": true on these two-player boards for 1, false for 5.
+        fn at_least_opponents(count: i32) -> AbilityCondition {
+            AbilityCondition::QuantityCheck {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::PlayerCount {
+                        filter: PlayerFilter::Opponent,
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: count },
             }
         }
 
@@ -4223,22 +4237,14 @@ mod tests {
         /// payment began, so a condition that no longer holds does not skip the latched head, and the
         /// independent tail stays a fresh choice.
         ///
-        /// Revert probe: keeping the root's condition on the remainder skips the head; the tail then takes
-        /// the untaken latch and draws (flag false).
+        /// Revert probe: keeping the root's condition on the remainder skips the head. The skipped head
+        /// takes its latch with it, so the tail is still a fresh choice, but it is now P0's first draw this
+        /// turn and Spirit admits it (flag false).
         #[test]
         fn an_unconditional_latched_head_runs_even_if_its_root_condition_no_longer_holds() {
             let (mut runner, source) = board(Restriction::Spirit, false);
             let mut root = ResolvedAbility::new(pay_cost(two_draw_legs()), vec![], source, P0);
-            // False on this two-player board.
-            root.condition = Some(AbilityCondition::QuantityCheck {
-                lhs: QuantityExpr::Ref {
-                    qty: QuantityRef::PlayerCount {
-                        filter: PlayerFilter::Opponent,
-                    },
-                },
-                comparator: Comparator::GE,
-                rhs: QuantityExpr::Fixed { value: 5 },
-            });
+            root.condition = Some(at_least_opponents(5));
             let mut tail = ResolvedAbility::new(pay_cost(draw_cost(1)), vec![], source, P0);
             // An unconditional next instruction, so a skipped head would not also skip it.
             tail.sub_link = SubAbilityLink::SequentialSibling;
@@ -4458,6 +4464,155 @@ mod tests {
             );
             assert_eq!(runner.life(P0), life_before + 10);
             assert!(runner.state().active_ability_continuation().is_none());
+        }
+
+        /// A latched remainder whose root carries an "instead" override that holds on this board: the
+        /// override gains 3 life in place of the head, then its own tail pays a fresh one-card draw cost.
+        fn queue_remainder_replaced_by_an_override(state: &mut GameState, source: ObjectId) {
+            let mut root = ResolvedAbility::new(pay_cost(two_draw_legs()), vec![], source, P0);
+            let mut override_clause = ResolvedAbility::new(gain_life(3), vec![], source, P0);
+            override_clause.condition = Some(AbilityCondition::ConditionInstead {
+                inner: Box::new(at_least_opponents(1)),
+            });
+            override_clause.sub_ability = Some(Box::new(ResolvedAbility::new(
+                pay_cost(draw_cost(1)),
+                vec![],
+                source,
+                P0,
+            )));
+            root.sub_ability = Some(Box::new(override_clause));
+            crate::game::effects::prepend_remaining_pay_cost_continuation(
+                state,
+                &root,
+                P0,
+                draw_cost(1),
+            );
+        }
+
+        /// CR 118.12 + CR 614.17b (V2h(v), skipped head): the latch binds to the queued head node, not to
+        /// the first `PayCost` the walker reaches. Here the walker's live "instead" swap replaces the head,
+        /// so the head pays nothing, and the `PayCost` in the override's tail is a separate, fresh choice
+        /// that Maralen refuses. Scope: the root's own not-swap verdict is not carried onto the remainder
+        /// (a recorded gap); this row pins only that a head the walker replaces keeps its latch from the
+        /// tail.
+        ///
+        /// Revert probe: reading the latch at chain-body entry without taking it leaves it for the tail,
+        /// which then pays latched: the draw is clamped and the flag stays false.
+        #[test]
+        fn a_replaced_latched_head_does_not_latch_the_pay_cost_in_its_tail() {
+            // Reach guard: the walker swaps the head and reaches the tail. P0 has not drawn this turn, so
+            // Spirit admits the tail's fresh choice.
+            let (mut runner, source) = board(Restriction::Spirit, false);
+            let life_before = runner.life(P0);
+            let state = runner.state_mut();
+            let hand_before = hand_size(state);
+            queue_remainder_replaced_by_an_override(state, source);
+            crate::game::effects::drain_pending_continuation(state, &mut Vec::new());
+            assert_eq!(hand_size(state), hand_before + 1, "the tail drew");
+            assert!(!state.cost_payment_failed_flag);
+            assert_eq!(
+                runner.life(P0),
+                life_before + 3,
+                "the override replaced the head"
+            );
+
+            let (mut runner, source) = board(Restriction::Maralen, false);
+            let life_before = runner.life(P0);
+            let state = runner.state_mut();
+            let hand_before = hand_size(state);
+            queue_remainder_replaced_by_an_override(state, source);
+            crate::game::effects::drain_pending_continuation(state, &mut Vec::new());
+            assert!(
+                state.cost_payment_failed_flag,
+                "the tail's PayCost is a fresh choice, and Maralen refuses it"
+            );
+            assert_eq!(hand_size(state), hand_before);
+            assert!(state.active_ability_continuation().is_none());
+            assert_eq!(
+                runner.life(P0),
+                life_before + 3,
+                "the override replaced the head"
+            );
+        }
+
+        /// CR 118.12 + CR 608.2c (V2h(vi), root-only gates): the remainder is one already-admitted
+        /// instruction. The root's repeat count and repeat-until loop belong to their own parked frames, so
+        /// the drained remainder resolves once: its latched draw is P0's only draw, and nothing re-runs it.
+        ///
+        /// Revert probe: keeping either repeat on the remainder re-runs it; each repeat is a fresh choice
+        /// Spirit refuses (flag true).
+        #[test]
+        fn a_remainder_does_not_inherit_its_roots_repeat() {
+            type AddRepeat = fn(&mut ResolvedAbility);
+            let repeats: [(&str, AddRepeat); 2] = [
+                ("repeat_for", |root| {
+                    root.repeat_for = Some(QuantityExpr::Fixed { value: 3 });
+                }),
+                ("repeat_until", |root| {
+                    root.repeat_until = Some(RepeatContinuation::WhileCondition {
+                        condition: Box::new(at_least_opponents(1)),
+                        max_iterations: Some(2),
+                    });
+                }),
+            ];
+            for (label, add_repeat) in repeats {
+                let (mut runner, source) = board(Restriction::Spirit, false);
+                let mut root = ResolvedAbility::new(pay_cost(two_draw_legs()), vec![], source, P0);
+                add_repeat(&mut root);
+                let state = runner.state_mut();
+                let hand_before = hand_size(state);
+                crate::game::effects::prepend_remaining_pay_cost_continuation(
+                    state,
+                    &root,
+                    P0,
+                    draw_cost(1),
+                );
+                crate::game::effects::drain_pending_continuation(state, &mut Vec::new());
+                assert_eq!(
+                    hand_size(state),
+                    hand_before + 1,
+                    "{label}: the head drew once"
+                );
+                assert!(
+                    !state.cost_payment_failed_flag,
+                    "{label}: the remainder was not re-run as a fresh choice"
+                );
+                assert!(state.active_ability_continuation().is_none());
+            }
+        }
+
+        /// CR 118.12 + CR 608.2c (V2h(vii), root-only gates): the root's player fan-out is not inherited. The
+        /// remainder is the head node itself, so it pays latched and reaches the Draw arm under Maralen.
+        ///
+        /// Revert probe: keeping `player_scope` fans the remainder out into per-player legs, each a node of
+        /// its own; the head's latch stays with the head, so the leg is gated fresh (no prompt, flag true).
+        #[test]
+        fn a_remainder_does_not_inherit_its_roots_player_fan_out() {
+            let (mut runner, source) = board(Restriction::Maralen, true);
+            let mut root = ResolvedAbility::new(pay_cost(two_draw_legs()), vec![], source, P0);
+            root.player_scope = Some(PlayerFilter::Controller);
+            let state = runner.state_mut();
+            let hand_before = hand_size(state);
+            crate::game::effects::prepend_remaining_pay_cost_continuation(
+                state,
+                &root,
+                P0,
+                draw_cost(1),
+            );
+            state.cost_payment_failed_flag = true;
+            crate::game::effects::drain_pending_continuation(state, &mut Vec::new());
+            assert!(
+                is_dredge_prompt_for_p0(state),
+                "the latched head must reach the Draw arm's Dredge prompt"
+            );
+            decline_dredge(state);
+            assert!(!state.cost_payment_failed_flag, "the latched head is paid");
+            assert_eq!(
+                hand_size(state),
+                hand_before,
+                "the draw is clamped by Maralen"
+            );
+            assert!(state.active_ability_continuation().is_none());
         }
     }
 }

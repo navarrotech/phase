@@ -2937,25 +2937,50 @@ pub(crate) fn resolve_effect_pay_cost_rider(
     resolve_ability_chain(state, &rider, events, 1)
 }
 
-pub(crate) fn prepend_remaining_pay_cost_continuation(
-    state: &mut GameState,
+/// CR 118.12 + CR 608.2c: The head node of a paused `PayCost`'s queued
+/// remainder — the unpaid cost suffix, as one already-admitted instruction.
+///
+/// The root passed every one of its execution gates before payment began: its
+/// condition, its "you may", its unless-cost, its repeat count or repeat-until
+/// loop, and its player fan-out. The remainder carries none of them. A gate
+/// left on it would be re-evaluated live when the remainder drains, and could
+/// skip the head, run it again, or fan it out to other players — each a way to
+/// pay a different cost than the one already chosen. The root's other
+/// iterations and fan-out legs are owned by their own parked frames (the
+/// repeat-for and repeat-until frames, the player-scope queue), never by this
+/// node.
+fn pay_cost_remainder_head(
     ability: &ResolvedAbility,
     payer: PlayerId,
     remaining_cost: AbilityCost,
-) {
+) -> ResolvedAbility {
     let mut remaining_payment = ability.clone();
     remaining_payment.controller = payer;
+    remaining_payment.condition = None;
     remaining_payment.optional = false;
     remaining_payment.optional_for = None;
-    // CR 118.12: the root's condition held when payment began; the remainder is
-    // unconditional, so it is the first instruction the drained chain resolves.
-    remaining_payment.condition = None;
+    remaining_payment.unless_pay = None;
+    remaining_payment.repeat_for = None;
+    remaining_payment.repeat_until = None;
+    remaining_payment.player_scope = None;
+    // CR 101.4: the turn-order anchor exists only for `player_scope` iteration.
+    remaining_payment.starting_with = None;
     remaining_payment.effect = Effect::PayCost {
         cost: remaining_cost,
         scale: None,
         payer: TargetFilter::Controller,
     };
     remaining_payment.sub_ability = None;
+    remaining_payment
+}
+
+pub(crate) fn prepend_remaining_pay_cost_continuation(
+    state: &mut GameState,
+    ability: &ResolvedAbility,
+    payer: PlayerId,
+    remaining_cost: AbilityCost,
+) {
+    let mut remaining_payment = pay_cost_remainder_head(ability, payer, remaining_cost);
 
     if let Some(sub) = ability.sub_ability.as_ref() {
         let mut sub_clone = sub.as_ref().clone();
@@ -2987,24 +3012,11 @@ pub(crate) fn prepend_remaining_pay_cost_before_parked_rider(
     payer: PlayerId,
     remaining_cost: AbilityCost,
 ) {
-    let mut remaining_payment = ability.clone();
-    remaining_payment.controller = payer;
-    remaining_payment.optional = false;
-    remaining_payment.optional_for = None;
-    // CR 118.12: the root's condition held when payment began; the remainder is
-    // unconditional, so it is the first instruction the drained chain resolves.
-    remaining_payment.condition = None;
-    remaining_payment.effect = Effect::PayCost {
-        cost: remaining_cost,
-        scale: None,
-        payer: TargetFilter::Controller,
-    };
-    remaining_payment.sub_ability = None;
     // CR 118.12: the unpaid suffix resumes through the authority's latched
     // entry — the choice to pay was already made.
     prepend_to_pending_continuation_with_producer(
         state,
-        remaining_payment,
+        pay_cost_remainder_head(ability, payer, remaining_cost),
         None,
         ResolutionPaymentOrigin::LatchedSuffix,
     );
@@ -15119,6 +15131,12 @@ fn resolve_chain_body(
     // value catches the replace case correctly (issue #491).
     let pending_continuation_before = state.active_ability_continuation().cloned();
     let child_stack_start = state.resolution_stack.capture_child_boundary();
+    // CR 118.12: a latched payment origin belongs to this node — the drained
+    // chain's head — and to no other. Take it before any fan-out, skip, or
+    // descent below can reach another node; only this node's own `PayCost`
+    // step receives it back (see the effect loop), so a head that is skipped or
+    // replaced leaves every later `PayCost` in the chain a fresh choice.
+    let head_payment_origin = std::mem::take(&mut state.resolving_head_payment_origin);
 
     // CR 608.2c + CR 701.20b + CR 603.3d: A multi-target reveal-all producer whose
     // per-target referent (the revealed card) is consumed by later co-instructions
@@ -16868,6 +16886,21 @@ fn resolve_chain_body(
                             &events[..],
                         ) {
                             bounded_move_refusals += 1;
+                        }
+                    }
+                    // CR 118.12: this node's latch goes to its own `PayCost`
+                    // step, once. `pay::resolve` takes it as its first act,
+                    // before anything it causes can resolve a nested chain. A
+                    // head an "instead" override replaced pays nothing, so the
+                    // latch is dropped with it.
+                    if iteration == 0 && !head_payment_origin.is_fresh_choice() {
+                        if matches!(iter_effective.effect, Effect::PayCost { .. }) {
+                            state.resolving_head_payment_origin = head_payment_origin;
+                        } else {
+                            tracing::debug!(
+                                effect = ?EffectKind::from(&iter_effective.effect),
+                                "dropping a latched payment origin: the chain head is not a PayCost"
+                            );
                         }
                     }
                     let resolved = if ability.repeat_for.is_some() {
