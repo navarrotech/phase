@@ -2699,7 +2699,9 @@ pub struct PendingContinuation {
 /// payment authority. A fresh payment is the payer's choice to pay, which a
 /// cost including an impossible event can't be (CR 614.17b). A latched payment
 /// resumes legs of a choice already made: a later can't-effect cannot unmake
-/// it (CR 614.17a), and it still clamps each event as it happens (CR 118.11).
+/// it (CR 614.17a), it still clamps each event as it happens (CR 118.11), and
+/// a prevented counter placement completes as paid. The origin travels into
+/// `costs::PaymentScope::Resolution`, where the leg arms read it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum ResolutionPaymentOrigin {
     #[default]

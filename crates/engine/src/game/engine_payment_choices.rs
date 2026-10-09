@@ -2631,11 +2631,14 @@ pub(super) fn resume_counter_addition_unless_payment(
                     });
                 return Ok(state.waiting_for.clone());
             }
-            // The latched entry never applies the CR 614.17b choice gate, so a
-            // draw leg never fails here; each draw is still clamped as it happens
-            // (CR 118.11 + CR 614.17a). Counter legs keep their in-arm CR 614.17a
-            // refusal. Should a leg fail, the choice CR 118.12 latched still
-            // stands: settle PAID, loudly.
+            // The latched entry never applies the CR 614.17b choice gate, and
+            // every admitted deterministic leg completes on a latched resume: a
+            // draw is clamped as it happens (CR 118.11 + CR 614.17a), fixed mana
+            // deposits what the pipeline allows, and a prevented counter
+            // placement completes as paid (CR 118.11 + CR 118.12). So no admitted
+            // leg returns `Failed` here; one that does is a new leg shape that
+            // forgot the latched policy, hence the assertion. The choice
+            // CR 118.12 latched still stands: settle PAID, loudly.
             PaymentOutcome::Failed { reason } => {
                 debug_assert!(
                     false,

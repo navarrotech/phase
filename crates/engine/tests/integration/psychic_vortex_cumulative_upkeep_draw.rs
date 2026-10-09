@@ -13,8 +13,12 @@
 //! `ChooseReplacement`, and every negative row carries a positive reach guard in
 //! the same test.
 
+use std::sync::Arc;
+
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
-use engine::types::ability::{AbilityCost, Effect, EffectKind, QuantityExpr, TargetFilter};
+use engine::types::ability::{
+    AbilityCost, Effect, EffectKind, ManaContribution, ManaProduction, QuantityExpr, TargetFilter,
+};
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
 use engine::types::events::GameEvent;
@@ -56,6 +60,9 @@ instead.\nAt the beginning of each end step, each player sacrifices a permanent 
 unless they discard a card.";
 
 const DIVINATION_ORACLE: &str = "Draw two cards.";
+
+const SOLEMNITY_ORACLE: &str = "Players can't get counters.\n\
+Counters can't be put on artifacts, creatures, enchantments, or lands.";
 
 /// NOT a printed card: the parser-produced Draw-N cumulative-upkeep base (probe P4), used to pin
 /// instruction size separately from repetition.
@@ -233,6 +240,84 @@ fn assert_replacement_choice(runner: &GameRunner, context: &str) {
 
 fn zone_of(runner: &GameRunner, object: ObjectId) -> Zone {
     runner.state().objects[&object].zone
+}
+
+/// NOT a printed card: the hostile shape the deterministic unless contract admits (a draw, then a counter
+/// on the source, then fixed red mana), used to pin that a counter leg prevented after the choice to pay
+/// still lets every later leg pay.
+fn draw_counter_mana_cost() -> AbilityCost {
+    AbilityCost::Composite {
+        costs: vec![
+            draw_cost(1),
+            AbilityCost::EffectCost {
+                effect: Box::new(Effect::PutCounter {
+                    counter_type: CounterType::Generic("probe".to_string()),
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::SelfRef,
+                }),
+            },
+            AbilityCost::EffectCost {
+                effect: Box::new(Effect::Mana {
+                    produced: ManaProduction::Fixed {
+                        colors: vec![ManaColor::Red],
+                        contribution: ManaContribution::Base,
+                    },
+                    restrictions: vec![],
+                    grants: vec![],
+                    expiry: None,
+                    target: None,
+                }),
+            },
+        ],
+    }
+}
+
+/// Replaces the synthesized cumulative-upkeep unless cost of `source` with `cost`. Reach guard: exactly one
+/// unless slot exists, so the install cannot silently miss the trigger the test drives.
+fn install_upkeep_cost(runner: &mut GameRunner, source: ObjectId, cost: AbilityCost) {
+    let object = runner
+        .state_mut()
+        .objects
+        .get_mut(&source)
+        .expect("the cumulative-upkeep source exists");
+    let mut installed = 0;
+    let unless_slots = Arc::make_mut(&mut object.base_trigger_definitions)
+        .iter_mut()
+        .filter_map(|trigger| trigger.execute.as_mut())
+        .filter_map(|execute| execute.sub_ability.as_mut())
+        .filter_map(|branch| branch.unless_pay.as_mut());
+    for unless in unless_slots {
+        unless.cost = cost.clone();
+        installed += 1;
+    }
+    assert_eq!(
+        installed, 1,
+        "exactly one synthesized cumulative-upkeep unless cost"
+    );
+    object.materialize_base_trigger_definitions();
+}
+
+/// Psychic Vortex with the mixed cost installed, Stinkweed Imp in P0's graveyard (its Dredge pauses the
+/// draw leg), and Solemnity staged in exile. Advanced to the upkeep prompt, which offers the installed cost.
+fn mixed_cost_board() -> (GameRunner, ObjectId, ObjectId) {
+    let (mut runner, vortex, solemnity) = vortex_board(0, &STAGED_LIBRARY, |scenario| {
+        scenario
+            .add_creature_to_graveyard(P0, "Stinkweed Imp", 1, 2)
+            .from_oracle_text(STINKWEED_IMP_ORACLE);
+        scenario
+            .add_enchantment_from_oracle(P1, "Solemnity", SOLEMNITY_ORACLE)
+            .id()
+    });
+    let mut events = Vec::new();
+    engine::game::zones::move_to_zone(runner.state_mut(), solemnity, Zone::Exile, &mut events);
+    install_upkeep_cost(&mut runner, vortex, draw_counter_mana_cost());
+    advance_through_upkeep(&mut runner);
+    assert_eq!(
+        unless_prompt_cost(&runner),
+        draw_counter_mana_cost(),
+        "the upkeep offers the installed mixed cost"
+    );
+    (runner, vortex, solemnity)
 }
 
 /// CR 702.24a (AC2): with N age counters, paying draws N cards and keeps the
@@ -1253,4 +1338,135 @@ fn a_skipped_draw_of_an_ordinary_effect_is_unchanged() {
     assert_replacement_choice(&runner, "the second draw offers its own skip");
     assert_eq!(ZoneSizes::of(&runner, P0).library, library_before);
     assert!(runner.state().active_draw_sequence().is_some());
+}
+
+/// CR 118.12 + CR 118.11 + CR 614.17a: a counter prohibition that arrives after P0 chose to pay does not
+/// unpay the choice, and it does not drop the legs after the prevented one. The draw leg pauses on Dredge,
+/// parking `[counter, mana]` as the latched suffix; Solemnity then arrives; declining Dredge resumes the
+/// suffix through the authority's latched entry. The prevented counter completes as paid and the red mana
+/// leg still pays.
+///
+/// Rows: `solemnity_arrives = false` is the positive control (both later legs execute on this exact
+/// path); `true` is the regression.
+///
+/// Revert probe: restoring the latched counter refusal fails the suffix, which trips the resume root's
+/// "a resumed unless-cost suffix failed at resolution" `debug_assert!` (debug) or leaves the red mana
+/// unpaid (release).
+#[test]
+fn a_counter_prohibition_arriving_mid_payment_still_pays_the_later_legs() {
+    let probe_counter = CounterType::Generic("probe".to_string());
+    for solemnity_arrives in [false, true] {
+        let (mut runner, vortex, solemnity) = mixed_cost_board();
+        let hand_before = ZoneSizes::of(&runner, P0).hand;
+
+        let mut settled_events = runner
+            .act(GameAction::PayUnlessCost { pay: true })
+            .expect("paying is legal while no counter prohibition exists")
+            .events;
+        assert_replacement_choice(&runner, "Dredge must pause the draw leg");
+        // Reach guard: the counter and mana legs are parked as the latched suffix.
+        let AbilityCost::Composite { costs } = draw_counter_mana_cost() else {
+            unreachable!("the fixture is a composite");
+        };
+        assert_eq!(
+            parked_unpaid_suffix(&runner),
+            Some(UnpaidCostSuffix {
+                payer: P0,
+                cost: AbilityCost::Composite {
+                    costs: costs[1..].to_vec(),
+                },
+            })
+        );
+
+        if solemnity_arrives {
+            let mut events = Vec::new();
+            engine::game::zones::move_to_zone(
+                runner.state_mut(),
+                solemnity,
+                Zone::Battlefield,
+                &mut events,
+            );
+        }
+        let declined = runner
+            .act(GameAction::ChooseReplacement {
+                index: DECLINE_REPLACEMENT,
+            })
+            .expect("declining Dredge is legal");
+        settled_events.extend(declined.events);
+
+        let row = format!("solemnity_arrives={solemnity_arrives}");
+        let red_mana = runner.state().players[P0.0 as usize]
+            .mana_pool
+            .count_color(ManaType::Red);
+        assert_eq!(
+            red_mana, 1,
+            "{row}: the mana leg after the counter leg is paid"
+        );
+        let probe_counters = runner.state().objects[&vortex]
+            .counters
+            .get(&probe_counter)
+            .copied()
+            .unwrap_or(0);
+        let expected_probe_counters = if solemnity_arrives { 0 } else { 1 };
+        assert_eq!(
+            probe_counters, expected_probe_counters,
+            "{row}: the counter is placed unless Solemnity prevents it"
+        );
+        assert_eq!(
+            ZoneSizes::of(&runner, P0).hand,
+            hand_before + 1,
+            "{row}: the draw leg drew its card once Dredge was declined"
+        );
+        assert_eq!(
+            zone_of(&runner, vortex),
+            Zone::Battlefield,
+            "{row}: the upkeep was paid"
+        );
+        assert!(
+            runner.state().pending_cost_move_resume.is_none(),
+            "{row}: nothing is left parked"
+        );
+        assert!(
+            upkeep_ability_resolved(&settled_events, vortex),
+            "{row}: the paid epilogue ran"
+        );
+    }
+}
+
+/// CR 614.17b: when Solemnity is already on the battlefield at the prompt, P0 can't choose to pay the mixed
+/// cost, because it includes a counter placement that can't happen; nothing is paid, and declining
+/// sacrifices Psychic Vortex.
+#[test]
+fn a_counter_prohibition_at_the_prompt_refuses_the_mixed_payment() {
+    let (mut runner, vortex, solemnity) = mixed_cost_board();
+    let mut events = Vec::new();
+    engine::game::zones::move_to_zone(
+        runner.state_mut(),
+        solemnity,
+        Zone::Battlefield,
+        &mut events,
+    );
+    let hand_before = ZoneSizes::of(&runner, P0).hand;
+
+    assert!(
+        runner.act(GameAction::PayUnlessCost { pay: true }).is_err(),
+        "a player can't choose to pay a cost that includes a counter placement that can't happen"
+    );
+    assert_eq!(
+        runner.state().players[P0.0 as usize]
+            .mana_pool
+            .count_color(ManaType::Red),
+        0,
+        "a refused choice pays no mana"
+    );
+    assert_eq!(
+        ZoneSizes::of(&runner, P0).hand,
+        hand_before,
+        "a refused choice draws nothing"
+    );
+
+    runner
+        .act(GameAction::PayUnlessCost { pay: false })
+        .expect("declining stays legal");
+    assert_eq!(zone_of(&runner, vortex), Zone::Graveyard);
 }

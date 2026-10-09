@@ -11363,9 +11363,11 @@ fn optional_effect_is_infeasible(state: &GameState, ability: &ResolvedAbility) -
                 payer,
                 ability.source_id,
                 cost,
+                // CR 614.17b: an offer is by definition a fresh choice to pay.
                 &crate::game::costs::PaymentScope::Resolution {
                     ability: &payment_ability,
                     cost_move_root: crate::game::costs::ResolutionCostMoveRoot::EffectPayCost,
+                    origin: ResolutionPaymentOrigin::FreshChoice,
                 },
             )
         }
@@ -11558,9 +11560,11 @@ pub(crate) fn resolution_optional_payment_options(
         return None;
     };
     let payer = crate::game::targeting::resolve_effect_player_ref(state, ability, payer)?;
+    // CR 614.17b: an offered option is by definition a fresh choice to pay.
     let scope = crate::game::costs::PaymentScope::Resolution {
         ability,
         cost_move_root: crate::game::costs::ResolutionCostMoveRoot::EffectPayCost,
+        origin: ResolutionPaymentOrigin::FreshChoice,
     };
     let options = costs
         .iter()

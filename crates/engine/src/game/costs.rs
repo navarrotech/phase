@@ -225,14 +225,44 @@ pub(crate) enum PaymentScope<'a> {
     ///
     /// The CR 614.17b choice gate runs once at the entry
     /// (`pay_ability_cost_for_resolution_with_cost_move_root`) for a fresh
-    /// payment; a latched resume skips it.
+    /// payment; a latched resume skips it. `origin` is the regime the leg arms
+    /// read through [`PaymentScope::prevented_event_refuses_payment`]: on a
+    /// latched resume every leg completes a prevented event as paid
+    /// (CR 118.11 + CR 118.12).
     Resolution {
         ability: &'a ResolvedAbility,
         cost_move_root: ResolutionCostMoveRoot,
+        origin: ResolutionPaymentOrigin,
     },
 }
 
 impl PaymentScope<'_> {
+    /// CR 614.17b + CR 118.11 + CR 118.12: whether a cost leg whose event a
+    /// can't-effect forbids refuses the payment.
+    ///
+    /// Choosing to pay is refused (CR 614.17b) — at activation, where the leg's
+    /// own arm is the only gate, and on a fresh resolution choice. A latched
+    /// resume continues a choice already made (CR 118.12): the prevented event
+    /// is an action modified by an effect, and the cost has still been paid
+    /// (CR 118.11).
+    ///
+    /// The `Effect::Draw` arm deliberately does not consult this: its fresh
+    /// refusal is the joint CR 121.2b measure across every leg, which only the
+    /// entry gate can see.
+    fn prevented_event_refuses_payment(&self) -> bool {
+        match self {
+            PaymentScope::Activation { .. }
+            | PaymentScope::Resolution {
+                origin: ResolutionPaymentOrigin::FreshChoice,
+                ..
+            } => true,
+            PaymentScope::Resolution {
+                origin: ResolutionPaymentOrigin::LatchedSuffix,
+                ..
+            } => false,
+        }
+    }
+
     /// CR 201.5a: the granter stamped on the ability whose cost is being paid.
     fn granting_object(
         &self,
@@ -484,6 +514,7 @@ fn effect_pay_cost_mana_resume(
     let PaymentScope::Resolution {
         ability,
         cost_move_root: ResolutionCostMoveRoot::EffectPayCost,
+        ..
     } = scope
     else {
         return None;
@@ -690,8 +721,8 @@ pub(crate) fn pay_ability_cost_for_resolution(
 /// latched — a parked unless-payment suffix, a paused mana-source
 /// `EffectPayCost` root, a prepended `PayCost` remainder, or a replayed staged
 /// transaction root. Never applies the CR 614.17b choice gate; each draw is
-/// still clamped as it happens (CR 118.11 + CR 614.17a); counter legs keep
-/// their in-arm CR 614.17a refusal.
+/// still clamped as it happens (CR 118.11 + CR 614.17a), and a prevented
+/// counter event completes as paid (CR 118.11 + CR 118.12).
 pub(crate) fn resume_ability_cost_for_resolution(
     state: &mut GameState,
     payer: PlayerId,
@@ -774,7 +805,9 @@ fn pay_ability_cost_for_resolution_with_cost_move_root(
     // CR 614.17b + CR 121.2b: "If an event can't happen, a player can't choose
     // to pay a cost that includes that event." Every fresh resolution payment,
     // singleton or `Composite`, meets this one choice gate before any leg is
-    // paid. A latched payment already passed it (CR 118.12).
+    // paid. A latched payment already passed it (CR 118.12). The origin is
+    // carried into the scope so a latched resume's legs complete prevented
+    // events as paid (CR 118.11).
     match origin {
         ResolutionPaymentOrigin::FreshChoice => {
             if resolution_cost_includes_impossible_event(state, payer, cost, ability) {
@@ -794,6 +827,7 @@ fn pay_ability_cost_for_resolution_with_cost_move_root(
         &PaymentScope::Resolution {
             ability,
             cost_move_root,
+            origin,
         },
         Some(cost),
     )
@@ -1464,12 +1498,20 @@ fn pay_ability_cost_inner(
                 } => {
                     let count = resolve_cost_quantity(state, count, player, source_id, scope);
                     // CR 614.17b: "If an event can't happen, a player can't
-                    // choose to pay a cost that includes that event" — a
-                    // prevented counter placement pays none of this cost. The
-                    // shared add primitive reports both a delivered and
-                    // prevented event as complete because effect resolution
-                    // needs that distinction only for continuation; payment must
-                    // reject the prevented case before executing it.
+                    // choose to pay a cost that includes that event." Whether a
+                    // prevented placement refuses this payment depends on the
+                    // regime (`PaymentScope::prevented_event_refuses_payment`):
+                    // - Activation: this in-arm refusal is the only CR 614.17b
+                    //   gate (see below).
+                    // - Fresh resolution choice: the entry gate
+                    //   (`resolution_cost_includes_impossible_event`) already
+                    //   refused the choice; this refusal is defense in depth.
+                    // - Latched resume (CR 118.12 + CR 118.11): the choice was
+                    //   already made, so the prevented placement is an action
+                    //   modified by an effect and the cost has still been paid.
+                    //   `add_counter_with_replacement` reports `Prevented` as a
+                    //   completed instruction, and the `Composite` continues with
+                    //   its later legs.
                     //
                     // The gate is `replacement::mandatory_prevention_applies`
                     // (CR 614.17: "some effects state that something can't
@@ -1489,21 +1531,20 @@ fn pay_ability_cost_inner(
                     // (CR 118.12). The two legs partition the space; they do not
                     // disagree.
                     //
-                    // CR 614.17b + CR 119.8 (analogue): the CHOICE is refused at the resolution
-                    // authority's entry for a fresh payment; this in-arm refusal remains the
-                    // activation gate and the CR 614.17a mid-payment backstop. The predicate
-                    // `resolution_cost_includes_impossible_event` is never consulted at
-                    // `PaymentScope::Activation` — `is_payable_for_activation` admits every
-                    // `EffectCost` unconditionally, and `can_pay` dry-runs this arm — so here it is
-                    // the only CR 614.17b gate an activated counter cost meets.
-                    let prevented = self_counter_placement_is_prohibited(
-                        state,
-                        player,
-                        source_id,
-                        counter_type.clone(),
-                        resolved_cost_count(count),
-                    );
-                    if prevented {
+                    // The predicate `resolution_cost_includes_impossible_event` is never
+                    // consulted at `PaymentScope::Activation` — `is_payable_for_activation`
+                    // admits every `EffectCost` unconditionally, and `can_pay` dry-runs this
+                    // arm — so here it is the only CR 614.17b gate an activated counter cost
+                    // meets. The preview runs only when the regime refuses.
+                    if scope.prevented_event_refuses_payment()
+                        && self_counter_placement_is_prohibited(
+                            state,
+                            player,
+                            source_id,
+                            counter_type.clone(),
+                            resolved_cost_count(count),
+                        )
+                    {
                         return Ok(payment_failed(
                             "Counter-placement cost prevented by a replacement effect",
                         ));
@@ -1709,12 +1750,13 @@ fn pay_ability_cost_inner(
         // counters" replacement effects still apply, mirroring the
         // `EffectCost`/`PutCounter` arm's use of the sibling
         // `effects::counters::add_counter_with_replacement` above. A
-        // replacement that PREVENTS the addition (Solemnity) is a genuinely
-        // FAILED payment here, not a paused one: unlike effect resolution
-        // (where "prevented" and "applied" both just mean the pending item is
-        // resolved), a cost that silently gives zero counters must not be
-        // mistaken for having actually been paid, or Ward's deterrent is
-        // bypassed for free.
+        // replacement that PREVENTS the addition (Solemnity) refuses the
+        // CHOICE to pay — at activation and on a fresh resolution choice — so
+        // Ward's deterrent is never bypassed for free: a player can't choose a
+        // cost that silently gives zero counters (CR 614.17b). Once the choice
+        // is latched (CR 118.12), a prevention arriving later is an action
+        // modified by an effect and the leg completes as paid (CR 118.11);
+        // `PaymentScope::prevented_event_refuses_payment` owns that split.
         //
         // CR 614.17b is the rule ("if an event can't happen, a player can't
         // choose to pay a cost that includes that event"). The gate that reaches
@@ -1733,8 +1775,8 @@ fn pay_ability_cost_inner(
         // `engine_payment_choices::resume_counter_addition_unless_payment`
         // (CR 118.12). Same partition as the `EffectCost`/`PutCounter` cost
         // arm. `resolution_cost_includes_impossible_event` refuses the CHOICE
-        // at every site that consumes it, so this refusal is defense in depth
-        // for the CR 614.17a mid-window case rather than the only gate.
+        // at every site that consumes it, so on a fresh resolution choice this
+        // refusal is defense in depth rather than the only gate.
         AbilityCost::GetPlayerCounters {
             counter_kind,
             count,
@@ -1744,9 +1786,11 @@ fn pay_ability_cost_inner(
             ) {
                 super::effects::player_counter::PlayerCounterAdditionOutcome::Applied => {}
                 super::effects::player_counter::PlayerCounterAdditionOutcome::Prevented => {
-                    return Ok(payment_failed(
-                        "Player-counter cost prevented by a replacement effect",
-                    ));
+                    if scope.prevented_event_refuses_payment() {
+                        return Ok(payment_failed(
+                            "Player-counter cost prevented by a replacement effect",
+                        ));
+                    }
                 }
                 super::effects::player_counter::PlayerCounterAdditionOutcome::NeedsChoice => {
                     return Ok(PaymentOutcome::Paused {
@@ -4067,6 +4111,7 @@ mod tests {
         let scope = PaymentScope::Resolution {
             ability: &ability,
             cost_move_root: ResolutionCostMoveRoot::EffectPayCost,
+            origin: ResolutionPaymentOrigin::FreshChoice,
         };
 
         // (i) Waterbend at Resolution → Failed (was a silent no-op `Paid`).
@@ -4186,6 +4231,7 @@ mod tests {
         let scope = PaymentScope::Resolution {
             ability: &ability,
             cost_move_root: ResolutionCostMoveRoot::EffectPayCost,
+            origin: ResolutionPaymentOrigin::FreshChoice,
         };
 
         // (v) + (vi) CLEAN board: the instrument fires only on the prohibition,
@@ -4729,6 +4775,146 @@ mod tests {
         }
     }
 
+    /// CR 614.17b + CR 118.12 + CR 118.11: both prevented-event legs — a counter on the source and a
+    /// counter on the payer — are refused as a CHOICE (the fresh entry fails the whole `Composite` and pays
+    /// nothing), while a latched resume completes the prevented leg as paid and still pays the later
+    /// mana leg. Class coverage: no printed resolution `Composite` carries a `GetPlayerCounters` leg, so
+    /// its latched production entries are reached here through the shared authority.
+    ///
+    /// Revert probe: making `PaymentScope::prevented_event_refuses_payment` return `true` for
+    /// `LatchedSuffix` turns every Solemnity + latched row `Failed` with no red mana.
+    #[test]
+    fn a_latched_resume_completes_a_prevented_counter_event() {
+        use crate::types::ability::{ManaContribution, ManaProduction};
+        use crate::types::mana::{ManaColor, ManaType};
+        use crate::types::player::PlayerCounterKind;
+
+        let probe_counter = CounterType::Generic("probe".to_string());
+        let red_mana_leg = AbilityCost::EffectCost {
+            effect: Box::new(Effect::Mana {
+                produced: ManaProduction::Fixed {
+                    colors: vec![ManaColor::Red],
+                    contribution: ManaContribution::Base,
+                },
+                restrictions: vec![],
+                grants: vec![],
+                expiry: None,
+                target: None,
+            }),
+        };
+        let prevented_legs = [
+            (
+                "player counter",
+                AbilityCost::GetPlayerCounters {
+                    counter_kind: PlayerCounterKind::Poison,
+                    count: 1,
+                },
+            ),
+            (
+                "source counter",
+                AbilityCost::EffectCost {
+                    effect: Box::new(Effect::PutCounter {
+                        counter_type: probe_counter.clone(),
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::SelfRef,
+                    }),
+                },
+            ),
+        ];
+
+        for (leg_name, leg) in prevented_legs {
+            let is_player_leg = matches!(leg, AbilityCost::GetPlayerCounters { .. });
+            let cost = AbilityCost::Composite {
+                costs: vec![leg, red_mana_leg.clone()],
+            };
+            assert!(
+                supported_at_resolution(&cost),
+                "{leg_name}: the composite must be a resolution-payable shape"
+            );
+            for solemnity in [false, true] {
+                let mut scenario = GameScenario::new();
+                let source = scenario
+                    .add_enchantment_from_oracle(P0, "Counter Cost Source", "")
+                    .id();
+                if solemnity {
+                    scenario.add_enchantment_from_oracle(
+                        P0,
+                        "Solemnity",
+                        "Players can't get counters.\n\
+                         Counters can't be put on artifacts, creatures, enchantments, or lands.",
+                    );
+                }
+                let ability = draw_cost_ability(source);
+
+                for latched in [false, true] {
+                    let mut state = scenario.state.clone();
+                    let outcome = if latched {
+                        resume_ability_cost_for_resolution(
+                            &mut state,
+                            P0,
+                            &cost,
+                            &ability,
+                            &mut Vec::new(),
+                        )
+                    } else {
+                        pay_ability_cost_for_resolution(
+                            &mut state,
+                            P0,
+                            &cost,
+                            &ability,
+                            &mut Vec::new(),
+                        )
+                    };
+                    let red_mana = state.players[P0.0 as usize]
+                        .mana_pool
+                        .count_color(ManaType::Red);
+                    let poison =
+                        state.players[P0.0 as usize].player_counter(&PlayerCounterKind::Poison);
+                    let source_counters = state.objects[&source]
+                        .counters
+                        .get(&probe_counter)
+                        .copied()
+                        .unwrap_or(0);
+                    let placed_counters = if is_player_leg {
+                        poison
+                    } else {
+                        source_counters
+                    };
+                    let row = format!("{leg_name}, solemnity={solemnity}, latched={latched}");
+
+                    if !solemnity {
+                        // Reach guard: without the prohibition both entries pay both legs, so
+                        // the counter leg genuinely executes on this path.
+                        assert!(
+                            matches!(outcome, Ok(PaymentOutcome::Paid)),
+                            "{row}: {outcome:?}"
+                        );
+                        assert_eq!(red_mana, 1, "{row}: the mana leg is paid");
+                        assert_eq!(
+                            placed_counters, 1,
+                            "{row}: the counter leg places its counter"
+                        );
+                        continue;
+                    }
+                    assert_eq!(placed_counters, 0, "{row}: Solemnity prevents the counter");
+                    if latched {
+                        assert!(
+                            matches!(outcome, Ok(PaymentOutcome::Paid)),
+                            "{row}: a latched prevented counter completes as paid, got {outcome:?}"
+                        );
+                        assert_eq!(red_mana, 1, "{row}: the later mana leg is still paid");
+                    } else {
+                        assert!(
+                            matches!(outcome, Ok(PaymentOutcome::Failed { .. })),
+                            "{row}: the fresh choice is refused, got {outcome:?}"
+                        );
+                        assert_eq!(red_mana, 0, "{row}: a refused choice pays nothing");
+                    }
+                }
+            }
+        }
+    }
+
     // ---------------------------------------------------------------------
     // Resolution-scope `AbilityCost::TapCreatures` payment bounds.
     //
@@ -4781,6 +4967,7 @@ mod tests {
             &PaymentScope::Resolution {
                 ability,
                 cost_move_root: ResolutionCostMoveRoot::EffectPayCost,
+                origin: ResolutionPaymentOrigin::FreshChoice,
             },
             None,
         )
@@ -5264,6 +5451,7 @@ mod tests {
                 &PaymentScope::Resolution {
                     ability: &ability,
                     cost_move_root: ResolutionCostMoveRoot::EffectPayCost,
+                    origin: ResolutionPaymentOrigin::FreshChoice,
                 },
             );
             assert_eq!(

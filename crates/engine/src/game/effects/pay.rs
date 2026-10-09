@@ -321,7 +321,9 @@ pub(crate) fn scale_mana_cost(base: &ManaCost, times: u32) -> ManaCost {
 /// `Composite`, meets the choice gate at `costs::pay_ability_cost_for_resolution`;
 /// this `Composite` pre-gate is bypassed under payment-transaction replay. A
 /// latched head (a prepended remainder or the replayed root) pays through
-/// `costs::resume_ability_cost_for_resolution`.
+/// `costs::resume_ability_cost_for_resolution`; a latched `Composite` head
+/// never reaches the pre-gate, because it drains under
+/// `payment_transaction_replay`.
 fn resolve_ability_cost_payment(
     state: &mut GameState,
     ability: &ResolvedAbility,
@@ -340,6 +342,7 @@ fn resolve_ability_cost_payment(
             &costs::PaymentScope::Resolution {
                 ability,
                 cost_move_root: costs::ResolutionCostMoveRoot::EffectPayCost,
+                origin,
             },
         )
     {
