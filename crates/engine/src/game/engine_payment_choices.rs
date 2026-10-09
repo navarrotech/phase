@@ -2544,8 +2544,8 @@ pub(super) fn resume_ward_sacrifice_payment(
 /// travel in `unpaid_suffix` with their payer, and this root pays them through the authority's latched entry
 /// (`costs::resume_ability_cost_for_resolution`), parking again, with the checkpoint payload carried forward
 /// unchanged, if a later leg pauses in turn. The paused leg's own remaining draws belong to its active draw
-/// frame (CR 614.11a), never to the suffix. It calls the authority directly rather than re-entering `handle_unless_payment`, whose live CR 614.17b
-/// re-check would re-gate a choice CR 118.12 has already latched.
+/// frame (CR 614.11a), never to the suffix. It calls the authority directly rather than re-entering
+/// `handle_unless_payment`, whose live CR 614.17b re-check would re-gate a choice CR 118.12 has already latched.
 ///
 /// CR 614.11a: by the time this root runs, the paused instruction has completed.
 /// `engine_replacement` drives the active draw frame to completion before it
