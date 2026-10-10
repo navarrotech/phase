@@ -440,6 +440,7 @@ mod tests {
             amount: 5,
             is_combat: true,
             excess: 0,
+            source_incarnation: None,
         });
 
         let mut ability =
@@ -523,6 +524,7 @@ mod tests {
             amount: 4,
             is_combat: true,
             excess: 0,
+            source_incarnation: None,
         });
 
         let mut events = Vec::new();

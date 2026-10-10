@@ -1975,7 +1975,8 @@ fn legacy_trigger_condition(x: &TriggerCondition) -> bool {
         | TriggerCondition::ControlsCommander { .. }
         | TriggerCondition::ChosenLabelIs { .. }
         | TriggerCondition::ExceptFirstDrawInDrawStep
-        | TriggerCondition::PlacedByAbilitySource => false,
+        | TriggerCondition::PlacedByAbilitySource
+        | TriggerCondition::AddedManaWithThisAbilityThisTurn => false,
     }
 }
 
@@ -2557,6 +2558,7 @@ fn legacy_filter_prop(p: &FilterProp) -> bool {
         | FilterProp::MatchesLastChosenCardPredicate
         | FilterProp::HasSingleTarget
         | FilterProp::Modal
+        | FilterProp::PrepareSpell
         | FilterProp::NotColor { .. }
         | FilterProp::NotSupertype { .. }
         | FilterProp::Suspected
@@ -2846,6 +2848,7 @@ fn member_bound_filter_prop(p: &FilterProp) -> bool {
         | FilterProp::MatchesLastChosenCardPredicate
         | FilterProp::HasSingleTarget
         | FilterProp::Modal
+        | FilterProp::PrepareSpell
         | FilterProp::NotColor { .. }
         | FilterProp::NotSupertype { .. }
         | FilterProp::Suspected
@@ -3059,8 +3062,10 @@ fn legacy_effect(x: &Effect) -> bool {
         | Effect::Unsuspect { target, .. }
         | Effect::PhaseOut { target }
         | Effect::PhaseIn { target }
-        | Effect::BecomePrepared { target }
-        | Effect::BecomeUnprepared { target }
+        // Both scopes' `target` (announced or population filter) can carry a tag;
+        // `scope` itself is a tag-free enum.
+        | Effect::BecomePrepared { target, .. }
+        | Effect::BecomeUnprepared { target, .. }
         | Effect::BecomeSaddled { target }
         | Effect::ProliferateTarget { target }
         | Effect::Exploit { target }
@@ -6002,7 +6007,10 @@ fn rw_effect(
         // event-context ref there retains the batch prompt (CR 603.10a).
         Effect::Goad { target }
         | Effect::GoadAll { target }
-        | Effect::BecomePrepared { target }
+        // Scope-invariant by design (CR 722.3a): the mass form is a write to each
+        // population member, and the `Other` kind conflicts with every read, so
+        // both scopes are fail-closed alike.
+        | Effect::BecomePrepared { target, scope: _ }
         | Effect::ApplyPerpetual {
             target,
             modification: _,
@@ -7000,7 +7008,15 @@ fn rw_trigger_condition(x: &TriggerCondition) -> RwProfile {
         | TriggerCondition::CastTimingPermission { .. }
         | TriggerCondition::ChosenLabelIs { .. }
         | TriggerCondition::ExceptFirstDrawInDrawStep
-        | TriggerCondition::PlacedByAbilitySource => RwProfile::empty(),
+        | TriggerCondition::PlacedByAbilitySource
+        // CR 603.3b: order-independent. The leaf reads only the ledger entry
+        // keyed by its own `TriggerDefinitionRef` and controller, and the only
+        // writer of that key is a resolution carrying that same ref and player
+        // (`record_triggered_ability_added_mana`). A distinct-definition member
+        // (a second Carpet of Flowers) writes a different key, so no member's
+        // write feeds another member's read; an identical-definition pair
+        // shares one source and takes the existing `all_same_source` path.
+        | TriggerCondition::AddedManaWithThisAbilityThisTurn => RwProfile::empty(),
         // CR 903.3d: a LIVE battlefield census — see `commander_control_read`.
         // Shared with the `AbilityCondition` / `StaticCondition` mirrors of the
         // same printed clause.

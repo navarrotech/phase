@@ -1283,6 +1283,7 @@ fn finish_enter_phase(state: &mut GameState, next: Phase, events: &mut Vec<GameE
     state.lki_cache.clear();
     state.lki_copiable_values.clear();
     state.lki_by_incarnation.clear();
+    state.lki_copiable_values_by_incarnation.clear();
     state.departed_stack_spells.clear();
     // CR 607.2b + CR 603.10e: linked-exile LKI is likewise step-scoped — it only
     // needs to outlive the resolution of the ability whose source just left.
@@ -1684,6 +1685,9 @@ pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
     // boundary alongside other "this turn" trackers (mirrors the cleanup of
     // `trigger_fire_counts_this_turn`).
     state.ability_resolutions_this_turn.clear();
+    // CR 603.4 + CR 607.1c: "added mana with this ability this turn" is a
+    // per-turn record; it resets with the other "this turn" trackers.
+    state.triggered_abilities_added_mana_this_turn.clear();
     state.graveyard_cast_permissions_used.clear();
     // CR 110.4 + CR 601.2a: Reset per-turn-per-permanent-type tracking (Muldrotha).
     state.graveyard_cast_permissions_used_per_type.clear();
