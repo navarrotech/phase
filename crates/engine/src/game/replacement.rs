@@ -9019,7 +9019,6 @@ impl ReplacementPromptCauses {
         Self(cause.bit())
     }
 
-    #[cfg(test)]
     pub(crate) const fn contains(self, cause: ReplacementPromptCause) -> bool {
         self.0 & cause.bit() != 0
     }
@@ -15961,6 +15960,7 @@ mod tests {
                 amount: ambient as u32,
                 is_combat: false,
                 excess: 0,
+                source_incarnation: None,
             });
             let event = ProposedEvent::Damage {
                 source_id: ObjectId(11),

@@ -106,13 +106,25 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
- *  104 — game_setup and state_update carry GameState, whose parked unless-cost
+ *  106 — game_setup and state_update carry GameState, whose parked unless-cost
  *       resume now carries its unpaid legs (unpaid_suffix) and whose queued
  *       continuations carry a PayCost remainder's payment origin
  *       (head_payment_origin), and whose pending cost-move resume gains the
- *       ReplacementMayCostInnerChoice variant. A v103 peer drops the keys silently
+ *       ReplacementMayCostInnerChoice variant. A v105 peer drops the keys silently
  *       and cannot decode the variant, so first contact rejects the skew. Bumped
- *       with full-game protocol 122.
+ *       with full-game protocol 124.
+ *  105 — game_setup and state_update carry GameState, whose ability
+ *       definitions now carry the "prepared spell" filter tag, a scope on
+ *       the become-prepared / become-unprepared effects, the prepared-copy
+ *       source on the cast ledger, and the prepare face on copiable values.
+ *       A v104 peer cannot parse the new tag and would read a mass prepare
+ *       as a single-target one, so first contact rejects the skew. Bumped
+ *       in lockstep with full-game protocol 123.
+ *  104 — game_setup and state_update carry GameState, whose cast grants can now
+ *       name the TriggeringSourceController grantee (and whose damage events
+ *       carry the source incarnation). A v103 peer cannot deserialize the
+ *       tag, so first contact rejects the skew. Bumped with full-game
+ *       protocol 122.
  *  103 — game_setup and state_update carry GameState's successful-mana-history
  *       ledger as (trigger definition, receiving player) pairs. A v102 peer
  *       cannot decode a nonempty pair ledger. Bumped with full-game 121.
@@ -606,7 +618,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 104 as const;
+export const WIRE_PROTOCOL_VERSION = 106 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {

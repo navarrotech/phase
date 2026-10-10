@@ -3348,11 +3348,22 @@ mod tests {
 
     /// `PendingCostMoveResume::CounterAdditionUnlessPayment` gains `unpaid_suffix`
     /// (`UnpaidCostSuffix`, CR 118.12 + CR 702.24a) and `PendingContinuation` gains
-    /// `head_payment_origin` (`ResolutionPaymentOrigin`, CR 614.17a); a v121 peer drops
-    /// both keys silently, so it must be refused before it receives v122 state.
+    /// `head_payment_origin` (`ResolutionPaymentOrigin`, CR 614.17a); a v123 peer drops
+    /// both keys silently, so it must be refused before it receives v124 state.
     /// `PendingCostMoveResume::ReplacementMayCostInnerChoice` (an accepted entry
     /// MayCost parked while its leg's own replacement choice is answered,
-    /// CR 614.12a + CR 614.11a) is a new variant a v121 peer cannot decode.
+    /// CR 614.12a + CR 614.11a) is a new variant a v123 peer cannot decode.
+    /// `FilterProp::PrepareSpell` (CR 722.3d), the `scope` field on
+    /// `Effect::BecomePrepared` / `BecomeUnprepared` (CR 722.3a + CR 115.10a),
+    /// `SpellCastRecord::prepared_copy_source`, `CopiableValues::prepare_face`
+    /// and `GameObject::copied_prepare_face` are new in serialized full-game
+    /// state; a v122 peer cannot parse the new `FilterProp` tag and would read a
+    /// mass prepare as a single-target one, so it must be refused before it
+    /// receives v123 state.
+    /// `PermissionGrantee` gains `TriggeringSourceController` (a cast grant bound to
+    /// the triggering object's controller, CR 603.2 + CR 109.4), and damage events
+    /// carry the source incarnation (CR 400.7); a v121 peer cannot deserialize
+    /// the tag, so it must be refused before it receives v122 state.
     /// The successful-mana-history ledger now stores the actual receiving
     /// player with each trigger definition. A v120 peer cannot decode a
     /// nonempty pair ledger, so it must be refused before v121 state.
@@ -3475,8 +3486,8 @@ mod tests {
     /// `check-protocol-version.mjs` requires the current numeral in this name
     /// and refuses the superseded one.
     #[test]
-    fn protocol_version_is_122_for_draw_cost_resumption() {
-        assert_eq!(PROTOCOL_VERSION, 122);
+    fn protocol_version_is_124_for_draw_cost_resumption() {
+        assert_eq!(PROTOCOL_VERSION, 124);
     }
 
     /// The bump alone is inert — a version number nobody enforces prevents no
@@ -3487,7 +3498,7 @@ mod tests {
     ///
     /// REVERT-PROBE: relax to `PROTOCOL_VERSION - 1` — the exact regression
     /// this guards — and this test reds while
-    /// `protocol_version_is_122_for_draw_cost_resumption` stays
+    /// `protocol_version_is_124_for_draw_cost_resumption` stays
     /// green, which is why the two are separate assertions.
     #[test]
     fn full_game_floor_is_current_only_not_a_rollout_window() {
