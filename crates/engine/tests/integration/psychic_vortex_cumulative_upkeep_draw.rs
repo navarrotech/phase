@@ -64,7 +64,7 @@ const DIVINATION_ORACLE: &str = "Draw two cards.";
 const SOLEMNITY_ORACLE: &str = "Players can't get counters.\n\
 Counters can't be put on artifacts, creatures, enchantments, or lands.";
 
-/// NOT a printed card: the parser-produced Draw-N cumulative-upkeep base (probe P4), used to pin
+/// NOT a printed card: the parser-produced Draw-N cumulative-upkeep base, used to pin
 /// instruction size separately from repetition.
 const DRAW_TWO_VORTEX_ORACLE: &str =
     "Cumulative upkeep\u{2014}Draw two cards. (At the beginning of \

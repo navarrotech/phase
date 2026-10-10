@@ -489,7 +489,7 @@ fn another_players_concession_does_not_unpay_a_staged_draw_cost() {
 }
 
 /// CR 118.12 + CR 702.24a: the three-leg form of the concession row, where the latched remainder pauses
-/// again and re-prepends its own latched remainder (V2h(iv) on the production route).
+/// again and re-prepends its own latched remainder, driven through the production route.
 #[test]
 fn another_players_concession_does_not_unpay_a_three_leg_draw_cost() {
     assert_eq!(

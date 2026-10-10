@@ -4144,7 +4144,7 @@ mod tests {
                 .expect("declining Dredge is legal");
         }
 
-        /// CR 118.12 + CR 118.11 (V2h(i), acceptance for boundary (d)): the remainder a paused PayCost
+        /// CR 118.12 + CR 118.11: the remainder a paused PayCost
         /// queues pays latched. Under Maralen the draw still reaches the Draw arm (the Dredge prompt is
         /// its marker), is clamped, and the remainder settles paid.
         ///
@@ -4197,7 +4197,7 @@ mod tests {
             );
         }
 
-        /// CR 118.12 + CR 121.2b (V2h(ii), multi-authority hostile): the latch binds the queued head only.
+        /// CR 118.12 + CR 121.2b (multi-authority): the latch binds the queued head only.
         /// The head draws P0's one card; the fresh `PayCost` in its tail is then a separate choice, which
         /// Spirit of the Labyrinth refuses. Scope: on this board the head's fresh verdict is also false, so
         /// this row proves the tail is not latched; `a_prepended_pay_cost_remainder_is_latched` owns
@@ -4236,7 +4236,7 @@ mod tests {
             assert!(state.active_ability_continuation().is_none());
         }
 
-        /// CR 118.12 + CR 608.2c (V2h(ii')): the queued head is unconditional. The root's condition held when
+        /// CR 118.12 + CR 608.2c: the queued head is unconditional. The root's condition held when
         /// payment began, so a condition that no longer holds does not skip the latched head, and the
         /// independent tail stays a fresh choice.
         ///
@@ -4272,7 +4272,7 @@ mod tests {
             );
         }
 
-        /// CR 118.12 + CR 608.2c (V2h(iii)): `prepend_remaining_pay_cost_before_parked_rider` queues its suffix
+        /// CR 118.12 + CR 608.2c: `prepend_remaining_pay_cost_before_parked_rider` queues its suffix
         /// latched ahead of an already-parked fresh rider. The rider record is fresh, so the suffix is spliced
         /// onto it, and the rider still runs exactly once.
         ///
@@ -4340,7 +4340,7 @@ mod tests {
             );
         }
 
-        /// CR 118.12 + CR 608.2c (V2h-prune): a latched head survives the forwarded-result prune. The
+        /// CR 118.12 + CR 608.2c: a latched head survives the forwarded-result prune. The
         /// remainder inherits the root's empty forwarded result, and its tail depends on it, so the drain
         /// prunes the tail; the head itself does not depend on it, so the latch travels with it.
         ///
@@ -4402,7 +4402,7 @@ mod tests {
             assert!(state.active_ability_continuation().is_none());
         }
 
-        /// CR 118.12 + CR 608.2c (V2h-merge): a later instruction prepended while a latched record is the
+        /// CR 118.12 + CR 608.2c: a later instruction prepended while a latched record is the
         /// active continuation is parked as its own record above it, never spliced ahead of the latched head.
         /// It still resolves first; the latched record drains right after it, still latched.
         ///
@@ -4497,7 +4497,7 @@ mod tests {
             );
         }
 
-        /// CR 118.12 + CR 614.17b (V2h(v), skipped head): the latch binds to the queued head node, not to
+        /// CR 118.12 + CR 614.17b (skipped head): the latch binds to the queued head node, not to
         /// the first `PayCost` the walker reaches. Here the walker's live "instead" swap replaces the head,
         /// so the head pays nothing, and the `PayCost` in the override's tail is a separate, fresh choice
         /// that Maralen refuses. Scope: the root's own not-swap verdict is not carried onto the remainder
@@ -4553,7 +4553,7 @@ mod tests {
             );
         }
 
-        /// CR 118.12 + CR 614.17b (V2h(v), paying override; helper-contract fixture mirroring
+        /// CR 118.12 + CR 614.17b (paying override; helper-contract fixture mirroring
         /// `a_replaced_latched_head_does_not_latch_the_pay_cost_in_its_tail`): when the "instead" override
         /// that replaces a latched head pays a cost itself, that payment takes the head's place in the node
         /// but not its latch. Nobody chose to pay it, so it is a fresh choice that Maralen refuses.
@@ -4603,7 +4603,7 @@ mod tests {
             );
         }
 
-        /// CR 118.12 + CR 608.2c (V2h(vi), root-only gates): the remainder is one already-admitted
+        /// CR 118.12 + CR 608.2c (root-only gates): the remainder is one already-admitted
         /// instruction. The root's repeat count and repeat-until loop belong to their own parked frames, so
         /// the drained remainder resolves once: its latched draw is P0's only draw, and nothing re-runs it.
         ///
@@ -4649,7 +4649,7 @@ mod tests {
             }
         }
 
-        /// CR 118.12 + CR 608.2c (V2h(vii), root-only gates): the root's player fan-out is not inherited. The
+        /// CR 118.12 + CR 608.2c (root-only gates): the root's player fan-out is not inherited. The
         /// remainder is the head node itself, so it pays latched and reaches the Draw arm under Maralen.
         ///
         /// Revert probe: keeping `player_scope` fans the remainder out into per-player legs, each a node of
