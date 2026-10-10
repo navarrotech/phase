@@ -12834,14 +12834,14 @@ fn filter_prop_binding_diverges(prop: &FilterProp, reader: BindingReader) -> boo
         // resolution-local effect-context object, which does not exist for
         // either reader; with one, the reference set is resolved like
         // `DistinctFrom`'s.
-        FilterProp::SharesQuality { reference, .. } => match (reference, reader) {
-            (None, _) => true,
-            (Some(reference), BindingReader::DelayedTriggerFireTime) => {
-                filter_binding_diverges(reference, reader)
-            }
-            // CR 106.7 + CR 603.2: `object_shares_quality_with_reference_filter`
-            // resolves the reference through `resolve_event_context_targets`.
-            (Some(_), BindingReader::HypotheticalResolution) => true,
+        FilterProp::SharesQuality { reference, .. } => match reference {
+            None => true,
+            Some(reference) => match reader {
+                BindingReader::DelayedTriggerFireTime => filter_binding_diverges(reference, reader),
+                // CR 106.7 + CR 603.2: `object_shares_quality_with_reference_filter`
+                // resolves the reference through `resolve_event_context_targets`.
+                BindingReader::HypotheticalResolution => true,
+            },
         },
 
         // ---- Nested player predicates and controller scopes: recurse. ----
@@ -25907,8 +25907,8 @@ pub mod tests {
     #[test]
     fn binding_family_answers_for_both_readers() {
         use crate::types::ability::{
-            AbilityUseTally, CastManaObjectScope, CastManaSpentMetric, CastVariantPaid,
-            CoinFlipResult, EffectOutcomeSignal, ObjectScope,
+            AbilityUseTally, CastManaObjectScope, CastManaSpentMetric, CastTimingPermission,
+            CastVariantPaid, CoinFlipResult, EffectOutcomeSignal, ObjectScope,
         };
 
         fn quantity(qty: QuantityRef) -> (bool, bool) {
@@ -26008,24 +26008,233 @@ pub mod tests {
             (true, true)
         );
 
-        // One row per delta-table group.
-        assert_eq!(
-            count(creatures_with(vec![FilterProp::Another])),
-            (true, false)
-        );
-        assert_eq!(quantity(QuantityRef::CardsExiledBySource), (true, false));
-        assert_eq!(count(TargetFilter::ExiledBySource), (true, false));
-        assert_eq!(
-            gate(AbilityCondition::WasCast { zone: None }),
-            (true, false)
-        );
-        assert_eq!(
-            quantity(QuantityRef::Power {
-                scope: ObjectScope::EventSource,
-            }),
-            (false, true)
-        );
-        assert_eq!(count(TargetFilter::TriggeringSource), (false, true));
+        // The delta table: every hand-written `match reader` arm of the family,
+        // each read by both readers. A row is `(leaf, verdicts, expected)`, and
+        // both halves of every pair are asserted, so a swapped polarity in either
+        // reader of any arm fails here.
+        let controlled_by =
+            |controller| TargetFilter::Typed(TypedFilter::creature().controller(controller));
+        let controller_matches = |player| {
+            creatures_with(vec![FilterProp::ControllerMatches {
+                player: Box::new(player),
+            }])
+        };
+        let shares_name_with = |reference: Option<TargetFilter>| {
+            creatures_with(vec![FilterProp::SharesQuality {
+                quality: SharedQuality::Name,
+                reference: reference.map(Box::new),
+                relation: SharedQualityRelation::default(),
+            }])
+        };
+        let delta_rows = [
+            // CR 601.2: the cast context, read off the resolving ability or the
+            // source's persisted stamps — state for the hypothetical.
+            (
+                "WasCast",
+                gate(AbilityCondition::WasCast { zone: None }),
+                (true, false),
+            ),
+            (
+                "CastDuringPhase",
+                gate(AbilityCondition::CastDuringPhase {
+                    phases: vec![Phase::PreCombatMain],
+                }),
+                (true, false),
+            ),
+            (
+                "ControllerControlledMatchingAsCast",
+                gate(AbilityCondition::ControllerControlledMatchingAsCast {
+                    filter: creatures_you_control(),
+                }),
+                (true, false),
+            ),
+            (
+                "CastTimingPermission",
+                gate(AbilityCondition::CastTimingPermission {
+                    permission: CastTimingPermission::AsThoughHadFlash,
+                }),
+                (true, false),
+            ),
+            (
+                "ManaColorSpent",
+                gate(AbilityCondition::ManaColorSpent {
+                    color: SpentColor::ColorWord {
+                        color: ManaColor::Red,
+                    },
+                    minimum: 1,
+                }),
+                (true, false),
+            ),
+            (
+                "CastVariantPaidInstead",
+                gate(AbilityCondition::CastVariantPaidInstead {
+                    variant: CastVariantPaid::Ninjutsu,
+                }),
+                (true, false),
+            ),
+            // CR 607.2a: the persistent linked-exile store is state.
+            (
+                "QuantityRef::CardsExiledBySource",
+                quantity(QuantityRef::CardsExiledBySource),
+                (true, false),
+            ),
+            (
+                "TargetFilter::ExiledBySource",
+                count(TargetFilter::ExiledBySource),
+                (true, false),
+            ),
+            (
+                "FilterProp::SameNameAsExiledBySource",
+                count(creatures_with(vec![FilterProp::SameNameAsExiledBySource])),
+                (true, false),
+            ),
+            (
+                "PlayerFilter::OwnersOfCardsExiledBySource",
+                count(controller_matches(
+                    PlayerFilter::OwnersOfCardsExiledBySource,
+                )),
+                (true, false),
+            ),
+            (
+                "CardTypeSetSource::ExiledBySource",
+                quantity(QuantityRef::DistinctCardTypes {
+                    source: CardTypeSetSource::ExiledBySource,
+                }),
+                (true, false),
+            ),
+            // The fire-time-only `Another → OtherThanTriggerObject` rewrite.
+            (
+                "FilterProp::Another",
+                count(creatures_with(vec![FilterProp::Another])),
+                (true, false),
+            ),
+            // CR 603.2: the matched event's referents, which a CR 106.7 reader
+            // has no event to bind.
+            (
+                "ObjectScope::EventSource",
+                quantity(QuantityRef::Power {
+                    scope: ObjectScope::EventSource,
+                }),
+                (false, true),
+            ),
+            (
+                "ObjectScope::EventTarget",
+                quantity(QuantityRef::Power {
+                    scope: ObjectScope::EventTarget,
+                }),
+                (false, true),
+            ),
+            (
+                "ControllerRef::TriggeringPlayer",
+                count(controlled_by(ControllerRef::TriggeringPlayer)),
+                (false, true),
+            ),
+            (
+                "TargetFilter::TriggeringSource",
+                count(TargetFilter::TriggeringSource),
+                (false, true),
+            ),
+            (
+                "TargetFilter::TriggeringSourceController",
+                count(TargetFilter::TriggeringSourceController),
+                (false, true),
+            ),
+            (
+                "TargetFilter::EventTargetController",
+                count(TargetFilter::EventTargetController),
+                (false, true),
+            ),
+            (
+                "TargetFilter::TriggeringSpellController",
+                count(TargetFilter::TriggeringSpellController),
+                (false, true),
+            ),
+            (
+                "TargetFilter::TriggeringSpellOwner",
+                count(TargetFilter::TriggeringSpellOwner),
+                (false, true),
+            ),
+            (
+                "TargetFilter::TriggeringPlayer",
+                count(TargetFilter::TriggeringPlayer),
+                (false, true),
+            ),
+            (
+                "TargetFilter::EventTarget",
+                count(TargetFilter::EventTarget),
+                (false, true),
+            ),
+            (
+                "FilterProp::OtherThanTriggerObject",
+                count(creatures_with(vec![FilterProp::OtherThanTriggerObject])),
+                (false, true),
+            ),
+            (
+                "ManaSpentToCast { TriggeringSpell }",
+                gate(at_least_one(mana_spent(
+                    CastManaObjectScope::TriggeringSpell,
+                    CastManaSpentMetric::Total,
+                ))),
+                (false, true),
+            ),
+            // CR 508.5: the defending player reaches the trigger event.
+            (
+                "PlayerScope::DefendingPlayer",
+                quantity(QuantityRef::LifeTotal {
+                    player: PlayerScope::DefendingPlayer,
+                }),
+                (false, true),
+            ),
+            (
+                "ControllerRef::DefendingPlayer",
+                count(controlled_by(ControllerRef::DefendingPlayer)),
+                (false, true),
+            ),
+            (
+                "PlayerFilter::DefendingPlayer",
+                count(controller_matches(PlayerFilter::DefendingPlayer)),
+                (false, true),
+            ),
+            (
+                "TargetFilter::DefendingPlayer",
+                count(TargetFilter::DefendingPlayer),
+                (false, true),
+            ),
+            // A reference position reads the event even where the same filter
+            // as a population does not; with no reference the subject is
+            // resolution-local for both readers.
+            (
+                "DistinctFrom { StackSpell }",
+                count(creatures_with(vec![FilterProp::DistinctFrom {
+                    reference: Box::new(TargetFilter::StackSpell),
+                }])),
+                (false, true),
+            ),
+            (
+                "SharesQuality { None }",
+                count(shares_name_with(None)),
+                (true, true),
+            ),
+            (
+                "SharesQuality { TriggeringSource }",
+                count(shares_name_with(Some(TargetFilter::TriggeringSource))),
+                (false, true),
+            ),
+            (
+                "SharesQuality { ParentTarget }",
+                count(shares_name_with(Some(TargetFilter::ParentTarget))),
+                (true, true),
+            ),
+            // CR 701.57a: a ledger the triggering discover publishes.
+            (
+                "TriggeringDiscoverValue",
+                quantity(QuantityRef::TriggeringDiscoverValue),
+                (false, true),
+            ),
+        ];
+        for (leaf, verdicts, expected) in delta_rows {
+            assert_eq!(verdicts, expected, "{leaf}: (fire time, hypothetical)");
+        }
 
         // The ordinal ledger is published by the resolution being asked about.
         assert_eq!(
@@ -26045,14 +26254,8 @@ pub mod tests {
             (true, true)
         );
 
-        // Mana spent to cast: the scope axis, then the metric's population.
-        assert_eq!(
-            gate(at_least_one(mana_spent(
-                CastManaObjectScope::TriggeringSpell,
-                CastManaSpentMetric::Total,
-            ))),
-            (false, true)
-        );
+        // Mana spent to cast: the scope axis's other arms (`TriggeringSpell` is
+        // in the delta table), then the metric's population.
         assert_eq!(
             quantity(mana_spent(
                 CastManaObjectScope::SelfObject,
@@ -26111,51 +26314,9 @@ pub mod tests {
             (true, true)
         );
 
-        assert_eq!(
-            quantity(QuantityRef::TriggeringDiscoverValue),
-            (false, true)
-        );
-
-        // The CR 508.5 defending-player family reaches the trigger event.
-        assert_eq!(
-            quantity(QuantityRef::LifeTotal {
-                player: PlayerScope::DefendingPlayer,
-            }),
-            (false, true)
-        );
-        assert_eq!(
-            count(TargetFilter::Typed(
-                TypedFilter::creature().controller(ControllerRef::DefendingPlayer)
-            )),
-            (false, true)
-        );
-        assert_eq!(
-            count(creatures_with(vec![FilterProp::ControllerMatches {
-                player: Box::new(PlayerFilter::DefendingPlayer),
-            }])),
-            (false, true)
-        );
-        assert_eq!(count(TargetFilter::DefendingPlayer), (false, true));
-
-        // A reference position reads the event even where the same filter as a
-        // population does not.
-        assert_eq!(
-            count(creatures_with(vec![FilterProp::DistinctFrom {
-                reference: Box::new(TargetFilter::StackSpell),
-            }])),
-            (false, true)
-        );
-        assert_eq!(
-            count(creatures_with(vec![FilterProp::SharesQuality {
-                quality: SharedQuality::Name,
-                reference: Some(Box::new(TargetFilter::TriggeringSource)),
-                relation: SharedQualityRelation::default(),
-            }])),
-            (false, true)
-        );
+        // Not deltas. `StackSpell` is a live stack scan as a population (its
+        // reference position is in the delta table).
         assert_eq!(count(TargetFilter::StackSpell), (false, false));
-
-        // Not deltas.
         assert_eq!(
             count(TargetFilter::Typed(
                 TypedFilter::creature().controller(ControllerRef::EnchantedPlayer)

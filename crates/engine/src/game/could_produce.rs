@@ -36,7 +36,8 @@
 //! - **Replacements** (CR 614.1a + CR 616.1): each type is mapped through
 //!   `replacement::hypothetical_produced_mana_types`, in every order, with
 //!   CR 106.12's "tapped for mana" only for the {T} mana ability's own root
-//!   instruction.
+//!   instruction. One scan per solve (`replacement::produced_mana_may_be_replaced`)
+//!   skips that lookup when no replacement in the game could apply.
 //! - **Referential clauses**: a permanent whose ability is itself a
 //!   could-produce clause reads its population's answers. The populations form a
 //!   graph that may be cyclic (two Reflecting Pools; an Orchard on each side), so
@@ -64,7 +65,7 @@ use super::mana_abilities::{
     sacrifice_cost_choice,
 };
 use super::mana_sources::{has_tap_component, mana_options_from_production};
-use super::replacement::hypothetical_produced_mana_types;
+use super::replacement::{hypothetical_produced_mana_types, produced_mana_may_be_replaced};
 use super::triggers::{
     build_triggered_ability_from_context, check_trigger_condition_with_source,
     gate_binding_diverges, quantity_expr_binding_diverges, trigger_source_context_for_latch,
@@ -142,7 +143,7 @@ struct HypotheticalProduction {
     tap_state: ManaTapState,
     /// CR 106.5: the amount the instruction would add, already known to be
     /// positive — the resolved count, or 1 for a count the ability's own
-    /// activation or resolution fixes (§ quantity rule, [`instruction_amount`]).
+    /// activation or resolution fixes ([`instruction_amount`]).
     amount: u32,
     /// CR 109.5: the controller of the hypothetical resolving node — the player
     /// who would receive the mana, and the one replacements see.
@@ -244,10 +245,13 @@ fn population_members(state: &GameState, population: CouldProducePopulation<'_>)
         }
         CouldProducePopulation::OpponentLands { controller } => {
             let opponents = super::players::opponents(state, controller);
+            // CR 702.26b + CR 702.26d: a phased-out land stays on the battlefield
+            // under its controller but is treated as though it doesn't exist, so
+            // it anchors nothing. The `Matching` arm gets this from
+            // `matches_target_filter`; this arm reads the phased-in list.
             state
-                .battlefield
-                .iter()
-                .copied()
+                .battlefield_phased_in_ids()
+                .into_iter()
                 .filter(|object_id| {
                     state.objects.get(object_id).is_some_and(|object| {
                         opponents.contains(&object.controller)
@@ -314,6 +318,23 @@ struct ReferentialRead {
 /// node and every pass only grows a set, so it terminates within
 /// `6 · |closure| + 1` passes.
 fn solve(state: &GameState, roots: &[ObjectId]) -> Solution {
+    // CR 106.7 + CR 614.1a: one scan per solve decides whether any replacement
+    // could rewrite a production. On the common board none can, and each
+    // production then yields its own type — every amount read here is positive
+    // (`instruction_amount`), so that is exactly what the per-production lookup
+    // would answer, without its whole-game candidate scan per land and type.
+    let replacements_may_apply = produced_mana_may_be_replaced(state);
+    let produced_types = |source: ObjectId,
+                          controller: PlayerId,
+                          mana_type: ManaType,
+                          amount: u32,
+                          tap_state: ManaTapState| {
+        if !replacements_may_apply {
+            return ManaTypeSet::of(mana_type);
+        }
+        hypothetical_produced_mana_types(state, source, controller, mana_type, amount, tap_state)
+    };
+
     let mut nodes: Vec<SolveNode> = Vec::new();
     let mut index: HashMap<ObjectId, usize> = HashMap::new();
     let mut worklist: VecDeque<ObjectId> = roots.iter().copied().collect();
@@ -336,8 +357,7 @@ fn solve(state: &GameState, roots: &[ObjectId]) -> Solution {
                         &produced,
                     );
                     for mana_type in options {
-                        node.seed = node.seed.union(hypothetical_produced_mana_types(
-                            state,
+                        node.seed = node.seed.union(produced_types(
                             object_id,
                             production.controller,
                             mana_type,
@@ -379,8 +399,7 @@ fn solve(state: &GameState, roots: &[ObjectId]) -> Solution {
                         union.union(sets[*member])
                     });
                 for mana_type in project(union, read.measure).iter() {
-                    next = next.union(hypothetical_produced_mana_types(
-                        state,
+                    next = next.union(produced_types(
                         node.object_id,
                         read.controller,
                         mana_type,
@@ -426,7 +445,7 @@ fn hypothetical_productions(state: &GameState, object_id: ObjectId) -> Vec<Hypot
                 // X stays unbound — an activation choice.
                 let mut resolved = build_resolved_from_def(root, object.id, object.controller);
                 resolved.ability_index = Some(ability_index);
-                walk_chain(state, &resolved, Some(definition), &mut productions);
+                walk_chain(state, &resolved, definition, &mut productions);
             }
         }
     }
@@ -480,20 +499,13 @@ fn read_mana_ability_root(
             } else {
                 ManaTapState::NotFromTap
             };
-            push_production(
-                state,
-                branch,
-                effect,
-                tap_state,
-                Some(definition),
-                productions,
-            );
+            push_production(state, branch, effect, tap_state, definition, productions);
             ControlFlow::Continue(())
         });
         // CR 605.3b: the rest of the chain resolves through
         // `resolve_mana_ability_sub_chain` → `effects::resolve_ability_chain`.
         if let Some(sub) = branch.sub_ability.as_deref() {
-            walk_chain(state, sub, Some(definition), productions);
+            walk_chain(state, sub, definition, productions);
         }
     }
 }
@@ -516,9 +528,9 @@ fn read_triggered_abilities(
     }
     let context = trigger_source_context_for_latch(state, object);
     for (trigger_index, entry) in context.trigger_entries.iter().enumerate() {
-        if entry.definition.execute.is_none() {
+        let Some(execute) = entry.definition.execute.as_deref() else {
             continue;
-        }
+        };
         let definition_ref = TriggerDefinitionRef {
             source: context.identity.reference,
             occurrence: entry.occurrence.clone(),
@@ -542,18 +554,14 @@ fn read_triggered_abilities(
             Some(&definition_ref),
         );
         resolved.ability_index = Some(trigger_index);
-        walk_chain(
-            state,
-            &resolved,
-            entry.definition.execute.as_deref(),
-            productions,
-        );
+        walk_chain(state, &resolved, execute, productions);
     }
 }
 
 /// CR 608.2c: the chain the resolver would run from `node`, read with the
-/// resolver's own decisions. `cost_owner` is the definition whose activation
-/// cost a cost-referent production ranges over.
+/// resolver's own decisions. `cost_owner` is the definition whose cost a
+/// cost-referent production ranges over: the activated ability's own
+/// definition, or a triggered ability's execute definition.
 ///
 /// Step 1, the "instead" swap (CR 608.2c + CR 614.1a + CR 614.15): membership
 /// is `effects::is_instead_override`, the decision `effects::instead_swap_applies`
@@ -563,7 +571,7 @@ fn read_triggered_abilities(
 fn walk_chain(
     state: &GameState,
     node: &ResolvedAbility,
-    cost_owner: Option<&AbilityDefinition>,
+    cost_owner: &AbilityDefinition,
     productions: &mut Vec<HypotheticalProduction>,
 ) {
     let instead = node
@@ -611,7 +619,7 @@ fn walk_chain(
 fn walk_performed(
     state: &GameState,
     node: &ResolvedAbility,
-    cost_owner: Option<&AbilityDefinition>,
+    cost_owner: &AbilityDefinition,
     productions: &mut Vec<HypotheticalProduction>,
 ) {
     if let Some(condition) = &node.condition {
@@ -658,7 +666,7 @@ fn walk_performed(
 fn walk_false_gate_path(
     state: &GameState,
     node: &ResolvedAbility,
-    cost_owner: Option<&AbilityDefinition>,
+    cost_owner: &AbilityDefinition,
     productions: &mut Vec<HypotheticalProduction>,
 ) {
     if let Some(else_ability) = node.else_ability.as_deref() {
@@ -682,7 +690,7 @@ fn push_production(
     node: &ResolvedAbility,
     effect: &Effect,
     tap_state: ManaTapState,
-    cost_owner: Option<&AbilityDefinition>,
+    cost_owner: &AbilityDefinition,
     productions: &mut Vec<HypotheticalProduction>,
 ) {
     let Effect::Mana { produced, .. } = effect else {
@@ -738,28 +746,25 @@ fn production_reading(
     state: &GameState,
     produced: &ManaProduction,
     node: &ResolvedAbility,
-    cost_owner: Option<&AbilityDefinition>,
+    cost_owner: &AbilityDefinition,
 ) -> ProductionReading {
     match produced {
-        // CR 608.2k + CR 106.7: an unbound cost referent ranges over the cost's
-        // legal choices. A clause with no activation cost to range over (a
-        // triggered ability) has no referent and no option set.
+        // CR 608.2k + CR 106.7: an unbound cost referent ranges over the legal
+        // choices of `cost_owner`'s cost. For a triggered ability that is its
+        // execute definition's own cost, so the population is empty unless that
+        // definition carries a sacrifice cost.
         ManaProduction::AnyTypeProduceableBy {
             land_filter: TargetFilter::CostPaidObject,
             ..
         } => ProductionReading::Referential {
-            population: cost_owner
-                .map(|ability| {
-                    population_members(
-                        state,
-                        CouldProducePopulation::CostCandidates {
-                            controller: node.controller,
-                            source: node.source_id,
-                            ability,
-                        },
-                    )
-                })
-                .unwrap_or_default(),
+            population: population_members(
+                state,
+                CouldProducePopulation::CostCandidates {
+                    controller: node.controller,
+                    source: node.source_id,
+                    ability: cost_owner,
+                },
+            ),
             measure: CouldProduceMeasure::Types,
         },
         ManaProduction::AnyTypeProduceableBy { land_filter, .. } => {
@@ -1086,6 +1091,49 @@ mod tests {
             ),
             vec![ManaType::Green]
         );
+    }
+
+    /// CR 702.26b + CR 702.26d: a phased-out opponent land stays on the
+    /// battlefield under its controller but anchors nothing — the Orchard
+    /// census skips it, and so does a Reflecting Pool reading that Orchard.
+    #[test]
+    fn a_phased_out_opponent_land_anchors_no_census() {
+        let mut state = main_phase_state();
+        let pool = add_land(
+            &mut state,
+            P0_ID,
+            "Reflecting Pool",
+            vec![tap_mana_ability(reflecting_pool_production(
+                lands_you_control(),
+            ))],
+        );
+        let orchard = add_land(
+            &mut state,
+            P0_ID,
+            "Exotic Orchard",
+            vec![tap_mana_ability(ManaProduction::OpponentLandColors {
+                count: QuantityExpr::Fixed { value: 1 },
+            })],
+        );
+        let forest = add_land(
+            &mut state,
+            P1_ID,
+            "Opponent Forest",
+            vec![tap_mana_ability(fixed(ManaColor::Green))],
+        );
+        assert_eq!(could_produce(&state, pool), vec![ManaType::Green]);
+
+        let mut events = Vec::new();
+        crate::game::phasing::phase_out_object(
+            &mut state,
+            forest,
+            crate::game::game_object::PhaseOutCause::Directly,
+            &mut events,
+        );
+        assert!(state.objects[&forest].is_phased_out(), "reach-guard");
+        assert!(state.battlefield.contains(&forest), "reach-guard");
+        assert!(could_produce(&state, orchard).is_empty());
+        assert!(could_produce(&state, pool).is_empty());
     }
 
     // ---- U-c: replacements in every order ---------------------------------

@@ -21,8 +21,10 @@ use engine::ai_support::legal_actions;
 use engine::game::ability_utils::build_resolved_from_def;
 use engine::game::casting::can_cast_object_now;
 use engine::game::effects::resolve_ability_chain;
+use engine::game::game_object::PhaseOutCause;
 use engine::game::layers::flush_layers;
 use engine::game::mana_abilities::can_activate_mana_ability_now;
+use engine::game::phasing::phase_out_object;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{Effect, ManaProduction};
 use engine::types::actions::GameAction;
@@ -960,6 +962,90 @@ fn sacrificed_reflecting_pool_follows_an_anchored_chain() {
     assert_eq!(pool(&runner, P0), vec![ManaType::Green]);
 }
 
+/// T21c (review 4, CR 702.26b + CR 702.26c + CR 702.26d): a phased-out land is
+/// treated as though it doesn't exist, though it stays on the battlefield under
+/// its controller. With the opponent's Forest — the only direct anchor —
+/// phased out, the Orchard surveys no land and your Reflecting Pool, which
+/// reads the Orchard, could produce nothing; sacrificing the Pool adds nothing.
+/// Phased in, the same chain gives {G}.
+#[test]
+fn phased_out_forest_anchors_no_chain_through_the_orchard() {
+    for phased_out in [true, false] {
+        let (mut scenario, squandered) = board();
+        let pool_land = scenario
+            .add_land_from_oracle(P0, "Reflecting Pool", REFLECTING_POOL)
+            .id();
+        let orchard = scenario
+            .add_land_from_oracle(P0, "Exotic Orchard", EXOTIC_ORCHARD)
+            .id();
+        let forest = scenario.add_basic_land(P1, ManaColor::Green);
+        let mut runner = scenario.build();
+        if phased_out {
+            let mut events = Vec::new();
+            phase_out_object(
+                runner.state_mut(),
+                forest,
+                PhaseOutCause::Directly,
+                &mut events,
+            );
+        }
+
+        let state = runner.state();
+        let forest_object = &state.objects[&forest];
+        assert_eq!(forest_object.is_phased_out(), phased_out, "reach-guard");
+        assert_eq!(
+            (forest_object.zone, forest_object.controller),
+            (Zone::Battlefield, P1),
+            "reach-guard (CR 702.26d): phasing moves the Forest nowhere"
+        );
+        let reads_a_census = |object: ObjectId| {
+            state.objects[&object].abilities.iter().any(|ability| {
+                matches!(
+                    &*ability.effect,
+                    Effect::Mana {
+                        produced: ManaProduction::AnyTypeProduceableBy { .. }
+                            | ManaProduction::OpponentLandColors { .. },
+                        ..
+                    }
+                )
+            })
+        };
+        assert!(
+            reads_a_census(pool_land) && reads_a_census(orchard),
+            "reach-guard: both recursive producers carry their could-produce clause"
+        );
+        let live_lands: Vec<ObjectId> = state
+            .battlefield_phased_in_ids()
+            .into_iter()
+            .filter(|object| {
+                state.objects[object]
+                    .card_types
+                    .core_types
+                    .contains(&CoreType::Land)
+            })
+            .collect();
+        let mut expected_lands = vec![pool_land, orchard];
+        if !phased_out {
+            expected_lands.push(forest);
+        }
+        assert_eq!(
+            live_lands, expected_lands,
+            "reach-guard: no other land could anchor the chain"
+        );
+
+        let activation = activate_and_sacrifice(&mut runner, squandered, pool_land);
+
+        assert_in_graveyard(&runner, pool_land);
+        assert_eq!(activation.prompt_options, None);
+        let expected_mana = if phased_out {
+            Vec::new()
+        } else {
+            vec![ManaType::Green]
+        };
+        assert_eq!(pool(&runner, P0), expected_mana, "phased out: {phased_out}");
+    }
+}
+
 /// T21b (castability, labelled NON-discriminating): on the same board with the
 /// Pool and the Orchard tapped, a {G} spell is offered. Not revert-sensitive by
 /// construction — the Orchard is itself a legal sacrifice that reaches the
@@ -1373,5 +1459,66 @@ fn urzas_saga_could_produce_colorless_only_once_chapter_one_granted_it() {
     let activation = activate_and_sacrifice(&mut runner, squandered, saga);
     assert_in_graveyard(&runner, saga);
     assert_eq!(activation.prompt_options, None);
+    assert_eq!(pool(&runner, P0), vec![ManaType::Colorless]);
+}
+
+// Verbatim Oracle text (Scryfall). Its ruling: "The effects of multiple Mana
+// Reflections are cumulative."
+const MANA_REFLECTION: &str =
+    "If you tap a permanent for mana, it produces twice as much of that mana instead.";
+const RITUAL_OF_SUBDUAL: &str = "Cumulative upkeep {2}\nIf a land is tapped for mana, it produces \
+     colorless mana instead of any other type.";
+
+/// A board with ten Mana Reflections (Copy Enchantment / Replication Technique
+/// are authentic ways to have them) and a Forest.
+fn ten_reflections_board() -> (GameScenario, ObjectId, ObjectId) {
+    let (mut scenario, squandered) = board();
+    for _ in 0..10 {
+        scenario.add_enchantment_from_oracle(P0, "Mana Reflection", MANA_REFLECTION);
+    }
+    let forest = scenario.add_basic_land(P0, ManaColor::Green);
+    (scenario, squandered, forest)
+}
+
+/// T31 (review 4, CR 106.7 + CR 614.5 + CR 616.1f): ten cumulative Mana
+/// Reflections give 10! replacement orders on every hypothetical read. Your
+/// Reflecting Pool reads the Forest through all of them (still Green), and
+/// tapping the Pool for mana really produces 2^10 Green.
+#[test]
+fn reflecting_pool_under_ten_mana_reflections_adds_exactly_1024_green() {
+    let (mut scenario, _squandered, _forest) = ten_reflections_board();
+    let pool_land = scenario
+        .add_land_from_oracle(P0, "Reflecting Pool", REFLECTING_POOL)
+        .id();
+    let mut runner = scenario.build();
+
+    let produced = tap_for_mana(&mut runner, pool_land);
+
+    assert!(
+        runner.state().objects[&pool_land].tapped,
+        "reach-guard: the Pool was tapped for mana"
+    );
+    assert_eq!(produced, vec![ManaType::Green; 1024]);
+}
+
+/// T32 (review 4, CR 106.7 + CR 616.1e): the same ten Reflections joined by
+/// Contamination and Ritual of Subdual, whose order decides the type: the
+/// sacrificed Forest could produce exactly {B} or {C}. Squandered's own
+/// production is not "tapped for mana", so the chosen type arrives once.
+#[test]
+fn sacrificed_forest_under_ten_reflections_and_two_type_rewrites_offers_black_or_colorless() {
+    let (mut scenario, squandered, forest) = ten_reflections_board();
+    scenario.add_enchantment_from_oracle(P0, "Contamination", CONTAMINATION);
+    scenario.add_enchantment_from_oracle(P0, "Ritual of Subdual", RITUAL_OF_SUBDUAL);
+    let mut runner = scenario.build();
+
+    let activation = activate_and_sacrifice(&mut runner, squandered, forest);
+
+    assert_in_graveyard(&runner, forest);
+    assert_eq!(
+        activation.prompt_options,
+        Some(vec![ManaType::Black, ManaType::Colorless])
+    );
+    choose(&mut runner, ManaType::Colorless);
     assert_eq!(pool(&runner, P0), vec![ManaType::Colorless]);
 }
