@@ -198,11 +198,13 @@ fn resume_active_draw_sequences(
         // frame installed beneath this draw frame. Its dispatch finished while
         // the draw frame was on top, so the top-only retirement could not
         // remove it; the completed draw now exposes it, and it is retired here
-        // rather than at the next priority sweep. Two callers observe this: a
-        // parked entry MayCost resumes its permanent's `SpellResolution` only
-        // when that frame is the top again, and an outer draw frame the
-        // retirement exposes is resumed by this same loop, here, instead of at
-        // the priority sweep.
+        // rather than at the next priority sweep, so a parked entry MayCost
+        // finds its permanent's `SpellResolution` on top again. The retirement
+        // never exposes another draw frame: a draw has one `MultiDraw` frame (the
+        // stack validator rejects a second one as a split draw authority), and a
+        // nested draw instruction (Teferi's Ageless Insight's "draw two cards
+        // instead") is a sequence inside that frame, which the loop's top
+        // re-read already resumes without any retirement.
         state.remove_empty_active_post_replacement_frame();
     }
     None

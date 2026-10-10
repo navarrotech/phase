@@ -40,6 +40,10 @@ use engine::types::proposed_event::ProposedEvent;
 use engine::types::resolution::{FrameKind, ResolutionFrame};
 use engine::types::zones::Zone;
 
+use crate::draw_from_general_post_replacement::{
+    choose_replacement, frame_kinds, APPLY_REPLACEMENT, EIGHT_CARD_LIBRARY, STINKWEED_IMP_ORACLE,
+};
+
 const MOX_DIAMOND_ORACLE: &str =
     "If this artifact would enter, you may discard a land card instead. If you do, \
      put this artifact onto the battlefield. If you don't, put it into its owner's \
@@ -555,11 +559,6 @@ fn a_may_cost_draw_leg_resumed_after_a_discard_choice_stays_paid() {
 // record must stay live for its answer while the accepted entry replacement waits, with its unpaid later
 // legs, in `PendingCostMoveResume::ReplacementMayCostInnerChoice`.
 
-/// Stinkweed Imp, verbatim Oracle text: Dredge 5 replaces a draw (CR 702.52a).
-const STINKWEED_IMP_ORACLE: &str = "Flying\nWhenever this creature deals combat damage to a creature, \
-destroy that creature.\nDredge 5 (If you would draw a card, you may mill five cards instead. If you do, \
-return this card from your graveyard to your hand.)";
-
 /// Obstinate Familiar, verbatim Oracle text: an optional skip of a single draw.
 const OBSTINATE_FAMILIAR_ORACLE: &str = "If you would draw a card, you may skip that draw instead.";
 
@@ -572,17 +571,8 @@ would be put into a graveyard from anywhere, exile it instead.";
 const LEYLINE_OF_THE_VOID_ORACLE: &str = "If this card is in your opening hand, you may begin the game with \
 it on the battlefield.\nIf a card would be put into an opponent's graveyard from anywhere, exile it instead.";
 
-/// Teferi's Ageless Insight, verbatim Oracle text: a draw whose substitute is itself a draw instruction.
-const TEFERIS_AGELESS_INSIGHT_ORACLE: &str =
-    "If you would draw a card except the first one you draw in each \
-of your draw steps, draw two cards instead.";
-
-/// At an optional replacement prompt, index 0 applies the replacement and index 1 declines it.
-const APPLY_REPLACEMENT: usize = 0;
+/// At an optional replacement prompt, index 1 declines the replacement.
 const DECLINE_REPLACEMENT: usize = 1;
-
-/// P0's library: Dredge 5 needs at least five cards, and every outcome is read on its size.
-const EIGHT_CARD_LIBRARY: [&str; 8] = ["L1", "L2", "L3", "L4", "L5", "L6", "L7", "L8"];
 
 /// Which leg of the rewritten Mox Diamond MayCost is paid first.
 #[derive(Clone, Copy)]
@@ -692,14 +682,6 @@ fn mox_with_a_replaced_draw_leg(
     }
 }
 
-/// Submit `ChooseReplacement { index }` through the reducer, accumulating its events.
-fn choose_replacement(runner: &mut GameRunner, index: usize, events: &mut Vec<GameEvent>) {
-    let result = runner
-        .act(GameAction::ChooseReplacement { index })
-        .expect("the replacement answer is legal");
-    events.extend(result.events);
-}
-
 /// How many times `object` moved to `zone` across the accumulated events.
 fn moves_of(events: &[GameEvent], object: ObjectId, zone: Zone) -> usize {
     events
@@ -723,14 +705,6 @@ fn entry_and_life_order(events: &[GameEvent], object: ObjectId) -> Vec<&'static 
             GameEvent::LifeChanged { .. } => Some("life"),
             _ => None,
         })
-        .collect()
-}
-
-fn frame_kinds(state: &GameState) -> Vec<FrameKind> {
-    state
-        .resolution_stack
-        .iter()
-        .map(|frame| frame.kind())
         .collect()
 }
 
@@ -1144,7 +1118,9 @@ enum DrawLegAnswer {
 /// replacement. Whatever the answer, the entry precedes the life gain. The Dredge rows settle on the
 /// delivered arm, the skip row on the prevented arm.
 ///
-/// Revert probe: without the rider exclusion, the declined-Dredge row orders the life gain before the entry.
+/// Revert probe: without the rider exclusion, the Dredge rows order the life gain before the entry (the
+/// DredgeApplied row fails first, with `["life", "entry"]`). The skip row is a measurement, not a
+/// discriminator of that exclusion: the prevented arm has no rider drain ahead of its cost drain.
 #[test]
 fn an_entry_may_cost_finishes_before_the_effects_next_instruction() {
     for draw_leg in [
@@ -1276,152 +1252,4 @@ fn a_dredged_then_skipped_draw_leg_completes_the_spell_resolution() {
     assert_eq!(state.objects[&mox].zone, Zone::Battlefield);
     assert_eq!(moves_of(&events, mox, Zone::Battlefield), 1);
     assert_settled(state);
-}
-
-// A draw frame finishing in the post-choice draw driver, with no MayCost involved. These rows pin the end
-// state of the driver's widened behaviour: the emptied substitute frame is retired when the draw completes,
-// and a draw instruction exposed by a finished inner draw is resumed by the same loop.
-
-/// A bare "draw `cards`, then gain 3 life" effect with Stinkweed Imp in P0's graveyard and, optionally,
-/// Teferi's Ageless Insight on P0's battlefield. Returns the runner, the Imp and Teferi's Ageless Insight.
-fn draw_then_gain_life(cards: i32, with_teferi: bool) -> (GameRunner, ObjectId, Option<ObjectId>) {
-    let mut scenario = GameScenario::new();
-    scenario.at_phase(Phase::PreCombatMain);
-    scenario.with_library_top(P0, &EIGHT_CARD_LIBRARY);
-    let imp = scenario
-        .add_creature_to_graveyard(P0, "Stinkweed Imp", 1, 2)
-        .from_oracle_text(STINKWEED_IMP_ORACLE)
-        .id();
-    let teferi = with_teferi.then(|| {
-        scenario
-            .add_enchantment_from_oracle(
-                P0,
-                "Teferi's Ageless Insight",
-                TEFERIS_AGELESS_INSIGHT_ORACLE,
-            )
-            .id()
-    });
-    let mut runner = scenario.build();
-    engine::game::layers::evaluate_layers(runner.state_mut());
-    let draw_then_gain = ResolvedAbility::new(
-        Effect::Draw {
-            count: QuantityExpr::Fixed { value: cards },
-            target: TargetFilter::Controller,
-        },
-        vec![],
-        ObjectId(9000),
-        PlayerId(0),
-    )
-    .sub_ability(ResolvedAbility::new(
-        Effect::GainLife {
-            amount: QuantityExpr::Fixed { value: 3 },
-            player: TargetFilter::Controller,
-        },
-        vec![],
-        ObjectId(9000),
-        PlayerId(0),
-    ));
-    let mut events = Vec::new();
-    resolve_ability_chain(runner.state_mut(), &draw_then_gain, &mut events, 0)
-        .expect("the draw pauses on its replacement choice");
-    (runner, imp, teferi)
-}
-
-/// The order of the Imp's return, every card draw and every life change across the accumulated events.
-fn dredge_draw_and_life_order(events: &[GameEvent], imp: ObjectId) -> Vec<&'static str> {
-    events
-        .iter()
-        .filter_map(|event| match event {
-            GameEvent::ZoneChanged {
-                object_id,
-                to: Zone::Hand,
-                ..
-            } if *object_id == imp => Some("imp returned"),
-            GameEvent::CardDrawn { .. } => Some("drawn"),
-            GameEvent::LifeChanged { .. } => Some("life"),
-            _ => None,
-        })
-        .collect()
-}
-
-/// CR 614.11a + CR 702.52a + CR 608.2c: a dredged draw finishes its substitute (mill five, return the Imp)
-/// before the effect's next instruction, and its emptied substitute frame is retired as the draw completes.
-#[test]
-fn a_dredged_draw_settles_before_the_effects_next_instruction() {
-    let (mut runner, imp, _) = draw_then_gain_life(1, false);
-    let mut events = Vec::new();
-    // Reach guard: the draw's Dredge prompt is open.
-    assert!(matches!(
-        runner
-            .state()
-            .pending_replacement
-            .as_ref()
-            .map(|record| &record.proposed),
-        Some(ProposedEvent::Draw { .. })
-    ));
-    choose_replacement(&mut runner, APPLY_REPLACEMENT, &mut events);
-
-    let state = runner.state();
-    assert_eq!(
-        dredge_draw_and_life_order(&events, imp),
-        vec!["imp returned", "life"]
-    );
-    assert_eq!(state.objects[&imp].zone, Zone::Hand);
-    assert_eq!(library_size(&runner), EIGHT_CARD_LIBRARY.len() - 5);
-    assert_eq!(state.players[0].life, 23);
-    assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
-    assert!(
-        state.resolution_stack.is_empty(),
-        "got {:?}",
-        frame_kinds(state)
-    );
-}
-
-/// CR 616.1 + CR 614.11a + CR 121.6b: the draw is replaced by Teferi's Ageless Insight, whose "draw two cards
-/// instead" is itself a draw instruction; its first draw is dredged. The finished inner draw exposes the
-/// outer instruction, which the driver resumes, and every draw settles before the effect's next instruction.
-#[test]
-fn a_dredged_draw_inside_a_substituted_draw_resumes_the_outer_instruction() {
-    let (mut runner, imp, teferi) = draw_then_gain_life(1, true);
-    let teferi = teferi.expect("Teferi's Ageless Insight was built for this row");
-    let mut events = Vec::new();
-
-    // CR 616.1: Dredge and Teferi's Ageless Insight both apply to the draw; choose Teferi's.
-    let candidates = &runner
-        .state()
-        .pending_replacement
-        .as_ref()
-        .expect("the draw's ordering record owns the slot")
-        .candidates;
-    let substitute = candidates
-        .iter()
-        .position(|candidate| candidate.source == teferi)
-        .expect("Teferi's Ageless Insight is offered");
-    choose_replacement(&mut runner, substitute, &mut events);
-    // Dredge the substitute instruction's first draw.
-    assert_eq!(
-        frame_kinds(runner.state()),
-        vec![
-            FrameKind::AbilityContinuation,
-            FrameKind::PostReplacement,
-            FrameKind::MultiDraw
-        ]
-    );
-    choose_replacement(&mut runner, APPLY_REPLACEMENT, &mut events);
-
-    let state = runner.state();
-    assert_eq!(
-        dredge_draw_and_life_order(&events, imp),
-        vec!["imp returned", "drawn", "life"]
-    );
-    assert_eq!(state.objects[&imp].zone, Zone::Hand);
-    assert_eq!(library_size(&runner), EIGHT_CARD_LIBRARY.len() - 6);
-    assert_eq!(state.players[0].hand.len(), 2, "the Imp and one drawn card");
-    assert_eq!(state.players[0].life, 23);
-    assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
-    assert!(
-        state.resolution_stack.is_empty(),
-        "got {:?}",
-        frame_kinds(state)
-    );
 }
