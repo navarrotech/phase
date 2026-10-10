@@ -106,12 +106,20 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
- *  106 — game_setup and state_update carry GameState, whose parked unless-cost
+ *  109 — game_setup and state_update carry GameState, whose parked unless-cost
  *       resume now carries its unpaid legs (unpaid_suffix) and whose queued
  *       continuations carry a PayCost remainder's payment origin
  *       (head_payment_origin), and whose pending cost-move resume gains the
- *       ReplacementMayCostInnerChoice variant. A v105 peer drops the keys silently
+ *       ReplacementMayCostInnerChoice variant. A v108 peer drops the keys silently
  *       and cannot decode the variant, so first contact rejects the skew. Bumped
+ *       with full-game protocol 127.
+ *  108 — ZoneChangeRecord carries arrival (the owner and controller the destination
+ *       object holds) in game_setup and state_update. Bumped with full-game protocol 126.
+ *  107 — MulliganDecisionEntry and MulliganDeclaration carry free_reveals_taken in
+ *       game_setup and state_update. Bumped with full-game protocol 125.
+ *  106 — game_setup and state_update carry GameState, whose resolved-rules journal
+ *       now admits a land-play rebound_from (Library/Graveyard/Exile -> Battlefield).
+ *       A v105 peer rejects the journal, so first contact rejects the skew. Bumped
  *       with full-game protocol 124.
  *  105 — game_setup and state_update carry GameState, whose ability
  *       definitions now carry the "prepared spell" filter tag, a scope on
@@ -618,7 +626,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 106 as const;
+export const WIRE_PROTOCOL_VERSION = 109 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {

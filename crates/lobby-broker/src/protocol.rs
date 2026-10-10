@@ -60,17 +60,20 @@ pub struct TournamentRequestId(pub u64);
 /// rather than a parse error, and the handshake is the only place that pairing
 /// can be refused. See 24.
 ///
-/// 124 — paused cost payments: `PendingCostMoveResume::CounterAdditionUnlessPayment`
+/// 127 — paused cost payments: `PendingCostMoveResume::CounterAdditionUnlessPayment`
 ///      gains `unpaid_suffix` (`UnpaidCostSuffix`: the unpaid legs of a paused unless
 ///      effect-cost and their payer, CR 118.12 + CR 702.24a) and `PendingContinuation`
 ///      gains `head_payment_origin` (`ResolutionPaymentOrigin`: a queued PayCost remainder
-///      resumes a payment already chosen, CR 614.17a). A v123 peer drops both keys: it
+///      resumes a payment already chosen, CR 614.17a). A v126 peer drops both keys: it
 ///      would settle a paused multi-leg cost with its later legs unpaid and re-gate a
 ///      latched remainder as a fresh choice. `PendingCostMoveResume` also gains
 ///      `ReplacementMayCostInnerChoice` (an accepted entry MayCost parked while its
 ///      leg's own replacement choice is answered, CR 614.12a + CR 614.11a), which a
-///      v123 peer cannot decode. P2P moves to wire 106; no lobby carrier names any
+///      v126 peer cannot decode. P2P moves to wire 109; no lobby carrier names any
 ///      of them.
+/// 126 — `ZoneChangeRecord` gains `arrival` (the owner and controller the destination object holds), serialized inside `GameState` and in the resolved-rules journal's zone-change commands; a v125 peer rejects the journal when the departure owner differs from the command owner. Full-game peers and P2P move in lockstep (wire 108); no lobby carrier names it.
+/// 125 — `MulliganDecisionEntry` and `MulliganDeclaration` (inside `WaitingFor::MulliganDecision`) gain `free_reveals_taken`. Full-game peers and P2P move in lockstep (wire 107); no lobby carrier names it.
+/// 124 — the resolved-rules journal admits a land-play `rebound_from` on a `ResolvedZoneChangeCommand` (Library/Graveyard/Exile -> Battlefield), serialized inside `GameState.resolved_rules_journal`. A v123 peer rejects the state as an invalid resolved-rules journal. Full-game peers and P2P move in lockstep (wire 106); no lobby carrier names it.
 /// 123 — `FilterProp::PrepareSpell` ("a prepared spell" cast-trigger qualifier,
 ///      CR 722.3d), `scope` on `Effect::BecomePrepared` /
 ///      `BecomeUnprepared` (mass "each creature you control becomes
@@ -943,7 +946,7 @@ pub struct TournamentRequestId(pub u64);
 ///      payload; mulligan bottoming folded into a
 ///      `MulliganDecisionPhase::BottomCards` sub-phase on
 ///      `WaitingFor::MulliganDecision`.
-pub const PROTOCOL_VERSION: u32 = 124;
+pub const PROTOCOL_VERSION: u32 = 127;
 
 /// Minimum protocol version accepted by lobby-only brokers at the hello
 /// handshake **from clients that predate [`LOBBY_PROTOCOL_VERSION`]** — the
@@ -2200,12 +2203,12 @@ mod tests {
 
     #[test]
     fn protocol_version_tracks_full_game_wire_additions() {
-        assert_eq!(PROTOCOL_VERSION, 124);
+        assert_eq!(PROTOCOL_VERSION, 127);
         // Lobby keeps its one-version rollout window; full-game servers stay
         // current-only (`server_core::MIN_SUPPORTED_PROTOCOL == PROTOCOL_VERSION`),
         // which refuses an older full-game peer that cannot preserve the exact
         // Full-session identity across draft match attachment and follow-ups.
-        assert_eq!(MIN_SUPPORTED_PROTOCOL, 123);
+        assert_eq!(MIN_SUPPORTED_PROTOCOL, 126);
     }
 
     #[test]
