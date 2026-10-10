@@ -3123,7 +3123,7 @@ pub(super) fn apply_post_replacement_effect(
     if ability_definition_uses_post_replacement_event_target(effect_def) {
         if let Some(target) = state.post_replacement_event_target() {
             if !resolved.targets.contains(target) {
-                resolved.targets.push(target.clone());
+                resolved.push_target(target.clone());
             }
         }
     }
@@ -8488,7 +8488,7 @@ mod tests {
             source_id: source,
             branches,
             branch_descriptions: Vec::new(),
-            parent_targets: Vec::new(),
+            parent_occurrences: Default::default(),
             context: Default::default(),
             continuation: None,
             replacement_applied: Default::default(),
