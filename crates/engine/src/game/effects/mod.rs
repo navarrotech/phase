@@ -4232,9 +4232,7 @@ pub(crate) fn apply_parent_chain_context(
     // always resolve at depth > 0, so propagating the index never causes a
     // spurious counter bump (that happens only at the depth-0 top-level
     // resolution). Guarded on `is_none()` to never clobber an explicit index.
-    if child.ability_index.is_none() {
-        child.ability_index = parent.ability_index;
-    }
+    child.inherit_ability_index(parent.ability_index);
     // CR 608.2c + CR 109.4: Carry the resolution-scoped chosen-players list
     // down the chain so `ControllerRef::ChosenPlayer { index }` and later
     // `Choose(Player)` instructions resolve against players chosen by earlier
@@ -6257,7 +6255,7 @@ fn condition_reads_filter_population(
 /// against an absent result. Recurses And/Or/Not like the sibling
 /// `condition_depends_on_effect_performed` predicate. Predicate helper, not
 /// rule-implementing code — the CR annotation lives at the gate.
-fn condition_depends_on_result_object(condition: &AbilityCondition) -> bool {
+pub(crate) fn condition_depends_on_result_object(condition: &AbilityCondition) -> bool {
     match condition {
         AbilityCondition::TargetMatchesFilter { .. }
         | AbilityCondition::RevealedHasCardType { .. } => true,
@@ -6421,7 +6419,7 @@ fn resolver_performed_outcome(
     performed.map(|performed| performed && !compound_run_unperformed(ability))
 }
 
-fn effect_writes_last_revealed_ids(effect: &Effect) -> bool {
+pub(crate) fn effect_writes_last_revealed_ids(effect: &Effect) -> bool {
     matches!(
         effect,
         Effect::RevealTop { .. }
@@ -6436,6 +6434,116 @@ fn effect_writes_last_revealed_ids(effect: &Effect) -> bool {
     )
 }
 
+/// CR 701.20a + CR 701.20e + CR 608.2c: the objects resolving `node` would
+/// publish to `last_revealed_ids`, computed by the same selection its handler
+/// performs, or `None` when that set is not fixed by state alone for `reader`.
+///
+/// `None` covers a set fixed by a player choice, a random or iterative
+/// process, a target the reader has not bound, or a count or library owner
+/// the reader cannot resolve the way the resolution would. Only members of
+/// [`effect_writes_last_revealed_ids`] publish; every other effect answers
+/// `None`.
+pub(crate) fn published_revealed_ids(
+    state: &GameState,
+    node: &ResolvedAbility,
+    reader: crate::game::triggers::BindingReader,
+) -> Option<Vec<ObjectId>> {
+    use crate::game::triggers::{
+        filter_binding_diverges, quantity_expr_binding_diverges, BindingReader, HypotheticalTargets,
+    };
+
+    let targets = match reader {
+        BindingReader::DelayedTriggerFireTime => HypotheticalTargets::Unchosen,
+        BindingReader::HypotheticalResolution(bindings) => bindings.targets,
+    };
+    // CR 115.1: whose library is read. `resolve_player_for_context_ref` takes a
+    // non-context filter's player (and the parent-target anaphors' players)
+    // from `ability.targets`, so an unbound node cannot name it; a filter the
+    // reader cannot bind (the trigger event's player, the scoped player)
+    // cannot be named either.
+    let library_owner_is_fixed = |filter: &TargetFilter| {
+        let reads_targets = !filter.is_context_ref()
+            || matches!(
+                filter,
+                TargetFilter::ParentTarget
+                    | TargetFilter::ParentTargetSlot { .. }
+                    | TargetFilter::ParentTargetController
+                    | TargetFilter::ParentTargetOwner
+            );
+        !(reads_targets && targets == HypotheticalTargets::Unchosen)
+            && !filter_binding_diverges(filter, reader)
+    };
+
+    let published = match &node.effect {
+        Effect::Dig {
+            player,
+            count,
+            keep_count_expr,
+            ..
+        } => {
+            let counts_are_fixed = !quantity_expr_binding_diverges(count, reader)
+                && keep_count_expr
+                    .as_ref()
+                    .is_none_or(|keep| !quantity_expr_binding_diverges(keep, reader));
+            if !library_owner_is_fixed(player) || !counts_are_fixed {
+                return None;
+            }
+            // CR 701.20e: only the pure peek (nothing kept on this step) hands
+            // its cards on. A keep of one or more pauses on `DigChoice`, whose
+            // continuation is bound to the KEPT cards, a player choice.
+            dig::looked_cards(state, node)
+                .filter(|look| look.publishes_revealed)
+                .map(|look| look.cards)
+        }
+        Effect::RevealTop { player, .. } => {
+            if !library_owner_is_fixed(player) {
+                return None;
+            }
+            reveal_top::revealed_cards(state, node).map(|selection| selection.into_cards())
+        }
+        // CR 701.20a: a targeted reveal shows exactly the objects it was
+        // handed, which only an earlier instruction of this resolution can
+        // have bound (an unbound `ParentTarget` would resolve through
+        // fallbacks the runtime never takes).
+        Effect::Reveal { target } => match targets {
+            HypotheticalTargets::EstablishedByEarlierInstruction => {
+                Some(resolved_effect_object_ids(state, node, target))
+            }
+            HypotheticalTargets::Unchosen => None,
+        },
+        // An iterative stop over a library the handler also moves
+        // (`RevealUntil`), each player's top card plus a later choice
+        // (`Clash`), chosen targets (`TurnFaceUp`), and every non-publisher.
+        _ => None,
+    };
+    published.filter(|ids| !ids.is_empty())
+}
+
+/// CR 608.2c + CR 701.20e: whether `sub` receives the objects `parent` just
+/// looked at or revealed as its targets — the runtime's look-then-act
+/// hand-off, made after a gated sub's gate passed exactly as for an ungated
+/// one. Reads `state.last_revealed_ids`, so a reader that has not run the
+/// parent passes the state the parent's handler would have left.
+pub(crate) fn receives_last_revealed(
+    state: &GameState,
+    parent: &ResolvedAbility,
+    sub: &ResolvedAbility,
+) -> bool {
+    sub.targets.is_empty()
+        && !state.last_revealed_ids.is_empty()
+        && effect_writes_last_revealed_ids(&parent.effect)
+        && (target_filter_for_last_revealed_sub(&sub.effect).is_some()
+            || effect_consumes_parent_object_referent(&sub.effect)
+            || has_member_driven_repeat(sub))
+        // CR 701.21a: Sacrifice resolves its own battlefield-scoped eligible
+        // pool — injecting library card IDs from a look-only Dig (e.g.
+        // Birthing Ritual) would route through effect_object_targets and
+        // silently skip every card (Zone::Library ≠ Zone::Battlefield),
+        // producing no PermanentSacrificed event and leaving
+        // effect_context_object = None for the downstream PriorLook Dig.
+        && !matches!(sub.effect, Effect::Sacrifice { .. })
+}
+
 fn target_filter_for_last_revealed_sub(effect: &Effect) -> Option<&TargetFilter> {
     match effect {
         Effect::CastFromZone { target, .. }
@@ -6447,7 +6555,7 @@ fn target_filter_for_last_revealed_sub(effect: &Effect) -> Option<&TargetFilter>
     }
 }
 
-fn inject_last_revealed_targets(
+pub(crate) fn inject_last_revealed_targets(
     state: &GameState,
     parent_ability: &ResolvedAbility,
     sub: &ResolvedAbility,
@@ -14851,7 +14959,7 @@ fn reset_top_level_resolution_state(state: &mut GameState) {
 
 /// The per-resolution counters `resolve_ability_chain` keeps for a top-level
 /// chain before its first instruction.
-fn count_top_level_resolution(state: &mut GameState, ability: &ResolvedAbility) {
+pub(crate) fn count_top_level_resolution(state: &mut GameState, ability: &ResolvedAbility) {
     if let Some(idx) = ability.ability_index {
         let count = state
             .ability_resolutions_this_turn
@@ -18635,20 +18743,7 @@ fn resolve_chain_body(
                 attachment_candidates,
             );
             resolve_ability_chain(state, &sub_with_context, events, depth + 1)?;
-        } else if sub.targets.is_empty()
-            && !state.last_revealed_ids.is_empty()
-            && effect_writes_last_revealed_ids(&ability.effect)
-            && (target_filter_for_last_revealed_sub(&sub.effect).is_some()
-                || effect_consumes_parent_object_referent(&sub.effect)
-                || has_member_driven_repeat(sub.as_ref()))
-            // CR 701.21a: Sacrifice resolves its own battlefield-scoped eligible
-            // pool — injecting library card IDs from a look-only Dig (e.g.
-            // Birthing Ritual) would route through effect_object_targets and
-            // silently skip every card (Zone::Library ≠ Zone::Battlefield),
-            // producing no PermanentSacrificed event and leaving
-            // effect_context_object = None for the downstream PriorLook Dig.
-            && !matches!(sub.effect, Effect::Sacrifice { .. })
-        {
+        } else if receives_last_revealed(state, ability, sub.as_ref()) {
             // Inject revealed card IDs as targets for sub_abilities following
             // effects that write last_revealed_ids. Parallel to how
             // continuations inject chosen cards as targets.
@@ -19305,7 +19400,10 @@ fn fails_shared_quality(state: &GameState, effective: &ResolvedAbility) -> bool 
 /// CR 608.2b + CR 608.2c: an empty child with local initial-legality removal
 /// evidence inherits nothing. Other children retain players and objects unless
 /// the child owns an independent object slot.
-fn inherited_parent_targets(parent: &ResolvedAbility, sub: &ResolvedAbility) -> Vec<TargetRef> {
+pub(crate) fn inherited_parent_targets(
+    parent: &ResolvedAbility,
+    sub: &ResolvedAbility,
+) -> Vec<TargetRef> {
     if sub.targets.is_empty() && !sub.illegal_local_target_slots.is_empty() {
         return Vec::new();
     }
@@ -21133,6 +21231,221 @@ mod tests {
     use super::*;
     use crate::database::synthesis::synthesize_extort;
     use crate::types::ability::SpentColor;
+
+    /// U-p (CR 701.20a + CR 701.20e + CR 608.2c): `published_revealed_ids` names
+    /// exactly what each publisher's handler would write to
+    /// `last_revealed_ids`, and only when state alone fixes it for the reader.
+    #[test]
+    fn published_revealed_ids_follows_each_publishers_selection() {
+        use crate::game::triggers::{BindingReader, HypotheticalBindings, HypotheticalTargets};
+        use crate::types::ability::{DigRestOrder, DigSource, RevealUntilDisposition};
+
+        let unchosen = BindingReader::HypotheticalResolution(HypotheticalBindings::NONE);
+        let established = BindingReader::HypotheticalResolution(HypotheticalBindings {
+            targets: HypotheticalTargets::EstablishedByEarlierInstruction,
+            ..HypotheticalBindings::NONE
+        });
+
+        let mut state = GameState::new_two_player(42);
+        // `create_object` puts each new library card on top, so create bottom
+        // first: each library reads top first as its returned order.
+        let library = |state: &mut GameState, player: PlayerId| -> Vec<ObjectId> {
+            let mut cards: Vec<ObjectId> = (0..3)
+                .map(|index| {
+                    crate::game::zones::create_object(
+                        state,
+                        crate::types::identifiers::CardId(100 + u64::from(player.0) * 10 + index),
+                        player,
+                        format!("Card {index}"),
+                        Zone::Library,
+                    )
+                })
+                .collect();
+            cards.sort_by_key(|id| {
+                state
+                    .library_of(player)
+                    .iter()
+                    .position(|card| card == id)
+                    .expect("the card is in the library")
+            });
+            cards
+        };
+        let own = library(&mut state, PlayerId(0));
+        let theirs = library(&mut state, PlayerId(1));
+        assert_eq!(
+            state
+                .library_of(PlayerId(0))
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            own,
+            "reach-guard: P0's library, top first"
+        );
+        assert_eq!(
+            state
+                .library_of(PlayerId(1))
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            theirs,
+            "reach-guard: P1's library, top first"
+        );
+
+        let node = |effect: Effect, targets: Vec<TargetRef>| {
+            ResolvedAbility::new(effect, targets, ObjectId(1), PlayerId(0))
+        };
+        let dig = |keep_count: Option<u32>, reveal: bool, source: DigSource| Effect::Dig {
+            player: TargetFilter::Controller,
+            count: QuantityExpr::Fixed { value: 2 },
+            destination: if keep_count == Some(u32::MAX) {
+                Some(Zone::Hand)
+            } else {
+                None
+            },
+            keep_count,
+            keep_count_expr: None,
+            up_to: false,
+            filter: TargetFilter::Any,
+            rest_destination: None,
+            rest_split_top_count: None,
+            rest_order: DigRestOrder::Preserve,
+            reveal,
+            enter_tapped: false,
+            enters_attacking: false,
+            source,
+        };
+        let reveal_top = |player: TargetFilter| Effect::RevealTop { player, count: 1 };
+        let player = |id: u8| TargetRef::Player(PlayerId(id));
+
+        let rows: Vec<(&str, ResolvedAbility, BindingReader, Option<Vec<ObjectId>>)> = vec![
+            (
+                "Dig keep 0, look",
+                node(dig(Some(0), false, DigSource::Library), vec![]),
+                unchosen,
+                Some(own[..2].to_vec()),
+            ),
+            (
+                "Dig keep 0, reveal",
+                node(dig(Some(0), true, DigSource::Library), vec![]),
+                unchosen,
+                Some(own[..2].to_vec()),
+            ),
+            (
+                "Dig keep 1, reveal",
+                node(dig(Some(1), true, DigSource::Library), vec![]),
+                unchosen,
+                None,
+            ),
+            (
+                "Dig keep 1, look",
+                node(dig(None, false, DigSource::Library), vec![]),
+                unchosen,
+                None,
+            ),
+            (
+                "Dig mass put-all",
+                node(dig(Some(u32::MAX), false, DigSource::Library), vec![]),
+                unchosen,
+                None,
+            ),
+            (
+                "Dig over a prior look",
+                node(dig(Some(0), false, DigSource::PriorLook), vec![]),
+                unchosen,
+                None,
+            ),
+            (
+                "RevealTop, controller",
+                node(reveal_top(TargetFilter::Controller), vec![]),
+                unchosen,
+                Some(own[..1].to_vec()),
+            ),
+            (
+                "RevealTop, target player, unchosen",
+                node(reveal_top(TargetFilter::Player), vec![player(1)]),
+                unchosen,
+                None,
+            ),
+            (
+                "RevealTop, target player, established",
+                node(reveal_top(TargetFilter::Player), vec![player(1)]),
+                established,
+                Some(theirs[..1].to_vec()),
+            ),
+            (
+                "RevealTop, two target players, unchosen",
+                node(reveal_top(TargetFilter::Player), vec![player(0), player(1)]),
+                unchosen,
+                None,
+            ),
+            (
+                "Reveal ParentTarget, established",
+                node(
+                    Effect::Reveal {
+                        target: TargetFilter::ParentTarget,
+                    },
+                    vec![TargetRef::Object(own[1])],
+                ),
+                established,
+                Some(vec![own[1]]),
+            ),
+            (
+                "Reveal ParentTarget, unchosen",
+                node(
+                    Effect::Reveal {
+                        target: TargetFilter::ParentTarget,
+                    },
+                    vec![TargetRef::Object(own[1])],
+                ),
+                unchosen,
+                None,
+            ),
+            (
+                "RevealUntil",
+                node(
+                    Effect::RevealUntil {
+                        player: TargetFilter::Controller,
+                        filter: TargetFilter::Any,
+                        count: QuantityExpr::Fixed { value: 1 },
+                        matched_disposition: RevealUntilDisposition::default(),
+                        kept_destination: Zone::Hand,
+                        rest_destination: Zone::Graveyard,
+                        rest_order: DigRestOrder::Preserve,
+                        enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                        enters_attacking: false,
+                        kept_optional_to: None,
+                        enters_under: None,
+                        kept_destination_if: None,
+                    },
+                    vec![],
+                ),
+                unchosen,
+                None,
+            ),
+            (
+                "a non-publisher",
+                node(
+                    Effect::GainLife {
+                        amount: QuantityExpr::Fixed { value: 1 },
+                        player: TargetFilter::Controller,
+                    },
+                    vec![],
+                ),
+                unchosen,
+                None,
+            ),
+        ];
+        for (label, ability, reader, expected) in rows {
+            let published = published_revealed_ids(&state, &ability, reader);
+            assert_eq!(published, expected, "{label}");
+            if published.is_some() {
+                assert!(
+                    effect_writes_last_revealed_ids(&ability.effect),
+                    "{label}: only a publisher publishes"
+                );
+            }
+        }
+    }
 
     /// CR 608.2c: the pile placement after a reveal-only until-loop is bound to the
     /// exact cards that reveal looked at, on the continuation itself — so an

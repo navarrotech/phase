@@ -24,8 +24,7 @@ use crate::analysis::decision_template::{
 };
 use crate::game::game_object::GameObject;
 use crate::types::ability::{
-    AbilityCondition, AbilityDefinition, AbilityUseTally, ActivationRestriction,
-    DamageModification, TargetRef,
+    AbilityUseTally, ActivationRestriction, DamageModification, TargetRef,
 };
 use crate::types::card_type::{CoreType, Supertype};
 use crate::types::counter::CounterType;
@@ -8518,51 +8517,15 @@ fn ability_has_per_turn_activation_gate(state: &GameState, key: &(ObjectId, usiz
 /// can only make states compare DIFFERENT, which is the fail-closed direction
 /// (a loop is rejected, never falsely certified).
 fn ability_reads_own_activation_count(state: &GameState, key: &(ObjectId, usize)) -> bool {
-    fn condition_reads_activation_tally(condition: &AbilityCondition) -> bool {
-        match condition {
-            AbilityCondition::AbilityUseCountThisTurn {
-                tally: AbilityUseTally::Activated,
-                ..
-            } => true,
-            AbilityCondition::AbilityUseCountThisTurn { .. } => false,
-            AbilityCondition::And { conditions } | AbilityCondition::Or { conditions } => {
-                conditions.iter().any(condition_reads_activation_tally)
-            }
-            AbilityCondition::Not { condition }
-            | AbilityCondition::ConditionInstead { inner: condition } => {
-                condition_reads_activation_tally(condition)
-            }
-            _ => false,
-        }
-    }
-
     // The condition lives on whichever chain node carries the gated clause — for
     // the Dragon Whelp class it is the `SequentialSibling` holding
     // `CreateDelayedTrigger`, not the ability root — so the whole definition tree
-    // is walked, not just `def.condition`.
-    fn definition_reads_activation_tally(def: &AbilityDefinition) -> bool {
-        def.condition
-            .as_ref()
-            .is_some_and(condition_reads_activation_tally)
-            || def
-                .sub_ability
-                .as_deref()
-                .is_some_and(definition_reads_activation_tally)
-            || def
-                .else_ability
-                .as_deref()
-                .is_some_and(definition_reads_activation_tally)
-            || def
-                .mode_abilities
-                .iter()
-                .any(definition_reads_activation_tally)
-    }
-
+    // is walked, not just `def.condition` (`AbilityDefinition::reads_ability_use_count`).
     state
         .objects
         .get(&key.0)
         .and_then(|o| o.abilities.get(key.1))
-        .is_some_and(definition_reads_activation_tally)
+        .is_some_and(|def| def.reads_ability_use_count(AbilityUseTally::Activated))
 }
 
 /// CR 602.5b: per-GAME activation gate. Single authority.

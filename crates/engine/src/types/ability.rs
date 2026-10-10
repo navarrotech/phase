@@ -27401,6 +27401,31 @@ impl AbilityDefinition {
                 .as_ref()
                 .is_some_and(AbilityCondition::is_optional_effect_performed)
     }
+
+    /// CR 602.2a + CR 608.2c: whether any node of this printed ability reads
+    /// its per-turn `tally` ([`AbilityCondition::reads_ability_use_count`]).
+    ///
+    /// The whole definition tree is walked, not just `condition`: the gated
+    /// clause sits on whichever chain node carries it (Dragon Whelp's
+    /// `SequentialSibling` holding `CreateDelayedTrigger`, Soulbright Seeker's
+    /// mana sub), and a modal ability's modes are ways it resolves.
+    pub fn reads_ability_use_count(&self, tally: AbilityUseTally) -> bool {
+        self.condition
+            .as_ref()
+            .is_some_and(|condition| condition.reads_ability_use_count(tally))
+            || self
+                .sub_ability
+                .as_deref()
+                .is_some_and(|sub| sub.reads_ability_use_count(tally))
+            || self
+                .else_ability
+                .as_deref()
+                .is_some_and(|other| other.reads_ability_use_count(tally))
+            || self
+                .mode_abilities
+                .iter()
+                .any(|mode| mode.reads_ability_use_count(tally))
+    }
 }
 
 /// The result of an `Effect::OpponentGuess` round-trip.
@@ -28311,6 +28336,33 @@ impl AbilityCondition {
             AbilityCondition::Not { condition }
                 if condition.is_optional_effect_performed()
         )
+    }
+
+    /// CR 602.2a + CR 608.2c: whether this condition reads its own ability's
+    /// per-turn `tally` (`AbilityUseCountThisTurn`), through `And` / `Or` /
+    /// `Not` / `ConditionInstead`.
+    ///
+    /// Two readers rely on it. The loop firewall (`analysis::resource`) retains
+    /// a count any condition reads. The CR 106.7 walker (`game::could_produce`)
+    /// projects the use ledgers through one hypothetical resolution only for an
+    /// ability that reads one. Every other condition answers `false`, the
+    /// fail-closed direction for both: a missed reader keeps the firewall's
+    /// count and leaves the walker reading the gate both ways (the live
+    /// ledger), never deciding it against a ledger that was not projected.
+    pub fn reads_ability_use_count(&self, tally: AbilityUseTally) -> bool {
+        match self {
+            AbilityCondition::AbilityUseCountThisTurn { tally: read, .. } => *read == tally,
+            AbilityCondition::And { conditions } | AbilityCondition::Or { conditions } => {
+                conditions
+                    .iter()
+                    .any(|condition| condition.reads_ability_use_count(tally))
+            }
+            AbilityCondition::Not { condition }
+            | AbilityCondition::ConditionInstead { inner: condition } => {
+                condition.reads_ability_use_count(tally)
+            }
+            _ => false,
+        }
     }
 
     /// Default `min_count` for `AdditionalCostPaid` is 1 (any single payment).
@@ -35985,6 +36037,31 @@ impl ResolvedAbility {
         }
         if let Some(else_branch) = self.else_ability.as_mut() {
             else_branch.set_chosen_players_recursive(players);
+        }
+    }
+
+    /// CR 608.2c: a sub-ability is part of the same printed ability instance
+    /// as its parent, so it is "this ability" for an
+    /// `AbilityUseCountThisTurn` gate. Takes `parent_index` unless this node
+    /// already carries its own index, which is never clobbered.
+    pub fn inherit_ability_index(&mut self, parent_index: Option<usize>) {
+        if self.ability_index.is_none() {
+            self.ability_index = parent_index;
+        }
+    }
+
+    /// CR 608.2c: [`Self::inherit_ability_index`] applied down every
+    /// `sub_ability` / `else_ability` link. The runtime applies the one-hop
+    /// rule at each hand-off (`effects::apply_parent_chain_context`); a reader
+    /// that walks a chain without resolving it applies it to the whole tree.
+    pub fn inherit_ability_index_recursive(&mut self, parent_index: Option<usize>) {
+        self.inherit_ability_index(parent_index);
+        let index = self.ability_index;
+        if let Some(sub) = self.sub_ability.as_mut() {
+            sub.inherit_ability_index_recursive(index);
+        }
+        if let Some(else_branch) = self.else_ability.as_mut() {
+            else_branch.inherit_ability_index_recursive(index);
         }
     }
 

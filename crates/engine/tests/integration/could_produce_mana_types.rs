@@ -16,15 +16,17 @@
 //! opponent controls could produce colorless mana"; and it "takes into account
 //! any applicable replacement effects".
 
+use engine::game::layers::flush_layers;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::AbilityKind;
 use engine::types::actions::GameAction;
+use engine::types::card_type::CoreType;
 use engine::types::counter::parse_counter_type;
 use engine::types::game_state::{
     ExileLink, ExileLinkKind, GameState, ManaChoicePrompt, PayCostKind, WaitingFor,
 };
 use engine::types::identifiers::ObjectId;
-use engine::types::mana::{ManaColor, ManaType};
+use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
@@ -433,4 +435,176 @@ fn scenario_exiled_card(runner: &mut GameRunner) -> ObjectId {
         "Exiled Colorless Card".to_string(),
         Zone::Exile,
     )
+}
+
+// ---- Hypothetical resolutions the class reader reads (CR 106.7) ----------
+
+// Verbatim Oracle text (MTGJSON), reminder text omitted.
+const ASHAYA: &str = "Ashaya's power and toughness are each equal to the number of lands you \
+     control.\nNontoken creatures you control are Forest lands in addition to their other types.";
+const SOULBRIGHT_SEEKER: &str = "As an additional cost to cast this spell, behold an Elemental or \
+     pay {2}.\n{R}: Target creature you control gains trample until end of turn. If this is the \
+     third time this ability has resolved this turn, add {R}{R}{R}{R}.";
+const OMNATH_LOCUS_OF_ALL: &str = "If you would lose unspent mana, that mana becomes black \
+     instead.\nAt the beginning of your first main phase, look at the top card of your library. \
+     You may reveal that card if it has three or more colored mana symbols in its mana cost. If \
+     you do, add three mana in any combination of its colors and put it into your hand. If you \
+     don't reveal it, put it into your hand.";
+const COURSER_OF_KRUPHIX: &str = "Play with the top card of your library revealed.\nYou may play \
+     lands from the top of your library.\nLandfall — Whenever a land you control enters, you \
+     gain 1 life.";
+
+/// Applies the layer system, which `GameScenario::build` does not run.
+fn flush(runner: &mut GameRunner) {
+    runner.state_mut().layers_dirty.mark_full();
+    flush_layers(runner.state_mut());
+}
+
+/// Reach-guard: Ashaya made `object` a land.
+fn assert_is_land(runner: &GameRunner, object: ObjectId) {
+    assert!(
+        runner.state().objects[&object]
+            .card_types
+            .core_types
+            .contains(&CoreType::Land),
+        "reach-guard: Ashaya made it a land"
+    );
+}
+
+/// T30′-pool (CR 106.7 + CR 608.2c): Reflecting Pool reads the Seeker's ordinal
+/// against its next resolution — {R} only after exactly two real resolutions.
+#[test]
+fn reflecting_pool_reads_a_seekers_ordinal_against_its_next_resolution() {
+    for prior in 0..=3u32 {
+        let mut scenario = new_scenario();
+        let reflecting_pool = scenario
+            .add_land_from_oracle(P0, "Reflecting Pool", REFLECTING_POOL)
+            .id();
+        scenario.add_creature_from_oracle(P0, "Ashaya, Soul of the Wild", 0, 0, ASHAYA);
+        let seeker = scenario
+            .add_creature_from_oracle(P0, "Soulbright Seeker", 2, 1, SOULBRIGHT_SEEKER)
+            .id();
+        let mut runner = scenario.build();
+        flush(&mut runner);
+        for _ in 0..prior {
+            runner.state_mut().players[P0.0 as usize]
+                .mana_pool
+                .add(ManaUnit::new(ManaType::Red, ObjectId(0), false, vec![]));
+            runner.activate(seeker, 0).target_object(seeker).resolve();
+        }
+        flush(&mut runner);
+        assert_eq!(
+            runner
+                .state()
+                .ability_resolutions_this_turn
+                .get(&(seeker, 0))
+                .copied(),
+            (prior > 0).then_some(prior),
+            "reach-guard: the Seeker's resolution ledger"
+        );
+        assert_is_land(&runner, seeker);
+
+        let expected = if prior == 2 {
+            Produced::Prompt(vec![ManaType::Red, ManaType::Green])
+        } else {
+            Produced::Pool(vec![ManaType::Green])
+        };
+        assert_eq!(
+            tap_for_mana(&mut runner, reflecting_pool),
+            expected,
+            "{prior} prior resolutions"
+        );
+    }
+}
+
+/// Reflecting Pool beside Ashaya and Omnath, Locus of All (+ Courser of
+/// Kruphix when `courser`), with a card costing `shards` + `generic` on top of
+/// a filler card. Returns the runner and the Pool.
+fn omnath_pool_board(
+    courser: bool,
+    shards: Vec<ManaCostShard>,
+    generic: u32,
+) -> (GameRunner, ObjectId) {
+    let mut scenario = new_scenario();
+    let reflecting_pool = scenario
+        .add_land_from_oracle(P0, "Reflecting Pool", REFLECTING_POOL)
+        .id();
+    scenario.add_creature_from_oracle(P0, "Ashaya, Soul of the Wild", 0, 0, ASHAYA);
+    if courser {
+        scenario.add_creature_from_oracle(P0, "Courser of Kruphix", 2, 4, COURSER_OF_KRUPHIX);
+    }
+    let omnath = scenario
+        .add_creature_from_oracle(P0, "Omnath, Locus of All", 4, 4, OMNATH_LOCUS_OF_ALL)
+        .id();
+    scenario.add_spell_to_library_top(P0, "Filler", false);
+    scenario
+        .add_spell_to_library_top(P0, "Top Card", false)
+        .with_mana_cost(ManaCost::Cost { shards, generic });
+    let mut runner = scenario.build();
+    flush(&mut runner);
+    assert_is_land(&runner, omnath);
+    (runner, reflecting_pool)
+}
+
+/// T32b–T32e (CR 106.7 + CR 202.2c + CR 608.2c): with the top card public,
+/// Reflecting Pool reads Omnath's look exactly as Squandered Resources does —
+/// an eligible card's colors, nothing of an ineligible or colorless one —
+/// beside every land's intrinsic Forest {G}.
+#[test]
+fn reflecting_pool_reads_omnaths_public_top_card() {
+    let cases = [
+        (
+            "Doomsday",
+            vec![ManaCostShard::Black; 3],
+            0,
+            Produced::Prompt(vec![ManaType::Black, ManaType::Green]),
+        ),
+        (
+            "Esper Charm",
+            vec![
+                ManaCostShard::White,
+                ManaCostShard::Blue,
+                ManaCostShard::Black,
+            ],
+            0,
+            Produced::Prompt(vec![
+                ManaType::White,
+                ManaType::Blue,
+                ManaType::Black,
+                ManaType::Green,
+            ]),
+        ),
+        (
+            "Dimir Charm",
+            vec![ManaCostShard::Blue, ManaCostShard::Black],
+            0,
+            Produced::Pool(vec![ManaType::Green]),
+        ),
+        ("Sol Ring", vec![], 1, Produced::Pool(vec![ManaType::Green])),
+    ];
+    for (name, shards, generic, expected) in cases {
+        let (mut runner, reflecting_pool) = omnath_pool_board(true, shards, generic);
+        assert_eq!(
+            tap_for_mana(&mut runner, reflecting_pool),
+            expected,
+            "{name} on top"
+        );
+    }
+}
+
+/// T33b (CR 400.2 + CR 401.2): without Courser the top card is hidden, so the
+/// Pool does not read it. Paired positive: the Doomsday row of T32b.
+#[test]
+fn reflecting_pool_does_not_read_omnaths_hidden_top_card() {
+    let (mut runner, reflecting_pool) = omnath_pool_board(false, vec![ManaCostShard::Black; 3], 0);
+    let top = runner.state().players[P0.0 as usize].library[0];
+    assert_eq!(
+        runner.state().objects[&top].color,
+        vec![ManaColor::Black],
+        "reach-guard: Doomsday is on top"
+    );
+    assert_eq!(
+        tap_for_mana(&mut runner, reflecting_pool),
+        Produced::Pool(vec![ManaType::Green])
+    );
 }

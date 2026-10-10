@@ -8,12 +8,12 @@ use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AdditionalCostOrigin,
     BounceSelection, CardTypeSetSource, CastManaSpentMetric, ChosenAttribute, CommanderOwnership,
     ControllerRef, CopyRetargetPermission, DamageAmountScope, DamageAmountThreshold,
-    DamageKindFilter, DelayedTriggerCondition, DurationEvent, Effect, FilterProp, ModalChoice,
-    NameStickerSet, ObjectScope, OriginConstraint, PlayerFilter, PlayerScope, PtValue,
-    QuantityExpr, QuantityRef, RenownSubject, ResolvedAbility, SacrificeCost, StaticCondition,
-    TargetFilter, TargetRef, TributeOutcome, TriggerCondition, TriggerConditionAnchor,
-    TriggerConstraint, TriggerDefinition, TriggerDefinitionOccurrenceRef, TriggerDefinitionRef,
-    TriggerEntry, TriggerGrantProducerKey, TypeFilter, TypedFilter,
+    DamageKindFilter, DelayedTriggerCondition, DurationEvent, Effect, EffectOutcomeSignal,
+    FilterProp, ModalChoice, NameStickerSet, ObjectScope, OriginConstraint, PlayerFilter,
+    PlayerScope, PtValue, QuantityExpr, QuantityRef, RenownSubject, ResolvedAbility, SacrificeCost,
+    StaticCondition, TargetFilter, TargetRef, TributeOutcome, TriggerCondition,
+    TriggerConditionAnchor, TriggerConstraint, TriggerDefinition, TriggerDefinitionOccurrenceRef,
+    TriggerDefinitionRef, TriggerEntry, TriggerGrantProducerKey, TypeFilter, TypedFilter,
 };
 #[cfg(test)]
 use crate::types::ability::{EffectScope, TapStateChange};
@@ -11897,12 +11897,75 @@ pub(crate) enum BindingReader {
     DelayedTriggerFireTime,
     /// CR 106.7: "would produce if the ability were to resolve at that time" —
     /// a `ResolvedAbility` built by the runtime's own builder for that ability,
-    /// with no activation choices (targets, X, cost referent, chosen players),
-    /// no trigger event of its own and no ledger this resolution would publish.
-    /// `state.current_trigger_event` may even hold an UNRELATED event, when the
-    /// read happens while another trigger resolves. A diverging leaf is fixed by
-    /// the ability's own activation or resolution.
-    HypotheticalResolution,
+    /// with no activation choices (targets, X, cost referent, chosen players)
+    /// and no trigger event of its own. `state.current_trigger_event` may even
+    /// hold an UNRELATED event, when the read happens while another trigger
+    /// resolves. A diverging leaf is fixed by the ability's own activation or
+    /// resolution. The payload is what the hypothetical resolution has itself
+    /// established for the node being read (`could_produce`'s walker).
+    HypotheticalResolution(HypotheticalBindings),
+}
+
+/// CR 106.7 + CR 608.2c: what a hypothetical resolution has itself
+/// established for the node it is reading — bindings an earlier instruction
+/// of the same resolution, or the resolution's own entry bookkeeping, fixes
+/// from state.
+///
+/// Each axis is a separate two-valued enum, so a classifier leaf names the one
+/// axis it depends on and a leaf on another axis cannot be satisfied by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HypotheticalBindings {
+    pub(crate) targets: HypotheticalTargets,
+    pub(crate) optional_outcome: HypotheticalOptionalOutcome,
+    pub(crate) ledger: HypotheticalLedger,
+}
+
+impl HypotheticalBindings {
+    /// A root before its ledger is projected, or any node the walker has bound
+    /// nothing for — today's both-ways reading on every axis.
+    pub(crate) const NONE: Self = Self {
+        targets: HypotheticalTargets::Unchosen,
+        optional_outcome: HypotheticalOptionalOutcome::EitherWay,
+        ledger: HypotheticalLedger::Live,
+    };
+}
+
+/// Whose choice `ability.targets` is on the node being read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HypotheticalTargets {
+    /// CR 115.1 + CR 602.2b + CR 603.3d: chosen when the ability was put on
+    /// the stack — a choice the hypothetical never makes.
+    Unchosen,
+    /// CR 608.2c + CR 701.20e: a non-empty list of objects handed to this node
+    /// by an earlier instruction of the same resolution
+    /// (`could_produce::bind_child`), exactly as the runtime hands them, and
+    /// public to every seat.
+    EstablishedByEarlierInstruction,
+}
+
+/// Whether the "you may" instruction an "if you do" reads was performed on the
+/// path being read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HypotheticalOptionalOutcome {
+    /// CR 608.2d: the instruction is performable and the player chooses, so
+    /// both outcomes are possible.
+    EitherWay,
+    /// CR 608.2c: the instruction's own gate was false, so it was not
+    /// performed.
+    NotPerformed,
+}
+
+/// Whether this printed ability's per-turn use ledgers were projected through
+/// the hypothetical resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HypotheticalLedger {
+    /// The live ledger, which the resolution would bump before its gates run —
+    /// read both ways.
+    Live,
+    /// CR 608.2c + CR 602.2a: projected through the resolution's own entry
+    /// bookkeeping (`could_produce::resolution_entry_state`), so it reads
+    /// exactly what the resolution would read.
+    Projected,
 }
 
 /// CR 603.4 + CR 106.7: does this gate read a binding that `reader` resolves
@@ -11924,7 +11987,10 @@ pub(crate) enum BindingReader {
 ///
 /// For [`BindingReader::HypotheticalResolution`], a diverging gate is one whose
 /// outcome the ability's own activation or resolution fixes, so a CR 106.7
-/// reader reads both of its outcomes rather than evaluating it against state.
+/// reader reads both of its outcomes rather than evaluating it against state —
+/// unless the reader's [`HypotheticalBindings`] establish that binding for the
+/// node being read, in which case the gate is evaluated exactly as the
+/// resolution evaluates it.
 ///
 /// Only `QuantityCheck` carries a `QuantityExpr` (and hence a scope or filter)
 /// among the arms `ability_condition_to_static_condition` can bridge — the
@@ -11977,7 +12043,7 @@ pub(crate) fn gate_binding_diverges(condition: &AbilityCondition, reader: Bindin
             // stamps the source's `cast_from_zone` / kicker payments; an
             // activation stamps none), and the source's stamps are state at that
             // time — exactly what the real resolution reads.
-            BindingReader::HypotheticalResolution => false,
+            BindingReader::HypotheticalResolution(_) => false,
         },
         // CR 601.2 + CR 115.1: which object's cast-variant marker is read depends
         // on `subject`.
@@ -11988,9 +12054,10 @@ pub(crate) fn gate_binding_diverges(condition: &AbilityCondition, reader: Bindin
             // classifier answers for an `Anaphoric` / `Demonstrative` QUANTITY
             // read (an earlier instruction's object), while this evaluator binds
             // both to the source.
-            BindingReader::HypotheticalResolution => match subject {
-                // `ability.targets`, which the hypothetical never has.
-                ObjectScope::Target => true,
+            BindingReader::HypotheticalResolution(bindings) => match subject {
+                // `ability.targets`: chosen on activation, unless an earlier
+                // instruction of the hypothetical resolution handed them over.
+                ObjectScope::Target => bindings.targets == HypotheticalTargets::Unchosen,
                 // The resolving ability's own source permanent — state.
                 ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
                     false
@@ -12020,8 +12087,68 @@ pub(crate) fn gate_binding_diverges(condition: &AbilityCondition, reader: Bindin
             // structure itself and asks only whether the wrapped gate is
             // decidable now (`evaluate_condition`'s `ConditionInstead` arm
             // evaluates `inner`).
-            BindingReader::HypotheticalResolution => gate_binding_diverges(inner, reader),
+            BindingReader::HypotheticalResolution(_) => gate_binding_diverges(inner, reader),
         },
+
+        // CR 608.2c: "if you do" / "if you don't" — whether the nearest
+        // "you may" instruction was performed, published BY an earlier step of
+        // the same resolution.
+        AbilityCondition::EffectOutcome {
+            signal: EffectOutcomeSignal::OptionalEffectPerformed,
+        } => match reader {
+            // Nothing has been performed at detection time.
+            BindingReader::DelayedTriggerFireTime => true,
+            // CR 608.2d: a performable "you may" is the player's choice, so both
+            // outcomes; CR 608.2c: one whose own gate was false on this path was
+            // not performed, and the walker stamps that outcome on the node.
+            BindingReader::HypotheticalResolution(bindings) => {
+                bindings.optional_outcome == HypotheticalOptionalOutcome::EitherWay
+            }
+        },
+        // CR 608.2c + CR 602.2a: the per-turn use ledgers of THIS printed
+        // ability, keyed `(source_id, ability_index)`.
+        AbilityCondition::AbilityUseCountThisTurn { .. } => match reader {
+            // The fire-time leg has no resolution to publish them.
+            BindingReader::DelayedTriggerFireTime => true,
+            // CR 106.7: a root the walker projected through the resolution's own
+            // entry bookkeeping (`could_produce::resolution_entry_state`) reads
+            // exactly what the real resolution would read; any other root keeps
+            // the both-ways reading, so a missed projection can only over-read,
+            // never mis-answer.
+            BindingReader::HypotheticalResolution(bindings) => {
+                bindings.ledger == HypotheticalLedger::Live
+            }
+        },
+        // CR 115.1 + CR 608.2c: "that card" — the node's first object target.
+        AbilityCondition::TargetMatchesFilter {
+            filter,
+            subject_slot,
+            ..
+        } => match reader {
+            // Empty `targets` at fire time.
+            BindingReader::DelayedTriggerFireTime => true,
+            // CR 106.7 + CR 608.2c: decidable once an earlier instruction handed
+            // the node its objects — unless the subject is a declared slot of
+            // the resolving root (`subject_slot`, read from the chain root, not
+            // the node) or the filter itself reads an unbound binding.
+            BindingReader::HypotheticalResolution(bindings) => {
+                bindings.targets == HypotheticalTargets::Unchosen
+                    || subject_slot.is_some()
+                    || filter_binding_diverges(filter, reader)
+            }
+        },
+        // CR 115.1 + CR 608.2c: read off the node's own object targets.
+        AbilityCondition::TargetHasKeywordInstead { .. } | AbilityCondition::HasObjectTarget => {
+            match reader {
+                // Empty `targets` at fire time.
+                BindingReader::DelayedTriggerFireTime => true,
+                // CR 106.7 + CR 608.2c: decidable once an earlier instruction
+                // handed the node its objects.
+                BindingReader::HypotheticalResolution(bindings) => {
+                    bindings.targets == HypotheticalTargets::Unchosen
+                }
+            }
+        }
 
         // ---- RESOLUTION-SCOPED: neither reader has the resolving spell or
         // ---- ability's own choices, so these cannot be reproduced.
@@ -12035,17 +12162,19 @@ pub(crate) fn gate_binding_diverges(condition: &AbilityCondition, reader: Bindin
         | AbilityCondition::AlternativeManaCostPaid
         // CR 608.2c: signals published BY an earlier step of the SAME resolution
         // — an effect's outcome, a coin flip (CR 705.1), a reveal (CR 701.20), a
-        // reflexive "when you do" (CR 603.12), the previous effect's amount, the
-        // per-turn resolution count. None of them exist at detection time, and
-        // a CR 106.7 reader would read them one resolution early (the real
-        // resolution bumps `ability_resolutions_this_turn` before its gates run).
-        | AbilityCondition::EffectOutcome { .. }
+        // reflexive "when you do" (CR 603.12), the previous effect's amount.
+        // None of them exist at detection time, and a CR 106.7 reader does not
+        // carry them out.
+        | AbilityCondition::EffectOutcome {
+            signal: EffectOutcomeSignal::CurrentScopeSucceeded
+                | EffectOutcomeSignal::Guessed { .. }
+                | EffectOutcomeSignal::RevealUntilMatched,
+        }
         | AbilityCondition::EventOutcomeWon
         | AbilityCondition::CoinFlipOutcome { .. }
         | AbilityCondition::WhenYouDo
         | AbilityCondition::RevealedHasCardType { .. }
         | AbilityCondition::PreviousEffectAmount { .. }
-        | AbilityCondition::AbilityUseCountThisTurn { .. }
         | AbilityCondition::DiscardedCardMatchesFilter { .. }
         // CR 608.2c: the "this way" ledgers — `state.last_zone_changed_ids` and
         // the tracked sets — declined for exactly the reason their
@@ -12055,9 +12184,6 @@ pub(crate) fn gate_binding_diverges(condition: &AbilityCondition, reader: Bindin
         // CR 115.1 + CR 608.2k: reads the resolving ability's declared targets or
         // its cost-paid referent, both empty at fire time — the condition-axis
         // counterpart of `ObjectScope::Target` / `CostPaidObject`.
-        | AbilityCondition::TargetMatchesFilter { .. }
-        | AbilityCondition::TargetHasKeywordInstead { .. }
-        | AbilityCondition::HasObjectTarget
         | AbilityCondition::ObjectsShareQuality { .. }
         | AbilityCondition::TargetSharesNameWithOtherExiledThisWay { .. }
         | AbilityCondition::CostPaidObjectMatchesFilter { .. }
@@ -12165,10 +12291,19 @@ fn object_scope_unbound(scope: ObjectScope, reader: BindingReader) -> bool {
             // CR 106.7 + CR 603.2: the event is fixed only when the ability
             // triggers; a CR 106.7 reader has none of its own, and
             // `state.current_trigger_event` may name an unrelated object.
-            BindingReader::HypotheticalResolution => true,
+            BindingReader::HypotheticalResolution(_) => true,
         },
-        ObjectScope::Target
-        | ObjectScope::Recipient
+        // CR 115.1: the node's first object target.
+        ObjectScope::Target => match reader {
+            // Empty `targets` at fire time.
+            BindingReader::DelayedTriggerFireTime => true,
+            // CR 106.7 + CR 608.2c: decidable once an earlier instruction of the
+            // hypothetical resolution handed the node its objects.
+            BindingReader::HypotheticalResolution(bindings) => {
+                bindings.targets == HypotheticalTargets::Unchosen
+            }
+        },
+        ObjectScope::Recipient
         | ObjectScope::CostPaidObject
         | ObjectScope::Anaphoric
         | ObjectScope::Demonstrative
@@ -12195,10 +12330,21 @@ fn object_scope_unbound(scope: ObjectScope, reader: BindingReader) -> bool {
 /// reaches a quantity, but is adjudicated here rather than wildcarded.
 fn player_scope_unbound(scope: &PlayerScope, reader: BindingReader) -> bool {
     match scope {
-        PlayerScope::ScopedPlayer
-        | PlayerScope::Target
-        | PlayerScope::RecipientController
-        | PlayerScope::ParentObjectTargetController => true,
+        // `Target` is the first PLAYER target, which no earlier instruction of a
+        // hypothetical resolution hands over (the walker binds only revealed or
+        // looked-at objects), so it stays unbound for both readers.
+        PlayerScope::ScopedPlayer | PlayerScope::Target | PlayerScope::RecipientController => true,
+        // CR 109.4: the controller of the node's first object target
+        // (`ability_utils::parent_target_controller`).
+        PlayerScope::ParentObjectTargetController => match reader {
+            // Empty `targets` at fire time.
+            BindingReader::DelayedTriggerFireTime => true,
+            // CR 106.7 + CR 608.2c: decidable once an earlier instruction handed
+            // the node its objects.
+            BindingReader::HypotheticalResolution(bindings) => {
+                bindings.targets == HypotheticalTargets::Unchosen
+            }
+        },
         PlayerScope::AllPlayers { exclude, .. } => exclude
             .as_deref()
             .is_some_and(|scope| player_scope_unbound(scope, reader)),
@@ -12210,7 +12356,7 @@ fn player_scope_unbound(scope: &PlayerScope, reader: BindingReader) -> bool {
             // CR 106.7 + CR 508.5: `resolve_defending_player` falls back to the
             // trigger event's attacker when the source is not attacking, and a
             // CR 106.7 reader has no event of its own.
-            BindingReader::HypotheticalResolution => true,
+            BindingReader::HypotheticalResolution(_) => true,
         },
         PlayerScope::Controller
         | PlayerScope::Opponent { .. }
@@ -12347,8 +12493,15 @@ fn quantity_ref_binding_diverges(qty: &QuantityRef, reader: BindingReader) -> bo
             let scope_diverges = match scope {
                 // CR 601.2h + CR 115.1: a target-slot read that
                 // `quantity::resolve_event_scoped_ref` explicitly answers `None`
-                // for at fire time; neither reader has targets.
-                CastManaObjectScope::AbilityTarget => true,
+                // for at fire time.
+                CastManaObjectScope::AbilityTarget => match reader {
+                    BindingReader::DelayedTriggerFireTime => true,
+                    // CR 106.7 + CR 608.2c: decidable once an earlier instruction
+                    // handed the node its objects.
+                    BindingReader::HypotheticalResolution(bindings) => {
+                        bindings.targets == HypotheticalTargets::Unchosen
+                    }
+                },
                 // CR 400.7: the source object, which both readers carry.
                 CastManaObjectScope::SelfObject => false,
                 // CR 603.2: the spell named by the matched event.
@@ -12358,7 +12511,7 @@ fn quantity_ref_binding_diverges(qty: &QuantityRef, reader: BindingReader) -> bo
                     // CR 106.7 + CR 603.2: `resolve_ref` reads
                     // `state.current_trigger_event` with no fallback, and a
                     // CR 106.7 reader has no event of its own.
-                    BindingReader::HypotheticalResolution => true,
+                    BindingReader::HypotheticalResolution(_) => true,
                 },
             };
             scope_diverges
@@ -12384,7 +12537,7 @@ fn quantity_ref_binding_diverges(qty: &QuantityRef, reader: BindingReader) -> bo
             // read is guarded to the source's own battlefield departure, which
             // cannot be current while the surveyed permanent is on the
             // battlefield.
-            BindingReader::HypotheticalResolution => false,
+            BindingReader::HypotheticalResolution(_) => false,
         },
         // CR 701.57a: the discover value, a global scalar published by the
         // discover whose completion fires the trigger.
@@ -12393,15 +12546,33 @@ fn quantity_ref_binding_diverges(qty: &QuantityRef, reader: BindingReader) -> bo
             BindingReader::DelayedTriggerFireTime => false,
             // CR 106.7 + CR 701.57a: for any other resolution it is a stale value
             // from an unrelated discover — a resolution-published ledger.
-            BindingReader::HypotheticalResolution => true,
+            BindingReader::HypotheticalResolution(_) => true,
+        },
+        // CR 115.1 + CR 109.4: the controller of the node's first object target
+        // (`ability_utils::parent_target_controller`), and the mana value of
+        // its first object target matching `filter`.
+        QuantityRef::TargetControllerCounter { .. } => match reader {
+            // The fire-time resolver is handed `targets = &[]`.
+            BindingReader::DelayedTriggerFireTime => true,
+            // CR 106.7 + CR 608.2c: decidable once an earlier instruction handed
+            // the node its objects.
+            BindingReader::HypotheticalResolution(bindings) => {
+                bindings.targets == HypotheticalTargets::Unchosen
+            }
+        },
+        QuantityRef::TargetObjectManaValue { filter } => match reader {
+            BindingReader::DelayedTriggerFireTime => true,
+            BindingReader::HypotheticalResolution(bindings) => {
+                bindings.targets == HypotheticalTargets::Unchosen
+                    || filter_binding_diverges(filter, reader)
+            }
         },
         // ---- RESOLUTION-SCOPED, payload-free or target-bound: always diverges ----
         //
-        // CR 115.1: reads the resolving ability's declared targets, which the
-        // fire-time resolver is handed as `&[]`.
-        QuantityRef::TargetControllerCounter { .. }
-        | QuantityRef::TargetObjectManaValue { .. }
-        | QuantityRef::TargetZoneCardCount { .. }
+        // CR 115.1: reads the resolving ability's declared PLAYER target, which
+        // the fire-time resolver is handed as `&[]` and which no earlier
+        // instruction of a hypothetical resolution hands over.
+        QuantityRef::TargetZoneCardCount { .. }
         // CR 107.3a: `X` comes from the resolving ability's `chosen_x`, which is
         // `None` at fire time.
         | QuantityRef::Variable { .. }
@@ -12512,7 +12683,7 @@ fn card_type_set_source_binding_diverges(
                 CardTypeSetSource::ExiledBySource => match reader {
                     BindingReader::DelayedTriggerFireTime => true,
                     // CR 106.7 + CR 607.2a: the persistent link store is state.
-                    BindingReader::HypotheticalResolution => false,
+                    BindingReader::HypotheticalResolution(_) => false,
                 },
                 // CR 608.2i: the resolution-scoped population `TrackedSetSize`
                 // is declined for.
@@ -12543,7 +12714,7 @@ fn card_type_set_source_binding_diverges(
 /// (`oracle_trigger::static_condition_to_trigger_condition` substitutes `FilterProp::Another` →
 /// `FilterProp::OtherThanTriggerObject` on the fire-time leg only — CR 603.4, Valakut's ruling —
 /// so one printed "two or more OTHER creatures" counts a different population on each leg).
-fn filter_binding_diverges(filter: &TargetFilter, reader: BindingReader) -> bool {
+pub(crate) fn filter_binding_diverges(filter: &TargetFilter, reader: BindingReader) -> bool {
     // EXHAUSTIVE and wildcard-free, matching `object_scope_unbound` /
     // `player_scope_unbound` / `quantity_ref_binding_diverges`: a new `TargetFilter`
     // variant must be adjudicated here rather than silently defaulting to "cannot diverge". When
@@ -12583,13 +12754,13 @@ fn filter_binding_diverges(filter: &TargetFilter, reader: BindingReader) -> bool
         // ---- ABILITY-BOUND: reads the resolving ability, which is `None` at
         // ---- fire time. Always diverges.
         //
-        // CR 115.1 + CR 115.10: resolution-scoped anaphora read `ability.targets`
-        // / the per-iteration player, neither of which the fire-time context has
-        // — the population-level counterpart of `ObjectScope::Target`.
-        TargetFilter::ParentTarget
-        | TargetFilter::ParentTargetSlot { .. }
-        | TargetFilter::ParentTargetController
-        | TargetFilter::ParentTargetOwner
+        // CR 115.1 + CR 115.10: resolution-scoped anaphora read a declared slot
+        // of the resolving ROOT (`ParentTargetSlot`, through
+        // `targeting::resolve_live_parent_slot_from_root` — never the node's
+        // handed objects) / the per-iteration player, neither of which the
+        // fire-time context has — the population-level counterpart of
+        // `ObjectScope::Target`.
+        TargetFilter::ParentTargetSlot { .. }
         | TargetFilter::ScopedPlayer
         // CR 608.2k: the cost-paid / effect-context referent lives on
         // `ResolvedAbility`, so this matches nothing at fire time. The
@@ -12628,6 +12799,20 @@ fn filter_binding_diverges(filter: &TargetFilter, reader: BindingReader) -> bool
         | TargetFilter::PostReplacementDamageTarget
         | TargetFilter::PostReplacementDamageTargetOwner => true,
 
+        // CR 115.1 + CR 109.4 + CR 108.3: the node's own object targets, and
+        // their controller / owner.
+        TargetFilter::ParentTarget
+        | TargetFilter::ParentTargetController
+        | TargetFilter::ParentTargetOwner => match reader {
+            // Empty `targets` at fire time.
+            BindingReader::DelayedTriggerFireTime => true,
+            // CR 106.7 + CR 608.2c: decidable once an earlier instruction of the
+            // hypothetical resolution handed the node its objects.
+            BindingReader::HypotheticalResolution(bindings) => {
+                bindings.targets == HypotheticalTargets::Unchosen
+            }
+        },
+
         // CR 607.2a: the source's linked-exile population, adjudicated exactly as
         // `QuantityRef::CardsExiledBySource` is.
         TargetFilter::ExiledBySource => match reader {
@@ -12635,7 +12820,7 @@ fn filter_binding_diverges(filter: &TargetFilter, reader: BindingReader) -> bool
             BindingReader::DelayedTriggerFireTime => true,
             // CR 106.7 + CR 607.2a: the persistent link store
             // (`players::linked_exile_cards_for_source`) is state at that time.
-            BindingReader::HypotheticalResolution => false,
+            BindingReader::HypotheticalResolution(_) => false,
         },
 
         // CR 603.2 + CR 508.5: the matched event's own referents.
@@ -12658,7 +12843,7 @@ fn filter_binding_diverges(filter: &TargetFilter, reader: BindingReader) -> bool
             // CR 106.7 + CR 603.2: the event is fixed only when the ability
             // triggers; a CR 106.7 reader has none of its own, and
             // `state.current_trigger_event` may name an unrelated referent.
-            BindingReader::HypotheticalResolution => true,
+            BindingReader::HypotheticalResolution(_) => true,
         },
 
         // ---- Binds IDENTICALLY on both legs ----
@@ -12738,13 +12923,15 @@ fn controller_ref_binding_diverges(controller: &ControllerRef, reader: BindingRe
         // printed population to the wrong board with no gate rejection to catch
         // it — while `filter::controller_ref_player` has no such fallback and
         // answers `None`. Declining covers both.
+        //
+        // A PLAYER target is never handed over by an earlier instruction of a
+        // hypothetical resolution (the walker binds only revealed or looked-at
+        // objects), so these stay unbound for both readers.
         ControllerRef::TargetPlayer
         | ControllerRef::TargetOpponent
-        // CR 109.4 + CR 108.3: the parent target's controller / owner, read off
-        // the same empty `ability.targets`.
-        | ControllerRef::ParentTargetController
+        // CR 120.1 + CR 109.4: the trigger event's target's controller, read
+        // through the resolving ability.
         | ControllerRef::EventTargetController
-        | ControllerRef::ParentTargetOwner
         // CR 608.2c: `ability.chosen_players`, populated BY the resolution that
         // ran the `Choose(Player)`.
         | ControllerRef::ChosenPlayer { .. }
@@ -12765,6 +12952,18 @@ fn controller_ref_binding_diverges(controller: &ControllerRef, reader: BindingRe
         | ControllerRef::EnchantedPlayer
         // CR 611.2: a player id already snapshotted at resolution — a literal.
         | ControllerRef::SpecificPlayer { .. } => false,
+        // CR 109.4 + CR 108.3: the controller / owner of the node's first object
+        // target (`filter::parent_target_controller_player` /
+        // `parent_target_owner_player`).
+        ControllerRef::ParentTargetController | ControllerRef::ParentTargetOwner => match reader {
+            // Read off the empty `ability.targets` at fire time.
+            BindingReader::DelayedTriggerFireTime => true,
+            // CR 106.7 + CR 608.2c: decidable once an earlier instruction handed
+            // the node its objects.
+            BindingReader::HypotheticalResolution(bindings) => {
+                bindings.targets == HypotheticalTargets::Unchosen
+            }
+        },
         // CR 603.2 + CR 508.5: event-derived players.
         ControllerRef::TriggeringPlayer | ControllerRef::DefendingPlayer => match reader {
             // Resolved through the same resolution-or-detection dual path as the
@@ -12773,7 +12972,7 @@ fn controller_ref_binding_diverges(controller: &ControllerRef, reader: BindingRe
             // CR 106.7 + CR 603.2: a CR 106.7 reader has no event of its own, so
             // these would bind whatever player an unrelated in-flight event
             // names.
-            BindingReader::HypotheticalResolution => true,
+            BindingReader::HypotheticalResolution(_) => true,
         },
     }
 }
@@ -12828,7 +13027,7 @@ fn filter_prop_binding_diverges(prop: &FilterProp, reader: BindingReader) -> boo
             // `state.current_trigger_event` — an event a CR 106.7 reader cannot
             // bind. Over-approximates for a `GrantingObject` reference (a stamp),
             // in the safe direction.
-            BindingReader::HypotheticalResolution => true,
+            BindingReader::HypotheticalResolution(_) => true,
         },
         // CR 608.2c: with NO reference the shared-quality subject is the
         // resolution-local effect-context object, which does not exist for
@@ -12840,7 +13039,7 @@ fn filter_prop_binding_diverges(prop: &FilterProp, reader: BindingReader) -> boo
                 BindingReader::DelayedTriggerFireTime => filter_binding_diverges(reference, reader),
                 // CR 106.7 + CR 603.2: `object_shares_quality_with_reference_filter`
                 // resolves the reference through `resolve_event_context_targets`.
-                BindingReader::HypotheticalResolution => true,
+                BindingReader::HypotheticalResolution(_) => true,
             },
         },
 
@@ -12931,7 +13130,7 @@ fn filter_prop_binding_diverges(prop: &FilterProp, reader: BindingReader) -> boo
             // CR 106.7: `evaluate_condition` / `resolve_ref` keep the
             // source-exclusion reading, which a CR 106.7 reader (source = the
             // surveyed permanent) reads exactly as the real resolution does.
-            BindingReader::HypotheticalResolution => false,
+            BindingReader::HypotheticalResolution(_) => false,
         },
         // CR 603.4: the OUTPUT of the `Another` rewrite.
         FilterProp::OtherThanTriggerObject => match reader {
@@ -12940,14 +13139,14 @@ fn filter_prop_binding_diverges(prop: &FilterProp, reader: BindingReader) -> boo
             BindingReader::DelayedTriggerFireTime => false,
             // CR 106.7 + CR 603.2: `object_count_matching_candidate_ids` reads the
             // trigger event, which a CR 106.7 reader cannot bind.
-            BindingReader::HypotheticalResolution => true,
+            BindingReader::HypotheticalResolution(_) => true,
         },
         // CR 607.2a: the source's linked-exile population, adjudicated exactly as
         // `TargetFilter::ExiledBySource` is.
         FilterProp::SameNameAsExiledBySource => match reader {
             BindingReader::DelayedTriggerFireTime => true,
             // CR 106.7 + CR 607.2a: the persistent link store is state.
-            BindingReader::HypotheticalResolution => false,
+            BindingReader::HypotheticalResolution(_) => false,
         },
 
         // ---- Binds IDENTICALLY on both legs. ----
@@ -13088,7 +13287,12 @@ fn player_filter_binding_diverges(player: &PlayerFilter, reader: BindingReader) 
     match player {
         PlayerFilter::AllExcept { exclude } => player_filter_binding_diverges(exclude, reader),
         // CR 109.4 + CR 115.1 + CR 601.2a: the anchor lives on the resolving ability
-        // (`targets` / `chosen_players` / `cast_occurrence`).
+        // (`targets` / `chosen_players` / `cast_occurrence`). The two
+        // parent-object anchors stay unbound even for a hypothetical node whose
+        // objects an earlier instruction handed over: the population matcher
+        // (`effects::matches_player_scope`, which `FilterProp::ControllerMatches`
+        // routes through) answers `false` for them without reading any binding,
+        // so there is nothing a bound node would decide.
         PlayerFilter::ParentObjectTargetController
         | PlayerFilter::ParentObjectTargetOwner
         | PlayerFilter::GrantingObjectCaster
@@ -13145,7 +13349,7 @@ fn player_filter_binding_diverges(player: &PlayerFilter, reader: BindingReader) 
             BindingReader::DelayedTriggerFireTime => true,
             // CR 106.7 + CR 607.2a: `players::owns_card_exiled_by_source` reads
             // the persistent link store — state at that time.
-            BindingReader::HypotheticalResolution => false,
+            BindingReader::HypotheticalResolution(_) => false,
         },
         // CR 508.5: the defending player.
         PlayerFilter::DefendingPlayer => match reader {
@@ -13154,7 +13358,7 @@ fn player_filter_binding_diverges(player: &PlayerFilter, reader: BindingReader) 
             // CR 106.7 + CR 508.5: `matches_player_scope` resolves it through
             // `resolve_event_context_target_for_event_or_state` with the current
             // trigger event, which a CR 106.7 reader cannot bind.
-            BindingReader::HypotheticalResolution => true,
+            BindingReader::HypotheticalResolution(_) => true,
         },
         // CR 109.5 + CR 102.3: controller-derived seats, global player state,
         // and per-turn history every reader reads the same way.
@@ -25898,12 +26102,14 @@ pub mod tests {
         );
     }
 
-    /// U-h (CR 603.4 + CR 106.7): the binding family answers for BOTH readers.
-    /// Every row states `(fire time, hypothetical resolution)`; the fire-time
-    /// column is the verdict this family gave before it took a reader, so a
-    /// regression in either reader fails here. The rows are the delta table:
-    /// each leaf whose verdict differs, the leaves that look like deltas and are
-    /// not, and the gate entry's composition over its operands.
+    /// U-h (CR 603.4 + CR 106.7): the binding family answers for EVERY reader.
+    /// Every row states `(fire time, hypothetical, hypothetical bound)`: the
+    /// fire-time column is the verdict this family gave before it took a
+    /// reader, the second is a CR 106.7 node with nothing bound, and the third
+    /// a CR 106.7 node bound on every axis. A regression in any reader fails
+    /// here. The rows are the delta table: each leaf whose verdict differs, the
+    /// leaves that look like deltas and are not, and the gate entry's
+    /// composition over its operands.
     #[test]
     fn binding_family_answers_for_both_readers() {
         use crate::types::ability::{
@@ -25911,19 +26117,30 @@ pub mod tests {
             CastVariantPaid, CoinFlipResult, EffectOutcomeSignal, ObjectScope,
         };
 
-        fn quantity(qty: QuantityRef) -> (bool, bool) {
+        /// A node the hypothetical resolution has bound on every axis.
+        const BOUND: HypotheticalBindings = HypotheticalBindings {
+            targets: HypotheticalTargets::EstablishedByEarlierInstruction,
+            optional_outcome: HypotheticalOptionalOutcome::NotPerformed,
+            ledger: HypotheticalLedger::Projected,
+        };
+        fn readers<Verdict>(
+            read: impl Fn(BindingReader) -> Verdict,
+        ) -> (Verdict, Verdict, Verdict) {
             (
-                quantity_ref_binding_diverges(&qty, BindingReader::DelayedTriggerFireTime),
-                quantity_ref_binding_diverges(&qty, BindingReader::HypotheticalResolution),
+                read(BindingReader::DelayedTriggerFireTime),
+                read(BindingReader::HypotheticalResolution(
+                    HypotheticalBindings::NONE,
+                )),
+                read(BindingReader::HypotheticalResolution(BOUND)),
             )
         }
-        fn gate(condition: AbilityCondition) -> (bool, bool) {
-            (
-                gate_binding_diverges(&condition, BindingReader::DelayedTriggerFireTime),
-                gate_binding_diverges(&condition, BindingReader::HypotheticalResolution),
-            )
+        fn quantity(qty: QuantityRef) -> (bool, bool, bool) {
+            readers(|reader| quantity_ref_binding_diverges(&qty, reader))
         }
-        fn count(filter: TargetFilter) -> (bool, bool) {
+        fn gate(condition: AbilityCondition) -> (bool, bool, bool) {
+            readers(|reader| gate_binding_diverges(&condition, reader))
+        }
+        fn count(filter: TargetFilter) -> (bool, bool, bool) {
             quantity(QuantityRef::ObjectCount { filter })
         }
         fn creatures_with(properties: Vec<FilterProp>) -> TargetFilter {
@@ -25948,46 +26165,41 @@ pub mod tests {
         // The quantity entry: object scope and population.
         assert_eq!(
             quantity(QuantityRef::Power {
-                scope: ObjectScope::Target
-            }),
-            (true, true)
-        );
-        assert_eq!(
-            quantity(QuantityRef::Power {
                 scope: ObjectScope::Source
             }),
-            (false, false)
+            (false, false, false)
         );
         assert_eq!(
             quantity(QuantityRef::CountersOn {
                 scope: ObjectScope::Anaphoric,
                 counter_type: None,
             }),
-            (true, true)
+            (true, true, true)
         );
-        assert_eq!(count(creatures_you_control()), (false, false));
+        assert_eq!(count(creatures_you_control()), (false, false, false));
 
         // The gate entry composes its operands.
-        assert_eq!(gate(at_least_one(x())), (true, true));
-        assert_eq!(gate(at_least_one(lands_played())), (false, false));
+        assert_eq!(gate(at_least_one(x())), (true, true, true));
+        assert_eq!(gate(at_least_one(lands_played())), (false, false, false));
         assert_eq!(
             gate(AbilityCondition::ControllerControlsMatching {
                 filter: creatures_you_control(),
             }),
-            (false, false)
+            (false, false, false)
         );
         assert_eq!(
             gate(AbilityCondition::ConditionInstead {
                 inner: Box::new(at_least_one(lands_played())),
             }),
-            (true, false)
+            (true, false, false)
         );
         assert_eq!(
             gate(AbilityCondition::ConditionInstead {
                 inner: Box::new(at_least_one(x())),
             }),
-            (true, true)
+            (true, true, true)
         );
+        // A bound outcome decides the "if you do" member, and the turn is state.
         assert_eq!(
             gate(AbilityCondition::And {
                 conditions: vec![
@@ -25997,7 +26209,7 @@ pub mod tests {
                     AbilityCondition::IsYourTurn,
                 ],
             }),
-            (true, true)
+            (true, true, false)
         );
         assert_eq!(
             gate(AbilityCondition::Not {
@@ -26005,13 +26217,15 @@ pub mod tests {
                     result: CoinFlipResult::Won,
                 }),
             }),
-            (true, true)
+            (true, true, true)
         );
 
-        // The delta table: every hand-written `match reader` arm of the family,
-        // each read by both readers. A row is `(leaf, verdicts, expected)`, and
-        // both halves of every pair are asserted, so a swapped polarity in either
-        // reader of any arm fails here.
+        // The delta table: every hand-written `match reader` arm of the family
+        // whose verdict does not depend on the hypothetical bindings, each read
+        // by every reader. A row is `(leaf, verdicts, expected)`, and every
+        // column is asserted, so a swapped polarity in any reader of any arm
+        // fails here. The third column equals the second throughout: these arms
+        // are binding-independent.
         let controlled_by =
             |controller| TargetFilter::Typed(TypedFilter::creature().controller(controller));
         let controller_matches = |player| {
@@ -26032,28 +26246,28 @@ pub mod tests {
             (
                 "WasCast",
                 gate(AbilityCondition::WasCast { zone: None }),
-                (true, false),
+                (true, false, false),
             ),
             (
                 "CastDuringPhase",
                 gate(AbilityCondition::CastDuringPhase {
                     phases: vec![Phase::PreCombatMain],
                 }),
-                (true, false),
+                (true, false, false),
             ),
             (
                 "ControllerControlledMatchingAsCast",
                 gate(AbilityCondition::ControllerControlledMatchingAsCast {
                     filter: creatures_you_control(),
                 }),
-                (true, false),
+                (true, false, false),
             ),
             (
                 "CastTimingPermission",
                 gate(AbilityCondition::CastTimingPermission {
                     permission: CastTimingPermission::AsThoughHadFlash,
                 }),
-                (true, false),
+                (true, false, false),
             ),
             (
                 "ManaColorSpent",
@@ -26063,50 +26277,50 @@ pub mod tests {
                     },
                     minimum: 1,
                 }),
-                (true, false),
+                (true, false, false),
             ),
             (
                 "CastVariantPaidInstead",
                 gate(AbilityCondition::CastVariantPaidInstead {
                     variant: CastVariantPaid::Ninjutsu,
                 }),
-                (true, false),
+                (true, false, false),
             ),
             // CR 607.2a: the persistent linked-exile store is state.
             (
                 "QuantityRef::CardsExiledBySource",
                 quantity(QuantityRef::CardsExiledBySource),
-                (true, false),
+                (true, false, false),
             ),
             (
                 "TargetFilter::ExiledBySource",
                 count(TargetFilter::ExiledBySource),
-                (true, false),
+                (true, false, false),
             ),
             (
                 "FilterProp::SameNameAsExiledBySource",
                 count(creatures_with(vec![FilterProp::SameNameAsExiledBySource])),
-                (true, false),
+                (true, false, false),
             ),
             (
                 "PlayerFilter::OwnersOfCardsExiledBySource",
                 count(controller_matches(
                     PlayerFilter::OwnersOfCardsExiledBySource,
                 )),
-                (true, false),
+                (true, false, false),
             ),
             (
                 "CardTypeSetSource::ExiledBySource",
                 quantity(QuantityRef::DistinctCardTypes {
                     source: CardTypeSetSource::ExiledBySource,
                 }),
-                (true, false),
+                (true, false, false),
             ),
             // The fire-time-only `Another → OtherThanTriggerObject` rewrite.
             (
                 "FilterProp::Another",
                 count(creatures_with(vec![FilterProp::Another])),
-                (true, false),
+                (true, false, false),
             ),
             // CR 603.2: the matched event's referents, which a CR 106.7 reader
             // has no event to bind.
@@ -26115,59 +26329,59 @@ pub mod tests {
                 quantity(QuantityRef::Power {
                     scope: ObjectScope::EventSource,
                 }),
-                (false, true),
+                (false, true, true),
             ),
             (
                 "ObjectScope::EventTarget",
                 quantity(QuantityRef::Power {
                     scope: ObjectScope::EventTarget,
                 }),
-                (false, true),
+                (false, true, true),
             ),
             (
                 "ControllerRef::TriggeringPlayer",
                 count(controlled_by(ControllerRef::TriggeringPlayer)),
-                (false, true),
+                (false, true, true),
             ),
             (
                 "TargetFilter::TriggeringSource",
                 count(TargetFilter::TriggeringSource),
-                (false, true),
+                (false, true, true),
             ),
             (
                 "TargetFilter::TriggeringSourceController",
                 count(TargetFilter::TriggeringSourceController),
-                (false, true),
+                (false, true, true),
             ),
             (
                 "TargetFilter::EventTargetController",
                 count(TargetFilter::EventTargetController),
-                (false, true),
+                (false, true, true),
             ),
             (
                 "TargetFilter::TriggeringSpellController",
                 count(TargetFilter::TriggeringSpellController),
-                (false, true),
+                (false, true, true),
             ),
             (
                 "TargetFilter::TriggeringSpellOwner",
                 count(TargetFilter::TriggeringSpellOwner),
-                (false, true),
+                (false, true, true),
             ),
             (
                 "TargetFilter::TriggeringPlayer",
                 count(TargetFilter::TriggeringPlayer),
-                (false, true),
+                (false, true, true),
             ),
             (
                 "TargetFilter::EventTarget",
                 count(TargetFilter::EventTarget),
-                (false, true),
+                (false, true, true),
             ),
             (
                 "FilterProp::OtherThanTriggerObject",
                 count(creatures_with(vec![FilterProp::OtherThanTriggerObject])),
-                (false, true),
+                (false, true, true),
             ),
             (
                 "ManaSpentToCast { TriggeringSpell }",
@@ -26175,7 +26389,7 @@ pub mod tests {
                     CastManaObjectScope::TriggeringSpell,
                     CastManaSpentMetric::Total,
                 ))),
-                (false, true),
+                (false, true, true),
             ),
             // CR 508.5: the defending player reaches the trigger event.
             (
@@ -26183,114 +26397,323 @@ pub mod tests {
                 quantity(QuantityRef::LifeTotal {
                     player: PlayerScope::DefendingPlayer,
                 }),
-                (false, true),
+                (false, true, true),
             ),
             (
                 "ControllerRef::DefendingPlayer",
                 count(controlled_by(ControllerRef::DefendingPlayer)),
-                (false, true),
+                (false, true, true),
             ),
             (
                 "PlayerFilter::DefendingPlayer",
                 count(controller_matches(PlayerFilter::DefendingPlayer)),
-                (false, true),
+                (false, true, true),
             ),
             (
                 "TargetFilter::DefendingPlayer",
                 count(TargetFilter::DefendingPlayer),
-                (false, true),
+                (false, true, true),
             ),
             // A reference position reads the event even where the same filter
             // as a population does not; with no reference the subject is
-            // resolution-local for both readers.
+            // resolution-local for both readers. A `ParentTarget` reference is
+            // resolved through the trigger event too, never through the node's
+            // handed objects, so a bound node does not decide it.
             (
                 "DistinctFrom { StackSpell }",
                 count(creatures_with(vec![FilterProp::DistinctFrom {
                     reference: Box::new(TargetFilter::StackSpell),
                 }])),
-                (false, true),
+                (false, true, true),
             ),
             (
                 "SharesQuality { None }",
                 count(shares_name_with(None)),
-                (true, true),
+                (true, true, true),
             ),
             (
                 "SharesQuality { TriggeringSource }",
                 count(shares_name_with(Some(TargetFilter::TriggeringSource))),
-                (false, true),
+                (false, true, true),
             ),
             (
                 "SharesQuality { ParentTarget }",
                 count(shares_name_with(Some(TargetFilter::ParentTarget))),
-                (true, true),
+                (true, true, true),
             ),
             // CR 701.57a: a ledger the triggering discover publishes.
             (
                 "TriggeringDiscoverValue",
                 quantity(QuantityRef::TriggeringDiscoverValue),
-                (false, true),
+                (false, true, true),
+            ),
+            // The other `EffectOutcome` signals stay resolution-published.
+            (
+                "EffectOutcome { CurrentScopeSucceeded }",
+                gate(AbilityCondition::EffectOutcome {
+                    signal: EffectOutcomeSignal::CurrentScopeSucceeded,
+                }),
+                (true, true, true),
+            ),
+            // Target-shaped leaves a bound node does NOT decide: a PLAYER target
+            // (the walker hands over only revealed or looked-at objects), a
+            // declared slot of the resolving root, a root slot named by the
+            // gate, and the parent-object player anchors the population matcher
+            // answers `false` for without reading any binding.
+            (
+                "PlayerScope::Target",
+                quantity(QuantityRef::LifeTotal {
+                    player: PlayerScope::Target,
+                }),
+                (true, true, true),
+            ),
+            (
+                "ControllerRef::TargetPlayer",
+                count(controlled_by(ControllerRef::TargetPlayer)),
+                (true, true, true),
+            ),
+            (
+                "ControllerRef::TargetOpponent",
+                count(controlled_by(ControllerRef::TargetOpponent)),
+                (true, true, true),
+            ),
+            (
+                "TargetFilter::ParentTargetSlot",
+                count(TargetFilter::ParentTargetSlot { index: 0 }),
+                (true, true, true),
+            ),
+            (
+                "TargetMatchesFilter { subject_slot: Some }",
+                gate(AbilityCondition::TargetMatchesFilter {
+                    filter: TargetFilter::Any,
+                    use_lki: false,
+                    subject_slot: Some(0),
+                }),
+                (true, true, true),
+            ),
+            (
+                "PlayerFilter::ParentObjectTargetController",
+                count(controller_matches(
+                    PlayerFilter::ParentObjectTargetController,
+                )),
+                (true, true, true),
+            ),
+            (
+                "PlayerFilter::ParentObjectTargetOwner",
+                count(controller_matches(PlayerFilter::ParentObjectTargetOwner)),
+                (true, true, true),
             ),
         ];
         for (leaf, verdicts, expected) in delta_rows {
-            assert_eq!(verdicts, expected, "{leaf}: (fire time, hypothetical)");
+            assert_eq!(
+                verdicts, expected,
+                "{leaf}: (fire time, hypothetical, hypothetical bound)"
+            );
         }
 
-        // The ordinal ledger is published by the resolution being asked about.
-        assert_eq!(
-            gate(AbilityCondition::AbilityUseCountThisTurn {
-                tally: AbilityUseTally::Resolved,
-                comparator: Comparator::EQ,
-                n: 3,
-            }),
-            (true, true)
-        );
-        assert_eq!(
-            gate(AbilityCondition::AbilityUseCountThisTurn {
-                tally: AbilityUseTally::Activated,
-                comparator: Comparator::GE,
-                n: 2,
-            }),
-            (true, true)
-        );
-
-        // Mana spent to cast: the scope axis's other arms (`TriggeringSpell` is
-        // in the delta table), then the metric's population.
-        assert_eq!(
-            quantity(mana_spent(
-                CastManaObjectScope::SelfObject,
-                CastManaSpentMetric::Total
-            )),
-            (false, false)
-        );
-        assert_eq!(
-            quantity(mana_spent(
-                CastManaObjectScope::AbilityTarget,
-                CastManaSpentMetric::Total
-            )),
-            (true, true)
-        );
-        assert_eq!(
-            quantity(mana_spent(
-                CastManaObjectScope::SelfObject,
-                CastManaSpentMetric::FromSource {
-                    source_filter: TargetFilter::ParentTarget,
+        // The split arms: leaves a hypothetical node decides once its own
+        // resolution has bound the one axis each reads. Each row is
+        // `(leaf, axis, classifier)`. Every row reads `(true, true, false)`,
+        // and under the three single-axis bindings exactly its own axis
+        // answers `false` — so a leaf keyed on the wrong axis fails here.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Axis {
+            Targets,
+            OptionalOutcome,
+            Ledger,
+        }
+        fn only(axis: Axis) -> HypotheticalBindings {
+            match axis {
+                Axis::Targets => HypotheticalBindings {
+                    targets: HypotheticalTargets::EstablishedByEarlierInstruction,
+                    ..HypotheticalBindings::NONE
                 },
+                Axis::OptionalOutcome => HypotheticalBindings {
+                    optional_outcome: HypotheticalOptionalOutcome::NotPerformed,
+                    ..HypotheticalBindings::NONE
+                },
+                Axis::Ledger => HypotheticalBindings {
+                    ledger: HypotheticalLedger::Projected,
+                    ..HypotheticalBindings::NONE
+                },
+            }
+        }
+        type Classifier = Box<dyn Fn(BindingReader) -> bool>;
+        fn gate_leaf(condition: AbilityCondition) -> Classifier {
+            Box::new(move |reader| gate_binding_diverges(&condition, reader))
+        }
+        fn quantity_leaf(qty: QuantityRef) -> Classifier {
+            Box::new(move |reader| quantity_ref_binding_diverges(&qty, reader))
+        }
+        fn count_leaf(filter: TargetFilter) -> Classifier {
+            quantity_leaf(QuantityRef::ObjectCount { filter })
+        }
+        let split_rows: Vec<(&str, Axis, Classifier)> = vec![
+            (
+                "AbilityUseCountThisTurn { Resolved, EQ, 3 }",
+                Axis::Ledger,
+                gate_leaf(AbilityCondition::AbilityUseCountThisTurn {
+                    tally: AbilityUseTally::Resolved,
+                    comparator: Comparator::EQ,
+                    n: 3,
+                }),
+            ),
+            (
+                "AbilityUseCountThisTurn { Activated, GE, 2 }",
+                Axis::Ledger,
+                gate_leaf(AbilityCondition::AbilityUseCountThisTurn {
+                    tally: AbilityUseTally::Activated,
+                    comparator: Comparator::GE,
+                    n: 2,
+                }),
+            ),
+            (
+                "EffectOutcome { OptionalEffectPerformed }",
+                Axis::OptionalOutcome,
+                gate_leaf(AbilityCondition::EffectOutcome {
+                    signal: EffectOutcomeSignal::OptionalEffectPerformed,
+                }),
+            ),
+            (
+                "Power { ObjectScope::Target }",
+                Axis::Targets,
+                quantity_leaf(QuantityRef::Power {
+                    scope: ObjectScope::Target,
+                }),
+            ),
+            (
+                "PlayerScope::ParentObjectTargetController",
+                Axis::Targets,
+                quantity_leaf(QuantityRef::LifeTotal {
+                    player: PlayerScope::ParentObjectTargetController,
+                }),
+            ),
+            (
+                "CastVariantPaid { ObjectScope::Target }",
+                Axis::Targets,
+                gate_leaf(AbilityCondition::CastVariantPaid {
+                    variant: CastVariantPaid::Ninjutsu,
+                    subject: ObjectScope::Target,
+                }),
+            ),
+            (
+                "TargetMatchesFilter",
+                Axis::Targets,
+                gate_leaf(AbilityCondition::TargetMatchesFilter {
+                    filter: TargetFilter::Typed(TypedFilter::creature()),
+                    use_lki: false,
+                    subject_slot: None,
+                }),
+            ),
+            (
+                "TargetHasKeywordInstead",
+                Axis::Targets,
+                gate_leaf(AbilityCondition::TargetHasKeywordInstead {
+                    keyword: Keyword::Flying,
+                }),
+            ),
+            (
+                "HasObjectTarget",
+                Axis::Targets,
+                gate_leaf(AbilityCondition::HasObjectTarget),
+            ),
+            (
+                "ManaSpentToCast { AbilityTarget, Total }",
+                Axis::Targets,
+                quantity_leaf(mana_spent(
+                    CastManaObjectScope::AbilityTarget,
+                    CastManaSpentMetric::Total,
+                )),
+            ),
+            // The `FromSource` metric recurses into the split `ParentTarget`
+            // population leaf.
+            (
+                "ManaSpentToCast { SelfObject, FromSource { ParentTarget } }",
+                Axis::Targets,
+                quantity_leaf(mana_spent(
+                    CastManaObjectScope::SelfObject,
+                    CastManaSpentMetric::FromSource {
+                        source_filter: TargetFilter::ParentTarget,
+                    },
+                )),
+            ),
+            (
+                "TargetControllerCounter",
+                Axis::Targets,
+                quantity_leaf(QuantityRef::TargetControllerCounter {
+                    kind: PlayerCounterKind::Poison,
+                }),
+            ),
+            (
+                "TargetObjectManaValue",
+                Axis::Targets,
+                quantity_leaf(QuantityRef::TargetObjectManaValue {
+                    filter: Box::new(TargetFilter::Any),
+                }),
+            ),
+            (
+                "TargetFilter::ParentTarget",
+                Axis::Targets,
+                count_leaf(TargetFilter::ParentTarget),
+            ),
+            (
+                "TargetFilter::ParentTargetController",
+                Axis::Targets,
+                count_leaf(TargetFilter::ParentTargetController),
+            ),
+            (
+                "TargetFilter::ParentTargetOwner",
+                Axis::Targets,
+                count_leaf(TargetFilter::ParentTargetOwner),
+            ),
+            (
+                "ControllerRef::ParentTargetController",
+                Axis::Targets,
+                count_leaf(controlled_by(ControllerRef::ParentTargetController)),
+            ),
+            (
+                "ControllerRef::ParentTargetOwner",
+                Axis::Targets,
+                count_leaf(controlled_by(ControllerRef::ParentTargetOwner)),
+            ),
+        ];
+        for (leaf, axis, diverges) in &split_rows {
+            assert_eq!(
+                readers(diverges),
+                (true, true, false),
+                "{leaf}: (fire time, hypothetical, hypothetical bound)"
+            );
+            for bound_axis in [Axis::Targets, Axis::OptionalOutcome, Axis::Ledger] {
+                assert_eq!(
+                    diverges(BindingReader::HypotheticalResolution(only(bound_axis))),
+                    bound_axis != *axis,
+                    "{leaf}: keyed on {axis:?}, read with only {bound_axis:?} bound"
+                );
+            }
+        }
+
+        // Mana spent to cast: the scope axis's remaining arm (`TriggeringSpell`
+        // is in the delta table, `AbilityTarget` among the split rows).
+        assert_eq!(
+            quantity(mana_spent(
+                CastManaObjectScope::SelfObject,
+                CastManaSpentMetric::Total
             )),
-            (true, true)
+            (false, false, false)
         );
 
         // The per-turn ordered exile record stays resolution-published.
         assert_eq!(
             quantity(QuantityRef::ExiledCardPower { index: 0 }),
-            (true, true)
+            (true, true, true)
         );
         assert_eq!(
             count(TargetFilter::ExiledCardByIndex { index: 0 }),
-            (true, true)
+            (true, true, true)
         );
 
-        // The cast-variant marker follows the evaluator's subject mapping.
+        // The cast-variant marker follows the evaluator's subject mapping
+        // (`Target` is among the split rows).
         for subject in [
             ObjectScope::Source,
             ObjectScope::Anaphoric,
@@ -26302,32 +26725,25 @@ pub mod tests {
                     variant: CastVariantPaid::Ninjutsu,
                     subject,
                 }),
-                (true, false),
+                (true, false, false),
                 "{subject:?}"
             );
         }
-        assert_eq!(
-            gate(AbilityCondition::CastVariantPaid {
-                variant: CastVariantPaid::Ninjutsu,
-                subject: ObjectScope::Target,
-            }),
-            (true, true)
-        );
 
         // Not deltas. `StackSpell` is a live stack scan as a population (its
         // reference position is in the delta table).
-        assert_eq!(count(TargetFilter::StackSpell), (false, false));
+        assert_eq!(count(TargetFilter::StackSpell), (false, false, false));
         assert_eq!(
             count(TargetFilter::Typed(
                 TypedFilter::creature().controller(ControllerRef::EnchantedPlayer)
             )),
-            (false, false)
+            (false, false, false)
         );
         assert_eq!(
             count(creatures_with(vec![FilterProp::ControllerMatches {
                 player: Box::new(PlayerFilter::TriggeringPlayer),
             }])),
-            (true, true)
+            (true, true, true)
         );
 
         // The source permanent's own cast record is state; this ability's cost
@@ -26338,13 +26754,13 @@ pub mod tests {
             QuantityRef::ConvokedCreatureCount,
             QuantityRef::ChosenNumber,
         ] {
-            assert_eq!(quantity(qty.clone()), (false, false), "{qty:?}");
+            assert_eq!(quantity(qty.clone()), (false, false, false), "{qty:?}");
         }
         assert_eq!(
             quantity(QuantityRef::ObjectManaValue {
                 scope: ObjectScope::CostPaidObject,
             }),
-            (true, true)
+            (true, true, true)
         );
     }
 

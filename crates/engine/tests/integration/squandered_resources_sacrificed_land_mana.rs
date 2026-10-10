@@ -35,7 +35,7 @@ use engine::types::game_state::{
     CastPaymentMode, GameState, ManaChoice, ManaChoicePrompt, PayCostKind, WaitingFor,
 };
 use engine::types::identifiers::ObjectId;
-use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType};
+use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::player::PlayerId;
 use engine::types::zones::Zone;
@@ -1329,35 +1329,74 @@ fn sacrificed_bottomless_vault_with_no_counters_adds_black() {
     assert_eq!(pool(&runner, P0), vec![ManaType::Black]);
 }
 
-/// T30 (CR 608.2c): a gate on the ability's own resolution count is read both
-/// ways — the resolution that asks it bumps the ledger first, so the reading
-/// cannot settle it beforehand. Soulbright Seeker could produce {R}.
-#[test]
-fn sacrificed_soulbright_seeker_offers_its_ordinal_red() {
-    let (mut runner, squandered, seeker) =
-        ashaya_board_with("Soulbright Seeker", SOULBRIGHT_SEEKER);
-    assert!(
-        !runner
-            .state()
-            .ability_resolutions_this_turn
-            .keys()
-            .any(|(source, _)| *source == seeker),
-        "reach-guard: the Seeker's ability has not resolved this turn"
-    );
-
-    let activation = activate_and_sacrifice(&mut runner, squandered, seeker);
-
-    assert_in_graveyard(&runner, seeker);
-    assert_eq!(
-        activation.prompt_options,
-        Some(vec![ManaType::Red, ManaType::Green])
-    );
-    choose(&mut runner, ManaType::Red);
-    assert_eq!(pool(&runner, P0), vec![ManaType::Red]);
+/// Resolves the Seeker's ability `times` times through the real activation
+/// pipeline — each paid with {R} put into P0's pool, targeting the Seeker
+/// itself — then empties the pool and reapplies layers.
+fn resolve_seeker(runner: &mut GameRunner, seeker: ObjectId, times: u32) {
+    for _ in 0..times {
+        runner.state_mut().players[P0.0 as usize]
+            .mana_pool
+            .add(ManaUnit::new(ManaType::Red, ObjectId(0), false, vec![]));
+        runner.activate(seeker, 0).target_object(seeker).resolve();
+    }
+    runner.state_mut().players[P0.0 as usize]
+        .mana_pool
+        .mana
+        .clear();
+    flush(runner);
 }
 
-/// T30's behavioral control: the Seeker's ordinal gate really adds
-/// {R}{R}{R}{R} on the third resolution and nothing on the first two, so T30
+/// Reach-guard: the Seeker's ability has resolved exactly `prior` times this
+/// turn (no ledger entry for none).
+fn assert_seeker_resolutions(runner: &GameRunner, seeker: ObjectId, prior: u32) {
+    assert_eq!(
+        runner
+            .state()
+            .ability_resolutions_this_turn
+            .get(&(seeker, 0))
+            .copied(),
+        (prior > 0).then_some(prior),
+        "reach-guard: the Seeker's resolution ledger"
+    );
+}
+
+/// T30′ (CR 106.7 + CR 608.2c): "if this is the third time this ability has
+/// resolved this turn" is read against the resolution being asked about —
+/// the live count plus one. So the sacrificed Seeker could produce {R} only
+/// after exactly two real resolutions; its intrinsic Forest {G} always.
+#[test]
+fn sacrificed_soulbright_seeker_offers_red_only_before_its_third_resolution() {
+    for prior in 0..=3 {
+        let (mut runner, squandered, seeker) =
+            ashaya_board_with("Soulbright Seeker", SOULBRIGHT_SEEKER);
+        resolve_seeker(&mut runner, seeker, prior);
+        assert_seeker_resolutions(&runner, seeker, prior);
+        assert_ashaya_made_it_a_forest_land(&runner, seeker);
+
+        let activation = activate_and_sacrifice(&mut runner, squandered, seeker);
+
+        assert_in_graveyard(&runner, seeker);
+        if prior == 2 {
+            assert_eq!(
+                activation.prompt_options,
+                Some(vec![ManaType::Red, ManaType::Green]),
+                "{prior} prior resolutions"
+            );
+            choose(&mut runner, ManaType::Red);
+            assert_eq!(pool(&runner, P0), vec![ManaType::Red]);
+        } else {
+            assert_eq!(activation.prompt_options, None, "{prior} prior resolutions");
+            assert_eq!(
+                pool(&runner, P0),
+                vec![ManaType::Green],
+                "{prior} prior resolutions"
+            );
+        }
+    }
+}
+
+/// T30′'s behavioral control: the Seeker's ordinal gate really adds
+/// {R}{R}{R}{R} on the third resolution and nothing on the first two, so T30′
 /// reads a real ordinal producer, not an AST shape.
 #[test]
 fn soulbright_seeker_adds_red_only_on_its_third_resolution() {
@@ -1521,4 +1560,370 @@ fn sacrificed_forest_under_ten_reflections_and_two_type_rewrites_offers_black_or
     );
     choose(&mut runner, ManaType::Colorless);
     assert_eq!(pool(&runner, P0), vec![ManaType::Colorless]);
+}
+
+// ---- A triggered ordinal and a look-then-reveal producer (CR 106.7) ----
+
+// Verbatim Oracle text (MTGJSON), reminder text omitted.
+const OMNATH_LOCUS_OF_CREATION: &str = "When Omnath enters, draw a card.\nLandfall — Whenever a \
+     land you control enters, you gain 4 life if this is the first time this ability has \
+     resolved this turn. If it's the second time, add {R}{G}{W}{U}. If it's the third time, \
+     Omnath deals 4 damage to each opponent and each planeswalker you don't control.";
+const OMNATH_LOCUS_OF_ALL: &str = "If you would lose unspent mana, that mana becomes black \
+     instead.\nAt the beginning of your first main phase, look at the top card of your library. \
+     You may reveal that card if it has three or more colored mana symbols in its mana cost. If \
+     you do, add three mana in any combination of its colors and put it into your hand. If you \
+     don't reveal it, put it into your hand.";
+const COURSER_OF_KRUPHIX: &str = "Play with the top card of your library revealed.\nYou may play \
+     lands from the top of your library.\nLandfall — Whenever a land you control enters, you \
+     gain 1 life.";
+const VORINCLEX_VOICE_OF_HUNGER: &str = "Trample\nWhenever you tap a land for mana, add one mana \
+     of any type that land produced.\nWhenever an opponent taps a land for mana, that land \
+     doesn't untap during its controller's next untap step.";
+
+/// T31 (CR 106.7 + CR 603.3 + CR 608.2c): a triggered ability's ordinal is
+/// read against its next resolution, under the trigger's own index. Before any
+/// landfall the next resolution is the first ("you gain 4 life"); after one
+/// real landfall it is the second, which adds {R}{G}{W}{U}.
+#[test]
+fn sacrificed_omnath_locus_of_creation_reads_its_landfall_ordinal() {
+    for (landfalls, expected) in [
+        (0, None),
+        (
+            1,
+            Some(vec![
+                ManaType::White,
+                ManaType::Blue,
+                ManaType::Red,
+                ManaType::Green,
+            ]),
+        ),
+    ] {
+        let (mut scenario, squandered) = board();
+        scenario.add_creature_from_oracle(P0, "Ashaya, Soul of the Wild", 0, 0, ASHAYA);
+        let omnath = scenario
+            .add_creature_from_oracle(
+                P0,
+                "Omnath, Locus of Creation",
+                4,
+                4,
+                OMNATH_LOCUS_OF_CREATION,
+            )
+            .id();
+        let forest = scenario.add_land_to_hand(P0, "Forest").id();
+        let mut runner = scenario.build();
+        flush(&mut runner);
+        if landfalls == 1 {
+            let card_id = runner.state().objects[&forest].card_id;
+            runner
+                .act(GameAction::PlayLand {
+                    object_id: forest,
+                    card_id,
+                })
+                .expect("playing the Forest");
+            runner.advance_until_stack_empty();
+            flush(&mut runner);
+            assert_eq!(
+                runner.life(P0),
+                24,
+                "reach-guard: the first landfall gained 4"
+            );
+        }
+        let ledger: Vec<(usize, u32)> = runner
+            .state()
+            .ability_resolutions_this_turn
+            .iter()
+            .filter(|((source, _), _)| *source == omnath)
+            .map(|((_, index), count)| (*index, *count))
+            .collect();
+        let expected_ledger = if landfalls == 1 { vec![(1, 1)] } else { vec![] };
+        assert_eq!(ledger, expected_ledger, "reach-guard: the landfall ledger");
+        assert_ashaya_made_it_a_forest_land(&runner, omnath);
+
+        let activation = activate_and_sacrifice(&mut runner, squandered, omnath);
+
+        assert_in_graveyard(&runner, omnath);
+        assert_eq!(activation.prompt_options, expected, "{landfalls} landfalls");
+        if expected.is_none() {
+            assert_eq!(pool(&runner, P0), vec![ManaType::Green]);
+        }
+    }
+}
+
+/// The Omnath, Locus of All board: Ashaya (+ Courser of Kruphix when
+/// `courser`), Omnath, Squandered Resources and Reflecting Pool, with a card
+/// costing `top_cost` on top of a filler card (or an empty library when
+/// `top_cost` is `None`).
+struct OmnathBoard {
+    runner: GameRunner,
+    squandered: ObjectId,
+    reflecting_pool: ObjectId,
+    omnath: ObjectId,
+}
+
+fn omnath_board(courser: bool, top_cost: Option<ManaCost>) -> OmnathBoard {
+    let (mut scenario, squandered) = board();
+    let reflecting_pool = scenario
+        .add_land_from_oracle(P0, "Reflecting Pool", REFLECTING_POOL)
+        .id();
+    scenario.add_creature_from_oracle(P0, "Ashaya, Soul of the Wild", 0, 0, ASHAYA);
+    if courser {
+        scenario.add_creature_from_oracle(P0, "Courser of Kruphix", 2, 4, COURSER_OF_KRUPHIX);
+    }
+    let omnath = scenario
+        .add_creature_from_oracle(P0, "Omnath, Locus of All", 4, 4, OMNATH_LOCUS_OF_ALL)
+        .id();
+    if let Some(cost) = top_cost {
+        scenario.add_spell_to_library_top(P0, "Filler", false);
+        scenario
+            .add_spell_to_library_top(P0, "Top Card", false)
+            .with_mana_cost(cost);
+    }
+    let mut runner = scenario.build();
+    flush(&mut runner);
+    assert_ashaya_made_it_a_forest_land(&runner, omnath);
+    OmnathBoard {
+        runner,
+        squandered,
+        reflecting_pool,
+        omnath,
+    }
+}
+
+fn cost(shards: Vec<ManaCostShard>, generic: u32) -> ManaCost {
+    ManaCost::Cost { shards, generic }
+}
+
+fn doomsday() -> ManaCost {
+    cost(vec![ManaCostShard::Black; 3], 0)
+}
+
+fn esper_charm() -> ManaCost {
+    cost(
+        vec![
+            ManaCostShard::White,
+            ManaCostShard::Blue,
+            ManaCostShard::Black,
+        ],
+        0,
+    )
+}
+
+fn dimir_charm() -> ManaCost {
+    cost(vec![ManaCostShard::Blue, ManaCostShard::Black], 0)
+}
+
+fn sol_ring() -> ManaCost {
+    cost(vec![], 1)
+}
+
+/// The colors of P0's top library card — the reach-guard that the reading
+/// looked at the card the test staged.
+fn top_card_colors(runner: &GameRunner) -> Vec<ManaColor> {
+    let top = runner.state().players[P0.0 as usize].library[0];
+    runner.state().objects[&top].color.clone()
+}
+
+/// T32a (CR 106.7 + CR 202.2c + CR 401.5): with the top card public, the
+/// sacrificed Omnath could produce the colors of an eligible top card — here
+/// Doomsday's {B} — beside its intrinsic Forest {G}.
+#[test]
+fn sacrificed_omnath_offers_an_eligible_public_top_cards_color() {
+    let mut board = omnath_board(true, Some(doomsday()));
+    assert_eq!(top_card_colors(&board.runner), vec![ManaColor::Black]);
+
+    let activation = activate_and_sacrifice(&mut board.runner, board.squandered, board.omnath);
+
+    assert_in_graveyard(&board.runner, board.omnath);
+    assert_eq!(
+        activation.prompt_options,
+        Some(vec![ManaType::Black, ManaType::Green])
+    );
+    choose(&mut board.runner, ManaType::Black);
+    assert_eq!(pool(&board.runner, P0), vec![ManaType::Black]);
+}
+
+/// T32c (CR 202.2c): an eligible multicolored top card offers each of its
+/// colors.
+#[test]
+fn sacrificed_omnath_offers_each_color_of_an_eligible_multicolored_top_card() {
+    let mut board = omnath_board(true, Some(esper_charm()));
+    assert_eq!(
+        top_card_colors(&board.runner),
+        vec![ManaColor::White, ManaColor::Blue, ManaColor::Black]
+    );
+
+    let activation = activate_and_sacrifice(&mut board.runner, board.squandered, board.omnath);
+
+    assert_in_graveyard(&board.runner, board.omnath);
+    assert_eq!(
+        activation.prompt_options,
+        Some(vec![
+            ManaType::White,
+            ManaType::Blue,
+            ManaType::Black,
+            ManaType::Green
+        ])
+    );
+}
+
+/// T32d (CR 608.2c): an ineligible top card (two colored symbols) is never
+/// revealed, so "if you do" is false and its colors are not offered. Paired
+/// positive: T32c.
+#[test]
+fn sacrificed_omnath_offers_nothing_of_an_ineligible_top_card() {
+    let mut board = omnath_board(true, Some(dimir_charm()));
+    assert_eq!(
+        top_card_colors(&board.runner),
+        vec![ManaColor::Blue, ManaColor::Black]
+    );
+
+    let activation = activate_and_sacrifice(&mut board.runner, board.squandered, board.omnath);
+
+    assert_in_graveyard(&board.runner, board.omnath);
+    assert_eq!(activation.prompt_options, None);
+    assert_eq!(pool(&board.runner, P0), vec![ManaType::Green]);
+}
+
+/// T32e (CR 106.5): a colorless top card adds no type — never every color.
+#[test]
+fn sacrificed_omnath_offers_nothing_of_a_colorless_top_card() {
+    let mut board = omnath_board(true, Some(sol_ring()));
+    assert!(top_card_colors(&board.runner).is_empty());
+
+    let activation = activate_and_sacrifice(&mut board.runner, board.squandered, board.omnath);
+
+    assert_in_graveyard(&board.runner, board.omnath);
+    assert_eq!(activation.prompt_options, None);
+    assert_eq!(pool(&board.runner, P0), vec![ManaType::Green]);
+}
+
+/// T32f (CR 401.5 + CR 106.5): with an empty library there is no card to look
+/// at, so only the intrinsic Forest {G} remains.
+#[test]
+fn sacrificed_omnath_over_an_empty_library_offers_only_green() {
+    let mut board = omnath_board(true, None);
+    assert!(
+        board.runner.state().players[P0.0 as usize]
+            .library
+            .is_empty(),
+        "reach-guard: the library is empty"
+    );
+
+    let activation = activate_and_sacrifice(&mut board.runner, board.squandered, board.omnath);
+
+    assert_in_graveyard(&board.runner, board.omnath);
+    assert_eq!(activation.prompt_options, None);
+    assert_eq!(pool(&board.runner, P0), vec![ManaType::Green]);
+}
+
+/// T33a (CR 400.2 + CR 401.2): without Courser the top card is hidden, so its
+/// identity stays unbound — the reading is not a free look at the library.
+/// Paired positive: T32a, the same board with Courser.
+#[test]
+fn sacrificed_omnath_does_not_read_a_hidden_top_card() {
+    let mut board = omnath_board(false, Some(doomsday()));
+    assert_eq!(top_card_colors(&board.runner), vec![ManaColor::Black]);
+
+    let activation = activate_and_sacrifice(&mut board.runner, board.squandered, board.omnath);
+
+    assert_in_graveyard(&board.runner, board.omnath);
+    assert_eq!(activation.prompt_options, None);
+    assert_eq!(pool(&board.runner, P0), vec![ManaType::Green]);
+}
+
+/// Taps Reflecting Pool for mana and reports the type prompt's options (the
+/// Pool is untapped and the pool emptied first).
+fn reflecting_pool_options(runner: &mut GameRunner, reflecting_pool: ObjectId) -> Vec<ManaType> {
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&reflecting_pool)
+        .expect("the Pool exists")
+        .tapped = false;
+    runner.state_mut().players[P0.0 as usize]
+        .mana_pool
+        .mana
+        .clear();
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: reflecting_pool,
+            ability_index: 0,
+        })
+        .expect("tapping Reflecting Pool");
+    match runner.state().waiting_for.clone() {
+        WaitingFor::ChooseManaColor {
+            choice: ManaChoicePrompt::SingleColor { options },
+            ..
+        } => {
+            choose(runner, options[0]);
+            options
+        }
+        _ => pool(runner, P0),
+    }
+}
+
+/// C-8 (CR 106.7 "at any time"): the reading is live — after the library is
+/// reordered, the same Pool reads the new top card.
+#[test]
+fn reflecting_pool_reads_the_current_top_card_each_time() {
+    let mut board = omnath_board(true, Some(doomsday()));
+    // Restage the filler under the Doomsday as Esper Charm.
+    let esper = board.runner.state().players[P0.0 as usize].library[1];
+    {
+        let object = board.runner.state_mut().objects.get_mut(&esper).unwrap();
+        object.mana_cost = esper_charm();
+        object.color = vec![ManaColor::White, ManaColor::Blue, ManaColor::Black];
+    }
+    assert_eq!(top_card_colors(&board.runner), vec![ManaColor::Black]);
+    assert_eq!(
+        reflecting_pool_options(&mut board.runner, board.reflecting_pool),
+        vec![ManaType::Black, ManaType::Green]
+    );
+
+    let library = &mut board.runner.state_mut().players[P0.0 as usize].library;
+    library.retain(|card| *card != esper);
+    library.push_front(esper);
+    assert_eq!(
+        top_card_colors(&board.runner),
+        vec![ManaColor::White, ManaColor::Blue, ManaColor::Black],
+        "reach-guard: Esper Charm is on top now"
+    );
+    assert_eq!(
+        reflecting_pool_options(&mut board.runner, board.reflecting_pool),
+        vec![
+            ManaType::White,
+            ManaType::Blue,
+            ManaType::Black,
+            ManaType::Green
+        ]
+    );
+}
+
+/// C-10 (CR 603.2 + CR 106.7): "that land produced" names the trigger's own
+/// event, which a hypothetical resolution does not have — an unrelated event
+/// in flight is not read.
+#[test]
+fn sacrificed_vorinclex_does_not_read_an_unrelated_trigger_event() {
+    let (mut runner, squandered, vorinclex) =
+        ashaya_board_with("Vorinclex, Voice of Hunger", VORINCLEX_VOICE_OF_HUNGER);
+    runner.state_mut().current_trigger_event = Some(GameEvent::TappedForMana {
+        player_id: P0,
+        source_id: ObjectId(9999),
+        produced: vec![ManaType::White],
+        tap_state: Default::default(),
+    });
+    assert!(
+        matches!(
+            runner.state().current_trigger_event,
+            Some(GameEvent::TappedForMana { .. })
+        ),
+        "reach-guard: an unrelated event is in flight"
+    );
+
+    let activation = activate_and_sacrifice(&mut runner, squandered, vorinclex);
+
+    assert_in_graveyard(&runner, vorinclex);
+    assert_eq!(activation.prompt_options, None);
+    assert_eq!(pool(&runner, P0), vec![ManaType::Green]);
 }
