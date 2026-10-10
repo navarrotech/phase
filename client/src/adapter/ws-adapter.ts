@@ -214,7 +214,10 @@ export class NativeEngineVersionMismatchError extends Error {
  *      (CounterAdditionUnlessPayment) gains unpaid_suffix, the unpaid legs and
  *      their payer, and PendingContinuation gains head_payment_origin, which
  *      marks a queued PayCost remainder as a payment already chosen. A v121 peer
- *      drops both silently. P2P moves in lockstep to wire 104.
+ *      drops both silently. The pending cost-move resume also gains
+ *      ReplacementMayCostInnerChoice, an accepted entry MayCost parked while its
+ *      leg's own replacement choice is answered, which a v121 peer cannot decode.
+ *      P2P moves in lockstep to wire 104.
  * 121 — GameState's triggered-ability mana ledger records the actual
  *       receiving player alongside the exact trigger definition. A v120 peer
  *       cannot decode a nonempty pair ledger; the exact-match handshake

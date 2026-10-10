@@ -3350,6 +3350,9 @@ mod tests {
     /// (`UnpaidCostSuffix`, CR 118.12 + CR 702.24a) and `PendingContinuation` gains
     /// `head_payment_origin` (`ResolutionPaymentOrigin`, CR 614.17a); a v121 peer drops
     /// both keys silently, so it must be refused before it receives v122 state.
+    /// `PendingCostMoveResume::ReplacementMayCostInnerChoice` (an accepted entry
+    /// MayCost parked while its leg's own replacement choice is answered,
+    /// CR 614.12a + CR 614.11a) is a new variant a v121 peer cannot decode.
     /// The successful-mana-history ledger now stores the actual receiving
     /// player with each trigger definition. A v120 peer cannot decode a
     /// nonempty pair ledger, so it must be refused before v121 state.

@@ -116,7 +116,8 @@ const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
 // GameState.next_spell_announcement) and the BecomesTarget targeter.
 // +50: v121 records the actual receiving player with successful trigger mana.
 // +51: v122 adds the paused-payment carriers: `CounterAdditionUnlessPayment.unpaid_suffix`
-// (`UnpaidCostSuffix`) and `PendingContinuation.head_payment_origin`.
+// (`UnpaidCostSuffix`), `PendingContinuation.head_payment_origin` and
+// `PendingCostMoveResume::ReplacementMayCostInnerChoice`.
 const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 51;
 // The LOBBY message-set version, not derived from the full-game number above.
 // The classifier below refuses an expression only on the SOURCE constants; this

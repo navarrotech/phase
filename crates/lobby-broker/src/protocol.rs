@@ -66,8 +66,11 @@ pub struct TournamentRequestId(pub u64);
 ///      gains `head_payment_origin` (`ResolutionPaymentOrigin`: a queued PayCost remainder
 ///      resumes a payment already chosen, CR 614.17a). A v121 peer drops both keys: it
 ///      would settle a paused multi-leg cost with its later legs unpaid and re-gate a
-///      latched remainder as a fresh choice. P2P moves to wire 104; no lobby carrier
-///      names either.
+///      latched remainder as a fresh choice. `PendingCostMoveResume` also gains
+///      `ReplacementMayCostInnerChoice` (an accepted entry MayCost parked while its
+///      leg's own replacement choice is answered, CR 614.12a + CR 614.11a), which a
+///      v121 peer cannot decode. P2P moves to wire 104; no lobby carrier names any
+///      of them.
 /// 121 — `GameState::triggered_abilities_added_mana_this_turn` records
 ///       (trigger definition, receiving player), so copied triggers check
 ///       their own controller's successful mana history. A v120 peer cannot

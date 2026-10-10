@@ -647,6 +647,24 @@ pub(crate) fn resume_replacement_may_cost_move(
     super::engine_replacement::handle_replacement_choice(state, 0, events)
 }
 
+/// CR 614.12a + CR 614.11a + CR 118.12: Resume an accepted entry MayCost once
+/// the replacement choice on its paused leg's own event has settled — for a
+/// draw leg, the whole draw instruction and its substitute's work included.
+/// Restoring the accepted outer replacement re-enters its paid-resume branch,
+/// which pays the latched remainder and finishes the entry.
+pub(crate) fn resume_replacement_may_cost_after_inner_choice(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+) -> Result<WaitingFor, EngineError> {
+    let Some(PendingCostMoveResume::ReplacementMayCostInnerChoice { outer_replacement }) =
+        state.pending_cost_move_resume.take()
+    else {
+        unreachable!("the dispatcher matched this typed continuation")
+    };
+    state.pending_replacement = Some(*outer_replacement);
+    super::engine_replacement::handle_replacement_choice(state, 0, events)
+}
+
 pub fn pay_ability_cost_for_activation(
     state: &mut GameState,
     player: PlayerId,

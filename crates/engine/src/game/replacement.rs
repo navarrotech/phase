@@ -12145,14 +12145,14 @@ fn continue_replacement_impl(
             MayCostOutcome::Paid => true,
             MayCostOutcome::Unpaid => false,
             MayCostOutcome::PausedForChoice { remaining_cost } => {
-                // CR 614.12a: the payment surfaced an interactive sub-choice (e.g. a
-                // `DiscardChoice`); `state.waiting_for` is already set to it. Re-park
-                // the SAME pending record with `may_cost_paid: true` and flag the
-                // pause so `handle_replacement_choice` surfaces the live sub-choice
-                // (not a fresh ReplacementChoice). The permanent enters only when
-                // the resume finishes any `may_cost_remaining`. The carried
-                // `Execute` payload is inert — the flag short-circuits the caller
-                // before it is read.
+                // CR 614.12a: the payment surfaced a sub-choice (a `DiscardChoice`, or
+                // a replacement choice on one leg's own event); `state.waiting_for` is
+                // already set to it. Re-park the SAME pending record with
+                // `may_cost_paid: true` and flag the pause so `handle_replacement_choice`
+                // surfaces the live sub-choice (not a fresh ReplacementChoice). The
+                // permanent enters only when the resume finishes any
+                // `may_cost_remaining`. The carried `Execute` payload is inert — the
+                // flag short-circuits the caller before it is read.
                 let outer_replacement = crate::types::game_state::PendingReplacement {
                     proposed: proposed.clone(),
                     sacrifice_provenance: reparked_sacrifice_provenance,
@@ -12173,20 +12173,59 @@ fn continue_replacement_impl(
                     may_cost_paid: true,
                     may_cost_remaining: remaining_cost,
                 };
-                if let Some(crate::types::game_state::PendingCostMoveResume::ReplacementMayCost {
-                    outer_replacement: parked_outer,
-                    ..
-                }) = state.pending_cost_move_resume.as_mut()
-                {
+                use crate::types::game_state::PendingCostMoveResume;
+                match state.pending_cost_move_resume.as_mut() {
                     // CR 614.12a + CR 616.1: an inner cost move already owns
                     // `pending_replacement` for its Moved replacement choice.
                     // Keep that live inner prompt there and retain this outer
                     // optional replacement only in the typed cost continuation.
-                    *parked_outer = Some(Box::new(outer_replacement));
-                    state.replacement_may_cost_paused = true;
-                    return ReplacementResult::Execute(proposed);
+                    Some(PendingCostMoveResume::ReplacementMayCost {
+                        outer_replacement: parked_outer,
+                        ..
+                    }) => *parked_outer = Some(Box::new(outer_replacement)),
+                    // CR 614.12a + CR 616.1 + CR 614.11a: the paused leg owns
+                    // `pending_replacement` with its own event's replacement
+                    // choice (a Dredge on a draw leg, a CR 616.1 ordering on a
+                    // discarded card). That inner record must stay live for the
+                    // answer; the accepted outer entry replacement, with its
+                    // unpaid suffix in `may_cost_remaining`, waits in a typed
+                    // continuation and resumes only once the inner event (a whole
+                    // draw instruction included) has finished.
+                    None if state.pending_replacement.is_some() => {
+                        state.pending_cost_move_resume =
+                            Some(PendingCostMoveResume::ReplacementMayCostInnerChoice {
+                                outer_replacement: Box::new(outer_replacement),
+                            });
+                    }
+                    // An interactive sub-choice (`DiscardChoice`, `EffectZoneChoice`)
+                    // leaves the slot free; its resolution hook re-enters this
+                    // record from `pending_replacement`.
+                    None => state.pending_replacement = Some(outer_replacement),
+                    // Guarded catch-all: no admitted MayCost leg installs any other
+                    // cost-move owner beside a pause (a `ManaDynamic` leg's
+                    // mana-ability cursor could in theory, and has no producer).
+                    // Not `unreachable!`: the state is constructible under the typed
+                    // contract and a release panic would crash a live game. The live
+                    // inner record is never overwritten. If the replacement slot is
+                    // free the outer is re-parked there as before; otherwise the
+                    // outer is dropped and the entry never completes — on the cast
+                    // path the spell stays on the stack with its `SpellResolution`
+                    // frame and no owner to finish it (a wedge).
+                    Some(unexpected_owner) => {
+                        debug_assert!(
+                            false,
+                            "an entry MayCost leg parked a {unexpected_owner:?} owner \
+                             beside its pause"
+                        );
+                        tracing::warn!(
+                            owner = ?unexpected_owner,
+                            "entry MayCost paused beside an unexpected cost-move owner"
+                        );
+                        if state.pending_replacement.is_none() {
+                            state.pending_replacement = Some(outer_replacement);
+                        }
+                    }
                 }
-                state.pending_replacement = Some(outer_replacement);
                 state.replacement_may_cost_paused = true;
                 return ReplacementResult::Execute(proposed);
             }

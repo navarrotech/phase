@@ -109,8 +109,10 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  *  104 — game_setup and state_update carry GameState, whose parked unless-cost
  *       resume now carries its unpaid legs (unpaid_suffix) and whose queued
  *       continuations carry a PayCost remainder's payment origin
- *       (head_payment_origin). A v103 peer drops both silently, so first contact
- *       rejects the skew. Bumped with full-game protocol 122.
+ *       (head_payment_origin), and whose pending cost-move resume gains the
+ *       ReplacementMayCostInnerChoice variant. A v103 peer drops the keys silently
+ *       and cannot decode the variant, so first contact rejects the skew. Bumped
+ *       with full-game protocol 122.
  *  103 — game_setup and state_update carry GameState's successful-mana-history
  *       ledger as (trigger definition, receiving player) pairs. A v102 peer
  *       cannot decode a nonempty pair ledger. Bumped with full-game 121.
