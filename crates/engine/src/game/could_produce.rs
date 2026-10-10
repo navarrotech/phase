@@ -519,21 +519,22 @@ fn read_triggered_abilities(
         if entry.definition.execute.is_none() {
             continue;
         }
+        let definition_ref = TriggerDefinitionRef {
+            source: context.identity.reference,
+            occurrence: entry.occurrence.clone(),
+        };
         if let Some(condition) = &entry.definition.condition {
             if !check_trigger_condition_with_source(
                 state,
                 condition,
                 context.lki.controller,
                 Some(&context),
+                Some(&definition_ref),
                 None,
             ) {
                 continue;
             }
         }
-        let definition_ref = TriggerDefinitionRef {
-            source: context.identity.reference,
-            occurrence: entry.occurrence.clone(),
-        };
         let mut resolved = build_triggered_ability_from_context(
             state,
             &entry.definition,
