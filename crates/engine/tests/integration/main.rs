@@ -196,6 +196,7 @@ mod cost_paid_provenance;
 mod cost_reduction_order_election;
 mod cost_x_carrier_runtime;
 mod cost_zone_pipeline;
+mod could_produce_mana_types;
 mod council_of_four_nth_per_turn;
 mod count_form_draw_replacement;
 mod counter_anaphor_binds_to_recipient;

@@ -907,6 +907,9 @@ fn resolved_mana_ability_for_current_state(
     apply_condition_instead_mana_swap(state, &resolved)
 }
 
+/// CR 608.2c + CR 614.1a: a mana ability's "instead" sub (`ConditionInstead`)
+/// decided now — swapped in when its wrapped condition holds, its base chain
+/// kept otherwise.
 pub(crate) fn apply_condition_instead_mana_swap(
     state: &GameState,
     ability: &ResolvedAbility,
@@ -917,7 +920,23 @@ pub(crate) fn apply_condition_instead_mana_swap(
     let Some(AbilityCondition::ConditionInstead { inner }) = sub.condition.as_ref() else {
         return ability.clone();
     };
-    if super::effects::evaluate_condition(inner, state, ability) {
+    let met = super::effects::evaluate_condition(inner, state, ability);
+    condition_instead_mana_branch(ability, sub, met)
+}
+
+/// CR 608.2c + CR 614.1a: the mana ability `ability` with its `ConditionInstead`
+/// sub `sub` resolved one way: when `met`, a mana override is swapped in (any
+/// other override stays in the chain, where the chain resolver decides it);
+/// otherwise the override is consumed and its base chain (`else_ability`) runs.
+///
+/// Pure, so a CR 106.7 reader can build both branches when the wrapped
+/// condition is fixed by the ability's own resolution rather than by state.
+pub(crate) fn condition_instead_mana_branch(
+    ability: &ResolvedAbility,
+    sub: &ResolvedAbility,
+    met: bool,
+) -> ResolvedAbility {
+    if met {
         if matches!(sub.effect, Effect::Mana { target: None, .. }) {
             return super::ability_utils::apply_instead_swap(ability, sub);
         }
@@ -1231,7 +1250,7 @@ pub(crate) fn mana_choice_prompt(
         // referent's own could-produce set from the ability's cost-paid snapshot.
         ManaProduction::AnyTypeProduceableBy { land_filter, .. } => {
             let owner = state.objects.get(&source_id).map(|obj| obj.controller)?;
-            let options = super::mana_sources::produceable_mana_types_by_filter(
+            let options = super::could_produce::types_for_clause(
                 state,
                 land_filter,
                 owner,
@@ -1282,7 +1301,11 @@ pub(crate) fn mana_choice_prompt(
         // single option auto-picks). Mirrors `AnyTypeProduceableBy`.
         ManaProduction::OpponentLandColors { .. } => {
             let owner = state.objects.get(&source_id).map(|obj| obj.controller)?;
-            let options = super::mana_sources::opponent_land_color_options(state, owner);
+            let options = super::could_produce::census(
+                state,
+                super::could_produce::CouldProducePopulation::OpponentLands { controller: owner },
+                super::could_produce::CouldProduceMeasure::Colors,
+            );
             // CR 106.5: An ability that would produce mana of an undefined type
             // produces no mana, so it needs no color choice.
             let produces_mana = count_ability
@@ -5283,8 +5306,8 @@ fn prepare_deterministic_exile_cost_selection(
 ///
 /// This is the single candidate authority for a non-self sacrifice mana cost:
 /// the activation seam surfaces these choices, and the castability gate reads
-/// the same set before activation
-/// (`mana_sources::unbound_cost_referent_mana_types`). CR 118.10: a permanent
+/// the same set before activation (`could_produce::census` over
+/// `CouldProducePopulation::CostCandidates`). CR 118.10: a permanent
 /// already committed to a pending spell's sacrifice cost is excluded here, so
 /// both readers agree on it. `None` means the cost has no non-self sacrifice.
 pub(crate) fn sacrifice_cost_choice(

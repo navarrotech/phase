@@ -468,8 +468,9 @@ pub struct LKISnapshot {
     #[serde(default)]
     pub attachments: Vec<AttachmentSnapshot>,
     /// CR 106.7 + CR 608.2h: The mana types this object could produce as it last
-    /// existed on the battlefield (union over its mana abilities, ignoring cost
-    /// payability). A "could produce" read of a departed permanent — "the
+    /// existed on the battlefield — every ability's would-be resolution
+    /// (`could_produce::could_produce`), replacement-aware, in canonical
+    /// `ManaType::ALL` order. A "could produce" read of a departed permanent — "the
     /// sacrificed land" (Squandered Resources) — answers from here, because the
     /// object's layered abilities are gone once it leaves.
     ///

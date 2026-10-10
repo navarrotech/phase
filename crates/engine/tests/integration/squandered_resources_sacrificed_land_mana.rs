@@ -18,12 +18,16 @@
 //! really ran before asserting what mana arrived.
 
 use engine::ai_support::legal_actions;
+use engine::game::ability_utils::build_resolved_from_def;
 use engine::game::casting::can_cast_object_now;
+use engine::game::effects::resolve_ability_chain;
 use engine::game::layers::flush_layers;
 use engine::game::mana_abilities::can_activate_mana_ability_now;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{Effect, ManaProduction};
 use engine::types::actions::GameAction;
+use engine::types::card_type::CoreType;
+use engine::types::counter::parse_counter_type;
 use engine::types::events::GameEvent;
 use engine::types::game_state::{
     CastPaymentMode, GameState, ManaChoice, ManaChoicePrompt, PayCostKind, WaitingFor,
@@ -539,4 +543,835 @@ fn spells_are_not_offered_when_the_only_land_could_produce_nothing() {
     );
     assert!(!cast_is_offered(runner.state(), green_spell));
     assert!(!cast_is_offered(runner.state(), generic_spell));
+}
+
+// ---------------------------------------------------------------------------
+// CR 106.7 hostile fixtures: every ability's would-be resolution, read through
+// the one could-produce authority (`game::could_produce`). Each row drives the
+// real sacrifice, then asserts what arrived.
+// ---------------------------------------------------------------------------
+
+// Verbatim Oracle text (MTGJSON), reminder text omitted.
+const ASHAYA: &str = "Ashaya's power and toughness are each equal to the number of lands \
+     you control.\nNontoken creatures you control are Forest lands in addition to their other types.";
+const WILD_CANTOR: &str = "Sacrifice this creature: Add one mana of any color.";
+const MILLIKIN: &str = "{T}, Mill a card: Add {C}.";
+const CONTAMINATION: &str = "At the beginning of your upkeep, sacrifice this enchantment unless \
+     you sacrifice a creature.\nIf a land is tapped for mana, it produces {B} instead of any other \
+     type and amount.";
+const GAEAS_CRADLE: &str = "{T}: Add {G} for each creature you control.";
+const DRESS_DOWN: &str = "Flash\nWhen this enchantment enters, draw a card.\nCreatures lose all \
+     abilities.\nAt the beginning of the end step, sacrifice this enchantment.";
+const EXOTIC_ORCHARD: &str =
+    "{T}: Add one mana of any color that a land an opponent controls could produce.";
+const CALCIFORM_POOLS: &str = "{T}: Add {C}.\n{1}, {T}: Put a storage counter on this land.\n{1}, \
+     Remove X storage counters from this land: Add X mana in any combination of {W} and/or {U}.";
+const CRUMBLING_VESTIGE: &str = "This land enters tapped.\nWhen this land enters, add one mana of \
+     any color.\n{T}: Add {C}.";
+const RIVER_OF_TEARS: &str = "{T}: Add {U}. If you played a land this turn, add {B} instead.";
+const GEMSTONE_CAVERNS: &str = "If this card is in your opening hand and you're not the starting \
+     player, you may begin the game with Gemstone Caverns on the battlefield with a luck counter \
+     on it. If you do, exile a card from your hand.\n{T}: Add {C}. If Gemstone Caverns has a luck \
+     counter on it, instead add one mana of any color.";
+const URZAS_SAGA: &str = "(As this Saga enters and after your draw step, add a lore counter. \
+     Sacrifice after III.)\nI — This Saga gains \"{T}: Add {C}.\"\nII — This Saga gains \"{2}, \
+     {T}: Create a 0/0 colorless Construct artifact creature token with 'This token gets +1/+1 \
+     for each artifact you control.'\"\nIII — Search your library for an artifact card with mana \
+     cost {0} or {1}, put it onto the battlefield, then shuffle.";
+const SOLDEVI_ADNATE: &str = "{T}, Sacrifice a black or artifact creature: Add an amount of {B} \
+     equal to the sacrificed creature's mana value.";
+const BOTTOMLESS_VAULT: &str = "This land enters tapped.\nYou may choose not to untap this land \
+     during your untap step.\nAt the beginning of your upkeep, if this land is tapped, put a \
+     storage counter on it.\n{T}, Remove any number of storage counters from this land: Add {B} \
+     for each storage counter removed this way.";
+const SOULBRIGHT_SEEKER: &str = "As an additional cost to cast this spell, behold an Elemental or \
+     pay {2}.\n{R}: Target creature you control gains trample until end of turn. If this is the \
+     third time this ability has resolved this turn, add {R}{R}{R}{R}.";
+
+/// Applies the layer system, which `GameScenario::build` does not run.
+fn flush(runner: &mut GameRunner) {
+    runner.state_mut().layers_dirty.mark_full();
+    flush_layers(runner.state_mut());
+}
+
+/// Reach-guard: Ashaya made `object` a Forest land (CR 305.6 grants it
+/// "{T}: Add {G}"), so it is legal fodder for "Sacrifice a land".
+fn assert_ashaya_made_it_a_forest_land(runner: &GameRunner, object: ObjectId) {
+    let card_types = &runner.state().objects[&object].card_types;
+    assert!(
+        card_types.core_types.contains(&CoreType::Land)
+            && card_types.core_types.contains(&CoreType::Creature),
+        "reach-guard: Ashaya must make the creature a land; got {:?}",
+        card_types.core_types
+    );
+    assert!(
+        card_types
+            .subtypes
+            .iter()
+            .any(|subtype| subtype == "Forest"),
+        "reach-guard: Ashaya must make the creature a Forest; got {:?}",
+        card_types.subtypes
+    );
+}
+
+fn ashaya_board_with(name: &str, oracle: &str) -> (GameRunner, ObjectId, ObjectId) {
+    let (mut scenario, squandered) = board();
+    scenario.add_creature_from_oracle(P0, "Ashaya, Soul of the Wild", 0, 0, ASHAYA);
+    let fodder = scenario
+        .add_creature_from_oracle(P0, name, 1, 1, oracle)
+        .id();
+    let mut runner = scenario.build();
+    flush(&mut runner);
+    assert_ashaya_made_it_a_forest_land(&runner, fodder);
+    (runner, squandered, fodder)
+}
+
+/// T13 (review 3, finding 1): a non-tap production counts. Wild Cantor's
+/// sacrifice ability could produce any color, and Ashaya's intrinsic Forest
+/// ability adds Green, so all five colors are offered and Red arrives.
+#[test]
+fn sacrificed_wild_cantor_offers_every_color_its_sacrifice_ability_could_produce() {
+    let (mut runner, squandered, cantor) = ashaya_board_with("Wild Cantor", WILD_CANTOR);
+
+    let activation = activate_and_sacrifice(&mut runner, squandered, cantor);
+
+    assert_in_graveyard(&runner, cantor);
+    assert_eq!(
+        activation.prompt_options,
+        Some(vec![
+            ManaType::White,
+            ManaType::Blue,
+            ManaType::Black,
+            ManaType::Red,
+            ManaType::Green,
+        ]),
+        "CR 106.7: the untapped sacrifice ability counts, not only the {{T}} ability"
+    );
+    choose(&mut runner, ManaType::Red);
+    assert_eq!(pool(&runner, P0), vec![ManaType::Red]);
+}
+
+/// T14 (review 3, finding 6): a non-mana ability's production counts.
+/// Millikin's "{T}, Mill a card: Add {C}" is not a mana ability (CR 605.1a — its
+/// cost moves a card from a library), yet it would produce {C} if it resolved
+/// (CR 106.7 ignores costs). Positive sibling: without Ashaya, Millikin is not a
+/// land and is not offered, while a Forest is.
+#[test]
+fn sacrificed_millikin_offers_the_colorless_its_non_mana_ability_could_produce() {
+    let (mut runner, squandered, millikin) = ashaya_board_with("Millikin", MILLIKIN);
+
+    let activation = activate_and_sacrifice(&mut runner, squandered, millikin);
+
+    assert_in_graveyard(&runner, millikin);
+    assert_eq!(
+        activation.prompt_options,
+        Some(vec![ManaType::Green, ManaType::Colorless])
+    );
+    choose(&mut runner, ManaType::Colorless);
+    assert_eq!(pool(&runner, P0), vec![ManaType::Colorless]);
+
+    let (mut scenario, squandered) = board();
+    let millikin = scenario
+        .add_creature_from_oracle(P0, "Millikin", 0, 1, MILLIKIN)
+        .id();
+    let forest = scenario.add_basic_land(P0, ManaColor::Green);
+    let mut runner = scenario.build();
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: squandered,
+            ability_index: 0,
+        })
+        .expect("Squandered Resources is activatable with a Forest to sacrifice");
+    let WaitingFor::PayCost { choices, .. } = &runner.state().waiting_for else {
+        panic!(
+            "expected the sacrifice choice, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    assert!(
+        choices.contains(&forest),
+        "reach-guard: the Forest is offered"
+    );
+    assert!(
+        !choices.contains(&millikin),
+        "without Ashaya, Millikin is not a land and is not offered"
+    );
+}
+
+/// T15 (review 3, findings 3 + 6, CR 106.12): only the {T} mana ability is
+/// "tapped for mana". Under Contamination, the intrinsic Forest ability's Green
+/// becomes Black, but Millikin's {C} — from a non-mana ability — does not.
+#[test]
+fn contamination_rewrites_only_the_tapped_for_mana_production() {
+    let (mut scenario, squandered) = board();
+    scenario.add_creature_from_oracle(P0, "Ashaya, Soul of the Wild", 0, 0, ASHAYA);
+    scenario.add_enchantment_from_oracle(P0, "Contamination", CONTAMINATION);
+    let millikin = scenario
+        .add_creature_from_oracle(P0, "Millikin", 0, 1, MILLIKIN)
+        .id();
+    let control_forest = scenario.add_basic_land(P0, ManaColor::Green);
+    let mut runner = scenario.build();
+    flush(&mut runner);
+    assert_ashaya_made_it_a_forest_land(&runner, millikin);
+
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: control_forest,
+            ability_index: 0,
+        })
+        .expect("control: tapping the Forest for mana");
+    assert_eq!(
+        pool(&runner, P0),
+        vec![ManaType::Black],
+        "control: Contamination rewrites a Forest tapped for mana"
+    );
+    runner.state_mut().players[P0.0 as usize]
+        .mana_pool
+        .mana
+        .clear();
+
+    let activation = activate_and_sacrifice(&mut runner, squandered, millikin);
+
+    assert_in_graveyard(&runner, millikin);
+    assert_eq!(
+        activation.prompt_options,
+        Some(vec![ManaType::Black, ManaType::Colorless])
+    );
+    choose(&mut runner, ManaType::Colorless);
+    assert_eq!(pool(&runner, P0), vec![ManaType::Colorless]);
+}
+
+/// T16 (review 3, finding 3): the captured could-produce set reads through
+/// the applicable replacement, so a Forest under Contamination yields {B}.
+#[test]
+fn sacrificed_forest_under_contamination_adds_black() {
+    let (mut scenario, squandered) = board();
+    scenario.add_enchantment_from_oracle(P0, "Contamination", CONTAMINATION);
+    let control_forest = scenario.add_basic_land(P0, ManaColor::Green);
+    let forest = scenario.add_basic_land(P0, ManaColor::Green);
+    let mut runner = scenario.build();
+
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: control_forest,
+            ability_index: 0,
+        })
+        .expect("control: tapping a Forest for mana");
+    assert_eq!(pool(&runner, P0), vec![ManaType::Black]);
+    runner.state_mut().players[P0.0 as usize]
+        .mana_pool
+        .mana
+        .clear();
+
+    let activation = activate_and_sacrifice(&mut runner, squandered, forest);
+
+    assert_in_graveyard(&runner, forest);
+    assert_eq!(activation.prompt_options, None);
+    assert_eq!(pool(&runner, P0), vec![ManaType::Black]);
+}
+
+fn creature_in_hand(scenario: &mut GameScenario, name: &str, shard: ManaCostShard) -> ObjectId {
+    scenario
+        .add_creature_to_hand(P0, name, 2, 2)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![shard],
+            generic: 0,
+        })
+        .id()
+}
+
+/// T17 (review 3, finding 3, castability): the estimator reads the same
+/// replacement-aware set, so with only a tapped Forest under Contamination a
+/// {B} spell is offered and a {G} spell is not. T9 is the paired board without
+/// Contamination, where the {G} spell is castable.
+#[test]
+fn castability_under_contamination_credits_black_not_green() {
+    let (mut scenario, _squandered) = board();
+    scenario.add_enchantment_from_oracle(P0, "Contamination", CONTAMINATION);
+    let forest = scenario.add_basic_land(P0, ManaColor::Green);
+    let black_spell = creature_in_hand(&mut scenario, "Test Black Creature", ManaCostShard::Black);
+    let green_spell = creature_in_hand(&mut scenario, "Test Green Creature", ManaCostShard::Green);
+    let mut runner = scenario.build();
+    tap(&mut runner, forest);
+
+    assert!(can_cast_object_now(runner.state(), P0, black_spell));
+    assert!(cast_is_offered(runner.state(), black_spell));
+    assert!(!can_cast_object_now(runner.state(), P0, green_spell));
+    assert!(!cast_is_offered(runner.state(), green_spell));
+}
+
+fn cradle_board(creatures: usize) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
+    let (mut scenario, squandered) = board();
+    let cradle = scenario
+        .add_land_from_oracle(P0, "Gaea's Cradle", GAEAS_CRADLE)
+        .id();
+    for _ in 0..creatures {
+        scenario.add_vanilla(P0, 1, 1);
+    }
+    let spell = green_creature_in_hand(&mut scenario);
+    let mut runner = scenario.build();
+    tap(&mut runner, cradle);
+    (runner, squandered, cradle, spell)
+}
+
+/// T18 (review 3, finding 4): an instruction that would add no mana defines no
+/// type (CR 106.5). Gaea's Cradle with no creatures could produce nothing, so a
+/// {G} spell is not offered and sacrificing it adds nothing; with one creature
+/// it could produce {G}.
+#[test]
+fn gaeas_cradle_with_no_creatures_could_produce_nothing() {
+    let (mut runner, squandered, cradle, spell) = cradle_board(0);
+    assert!(!can_cast_object_now(runner.state(), P0, spell));
+    assert!(!cast_is_offered(runner.state(), spell));
+    let activation = activate_and_sacrifice(&mut runner, squandered, cradle);
+    assert_in_graveyard(&runner, cradle);
+    assert_eq!(activation.prompt_options, None);
+    assert!(pool(&runner, P0).is_empty());
+
+    let (mut runner, squandered, cradle, spell) = cradle_board(1);
+    assert!(
+        can_cast_object_now(runner.state(), P0, spell),
+        "positive pair: with one creature the Cradle could produce {{G}}"
+    );
+    assert!(cast_is_offered(runner.state(), spell));
+    let activation = activate_and_sacrifice(&mut runner, squandered, cradle);
+    assert_in_graveyard(&runner, cradle);
+    assert_eq!(activation.prompt_options, None);
+    assert_eq!(pool(&runner, P0), vec![ManaType::Green]);
+}
+
+/// T19: a count fixed by the ability's own activation (X, CR 107.3a) is
+/// admitted — CR 106.7 ignores whether the X could be paid — so Calciform
+/// Pools could produce {W}, {U} and {C}.
+#[test]
+fn sacrificed_calciform_pools_offers_its_x_production_types() {
+    let (mut scenario, squandered) = board();
+    let calciform = scenario
+        .add_land_from_oracle(P0, "Calciform Pools", CALCIFORM_POOLS)
+        .id();
+    let mut runner = scenario.build();
+
+    let activation = activate_and_sacrifice(&mut runner, squandered, calciform);
+
+    assert_in_graveyard(&runner, calciform);
+    assert_eq!(
+        activation.prompt_options,
+        Some(vec![ManaType::White, ManaType::Blue, ManaType::Colorless])
+    );
+    choose(&mut runner, ManaType::White);
+    assert_eq!(pool(&runner, P0), vec![ManaType::White]);
+}
+
+fn dryad_arbor_board(dress_down: bool) -> (GameRunner, ObjectId, ObjectId, ObjectId) {
+    let (mut scenario, squandered) = board();
+    let arbor = scenario
+        .add_land_from_oracle(P0, "Dryad Arbor", "")
+        .with_subtypes(vec!["Forest", "Dryad"])
+        .id();
+    if dress_down {
+        scenario.add_enchantment_from_oracle(P0, "Dress Down", DRESS_DOWN);
+    }
+    let spell = green_creature_in_hand(&mut scenario);
+    let mut runner = scenario.build();
+    {
+        let object = runner.state_mut().objects.get_mut(&arbor).unwrap();
+        object.card_types.core_types.push(CoreType::Creature);
+        object.base_card_types = object.card_types.clone();
+        object.tapped = true;
+    }
+    flush(&mut runner);
+    let card_types = &runner.state().objects[&arbor].card_types;
+    assert!(
+        card_types.core_types.contains(&CoreType::Land)
+            && card_types.core_types.contains(&CoreType::Creature)
+            && card_types
+                .subtypes
+                .iter()
+                .any(|subtype| subtype == "Forest"),
+        "reach-guard: Dryad Arbor keeps its types under Dress Down; got {card_types:?}"
+    );
+    (runner, squandered, arbor, spell)
+}
+
+/// T20 (review 3, finding 5): a layer-6 ability removal (CR 613.1f) takes away
+/// the intrinsic Forest ability layer 4 granted (CR 305.6 + CR 613.1d); the
+/// retained Forest subtype does not resurrect it.
+#[test]
+fn blanked_dryad_arbor_could_produce_nothing() {
+    let (mut runner, squandered, arbor, spell) = dryad_arbor_board(true);
+    assert!(
+        runner.state().objects[&arbor].abilities.is_empty(),
+        "reach-guard: Dress Down removed the intrinsic mana ability"
+    );
+    assert!(!cast_is_offered(runner.state(), spell));
+    let activation = activate_and_sacrifice(&mut runner, squandered, arbor);
+    assert_in_graveyard(&runner, arbor);
+    assert_eq!(activation.prompt_options, None);
+    assert!(pool(&runner, P0).is_empty());
+
+    let (mut runner, squandered, arbor, spell) = dryad_arbor_board(false);
+    assert!(
+        !runner.state().objects[&arbor].abilities.is_empty(),
+        "positive pair: without Dress Down the intrinsic ability is present"
+    );
+    assert!(can_cast_object_now(runner.state(), P0, spell));
+    let activation = activate_and_sacrifice(&mut runner, squandered, arbor);
+    assert_in_graveyard(&runner, arbor);
+    assert_eq!(activation.prompt_options, None);
+    assert_eq!(pool(&runner, P0), vec![ManaType::Green]);
+}
+
+/// T21 (review 3, finding 2): an anchored chain crosses controllers. Your
+/// Reflecting Pool reads your Exotic Orchard, which reads the opponent's
+/// Forest, so the Pool could produce {G}.
+#[test]
+fn sacrificed_reflecting_pool_follows_an_anchored_chain() {
+    let (mut scenario, squandered) = board();
+    let pool_land = scenario
+        .add_land_from_oracle(P0, "Reflecting Pool", REFLECTING_POOL)
+        .id();
+    let orchard = scenario
+        .add_land_from_oracle(P0, "Exotic Orchard", EXOTIC_ORCHARD)
+        .id();
+    scenario.add_basic_land(P1, ManaColor::Green);
+    let mut runner = scenario.build();
+
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: orchard,
+            ability_index: 0,
+        })
+        .expect("control: tapping the Orchard");
+    assert_eq!(
+        pool(&runner, P0),
+        vec![ManaType::Green],
+        "control: the Orchard reads the opponent's Forest"
+    );
+    runner.state_mut().players[P0.0 as usize]
+        .mana_pool
+        .mana
+        .clear();
+    runner.state_mut().objects.get_mut(&orchard).unwrap().tapped = false;
+
+    let activation = activate_and_sacrifice(&mut runner, squandered, pool_land);
+
+    assert_in_graveyard(&runner, pool_land);
+    assert_eq!(activation.prompt_options, None);
+    assert_eq!(pool(&runner, P0), vec![ManaType::Green]);
+}
+
+/// T21b (castability, labelled NON-discriminating): on the same board with the
+/// Pool and the Orchard tapped, a {G} spell is offered. Not revert-sensitive by
+/// construction — the Orchard is itself a legal sacrifice that reaches the
+/// Forest — so T21 and the class row C1 are the discriminating proofs.
+#[test]
+fn anchored_chain_board_offers_a_green_spell() {
+    let (mut scenario, _squandered) = board();
+    let pool_land = scenario
+        .add_land_from_oracle(P0, "Reflecting Pool", REFLECTING_POOL)
+        .id();
+    let orchard = scenario
+        .add_land_from_oracle(P0, "Exotic Orchard", EXOTIC_ORCHARD)
+        .id();
+    scenario.add_basic_land(P1, ManaColor::Green);
+    let spell = green_creature_in_hand(&mut scenario);
+    let mut runner = scenario.build();
+    tap(&mut runner, pool_land);
+    tap(&mut runner, orchard);
+
+    assert!(can_cast_object_now(runner.state(), P0, spell));
+    assert!(cast_is_offered(runner.state(), spell));
+}
+
+/// T22 (review 3, finding 2): an unanchored cycle stays empty — "won't help
+/// each other unless some other land allows one of them to actually produce
+/// some type of mana" (Exotic Orchard ruling). T21 is the positive pair.
+#[test]
+fn sacrificed_reflecting_pool_in_an_unanchored_cycle_adds_nothing() {
+    let (mut scenario, squandered) = board();
+    let pool_land = scenario
+        .add_land_from_oracle(P0, "Reflecting Pool", REFLECTING_POOL)
+        .id();
+    let orchard = scenario
+        .add_land_from_oracle(P0, "Exotic Orchard", EXOTIC_ORCHARD)
+        .id();
+    scenario.add_land_from_oracle(P1, "Exotic Orchard", EXOTIC_ORCHARD);
+    let spell = green_creature_in_hand(&mut scenario);
+    let mut runner = scenario.build();
+    tap(&mut runner, orchard);
+    tap(&mut runner, pool_land);
+    assert!(!cast_is_offered(runner.state(), spell));
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&pool_land)
+        .unwrap()
+        .tapped = false;
+
+    let activation = activate_and_sacrifice(&mut runner, squandered, pool_land);
+
+    assert_in_graveyard(&runner, pool_land);
+    assert_eq!(activation.prompt_options, None);
+    assert!(pool(&runner, P0).is_empty());
+}
+
+/// T23: an Orchard clause asks for *colors* (CR 105.1): "can't be tapped for
+/// colorless mana, even if a land an opponent controls could produce colorless
+/// mana" (Exotic Orchard ruling). Facing only Wastes it could produce nothing;
+/// facing Wastes and an Island it could produce only {U}.
+#[test]
+fn sacrificed_exotic_orchard_never_offers_colorless() {
+    let (mut scenario, squandered) = board();
+    let orchard = scenario
+        .add_land_from_oracle(P0, "Exotic Orchard", EXOTIC_ORCHARD)
+        .id();
+    scenario.add_land_from_oracle(P1, "Wastes", WASTES);
+    let mut runner = scenario.build();
+    let activation = activate_and_sacrifice(&mut runner, squandered, orchard);
+    assert_in_graveyard(&runner, orchard);
+    assert_eq!(activation.prompt_options, None);
+    assert!(pool(&runner, P0).is_empty());
+
+    let (mut scenario, squandered) = board();
+    let orchard = scenario
+        .add_land_from_oracle(P0, "Exotic Orchard", EXOTIC_ORCHARD)
+        .id();
+    scenario.add_land_from_oracle(P1, "Wastes", WASTES);
+    scenario.add_basic_land(P1, ManaColor::Blue);
+    let mut runner = scenario.build();
+    let activation = activate_and_sacrifice(&mut runner, squandered, orchard);
+    assert_in_graveyard(&runner, orchard);
+    assert_eq!(activation.prompt_options, None);
+    assert_eq!(pool(&runner, P0), vec![ManaType::Blue]);
+}
+
+/// T24 (CR 113.3 + CR 113.3c): "an ability" includes a triggered ability, so
+/// Crumbling Vestige's "When this land enters, add one mana of any color" counts
+/// beside its {T}: Add {C}.
+#[test]
+fn sacrificed_crumbling_vestige_offers_its_triggered_production() {
+    let (mut scenario, squandered) = board();
+    let vestige = scenario
+        .add_land_from_oracle(P0, "Crumbling Vestige", CRUMBLING_VESTIGE)
+        .id();
+    let mut runner = scenario.build();
+
+    let activation = activate_and_sacrifice(&mut runner, squandered, vestige);
+
+    assert_in_graveyard(&runner, vestige);
+    assert_eq!(
+        activation.prompt_options,
+        Some(vec![
+            ManaType::White,
+            ManaType::Blue,
+            ManaType::Black,
+            ManaType::Red,
+            ManaType::Green,
+            ManaType::Colorless,
+        ])
+    );
+    choose(&mut runner, ManaType::Red);
+    assert_eq!(pool(&runner, P0), vec![ManaType::Red]);
+}
+
+fn play_a_land(runner: &mut GameRunner, land: ObjectId) {
+    let card_id = runner.state().objects[&land].card_id;
+    runner
+        .act(GameAction::PlayLand {
+            object_id: land,
+            card_id,
+        })
+        .expect("playing the land from hand");
+    assert_eq!(
+        runner.state().players[P0.0 as usize].lands_played_this_turn,
+        1,
+        "reach-guard: a land was played this turn"
+    );
+}
+
+/// Taps `land` for its first ability and returns what arrived (no prompt).
+fn tap_for_mana(runner: &mut GameRunner, land: ObjectId) -> Vec<ManaType> {
+    runner.state_mut().players[P0.0 as usize]
+        .mana_pool
+        .mana
+        .clear();
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: land,
+            ability_index: 0,
+        })
+        .expect("tapping the land for mana");
+    let produced = pool(runner, P0);
+    runner.state_mut().players[P0.0 as usize]
+        .mana_pool
+        .mana
+        .clear();
+    produced
+}
+
+/// T25 (B1, CR 608.2c + CR 614.1a): "instead" replaces the earlier
+/// instruction. River of Tears could produce exactly {U} before a land is
+/// played and exactly {B} after — never both. A second River of Tears tapped
+/// in the same state is the differential control.
+#[test]
+fn sacrificed_river_of_tears_reads_its_instead_at_that_time() {
+    let (mut scenario, squandered) = board();
+    let river = scenario
+        .add_land_from_oracle(P0, "River of Tears", RIVER_OF_TEARS)
+        .id();
+    let control_river = scenario
+        .add_land_from_oracle(P0, "River of Tears", RIVER_OF_TEARS)
+        .id();
+    let mut runner = scenario.build();
+    assert_eq!(
+        runner.state().players[P0.0 as usize].lands_played_this_turn,
+        0
+    );
+    assert_eq!(
+        tap_for_mana(&mut runner, control_river),
+        vec![ManaType::Blue]
+    );
+    let activation = activate_and_sacrifice(&mut runner, squandered, river);
+    assert_in_graveyard(&runner, river);
+    assert_eq!(activation.prompt_options, None);
+    assert_eq!(pool(&runner, P0), vec![ManaType::Blue]);
+
+    let (mut scenario, squandered) = board();
+    let river = scenario
+        .add_land_from_oracle(P0, "River of Tears", RIVER_OF_TEARS)
+        .id();
+    let control_river = scenario
+        .add_land_from_oracle(P0, "River of Tears", RIVER_OF_TEARS)
+        .id();
+    let land_in_hand = scenario.add_land_to_hand(P0, "Wastes").id();
+    let mut runner = scenario.build();
+    play_a_land(&mut runner, land_in_hand);
+    assert_eq!(
+        tap_for_mana(&mut runner, control_river),
+        vec![ManaType::Black]
+    );
+    let activation = activate_and_sacrifice(&mut runner, squandered, river);
+    assert_in_graveyard(&runner, river);
+    assert_eq!(activation.prompt_options, None);
+    assert_eq!(pool(&runner, P0), vec![ManaType::Black]);
+}
+
+/// T26 (B1): an "instead" that changes the type. Gemstone Caverns without a
+/// luck counter could produce exactly {C}; with one, exactly any color.
+#[test]
+fn sacrificed_gemstone_caverns_reads_its_luck_counter() {
+    let (mut scenario, squandered) = board();
+    let caverns = scenario
+        .add_land_from_oracle(P0, "Gemstone Caverns", GEMSTONE_CAVERNS)
+        .id();
+    let mut runner = scenario.build();
+    let activation = activate_and_sacrifice(&mut runner, squandered, caverns);
+    assert_in_graveyard(&runner, caverns);
+    assert_eq!(activation.prompt_options, None);
+    assert_eq!(pool(&runner, P0), vec![ManaType::Colorless]);
+
+    let (mut scenario, squandered) = board();
+    let caverns = scenario
+        .add_land_from_oracle(P0, "Gemstone Caverns", GEMSTONE_CAVERNS)
+        .id();
+    let luck = parse_counter_type("luck");
+    scenario.with_counter(caverns, luck.clone(), 1);
+    let mut runner = scenario.build();
+    assert_eq!(
+        runner.state().objects[&caverns]
+            .counters
+            .get(&luck)
+            .copied(),
+        Some(1),
+        "reach-guard: the luck counter is on Gemstone Caverns"
+    );
+    let activation = activate_and_sacrifice(&mut runner, squandered, caverns);
+    assert_in_graveyard(&runner, caverns);
+    assert_eq!(
+        activation.prompt_options,
+        Some(vec![
+            ManaType::White,
+            ManaType::Blue,
+            ManaType::Black,
+            ManaType::Red,
+            ManaType::Green,
+        ])
+    );
+    choose(&mut runner, ManaType::Green);
+    assert_eq!(pool(&runner, P0), vec![ManaType::Green]);
+}
+
+/// T28 (CR 608.2k): a count fixed by the ability's own cost referent is
+/// admitted — Soldevi Adnate's "{B} equal to the sacrificed creature's mana
+/// value" could produce {B} whatever it would sacrifice (CR 106.7 ignores
+/// costs).
+#[test]
+fn sacrificed_soldevi_adnate_offers_its_cost_referent_black() {
+    let (mut runner, squandered, adnate) = ashaya_board_with("Soldevi Adnate", SOLDEVI_ADNATE);
+
+    let activation = activate_and_sacrifice(&mut runner, squandered, adnate);
+
+    assert_in_graveyard(&runner, adnate);
+    assert_eq!(
+        activation.prompt_options,
+        Some(vec![ManaType::Black, ManaType::Green])
+    );
+    choose(&mut runner, ManaType::Black);
+    assert_eq!(pool(&runner, P0), vec![ManaType::Black]);
+}
+
+/// T29: a storage land's count is the counters its own cost removes
+/// (`PreviousEffectAmount`), fixed by the activation — so a Bottomless Vault
+/// with no storage counters still could produce {B}. Paired with T18: Gaea's
+/// Cradle's count is state at that time, and zero there means nothing.
+#[test]
+fn sacrificed_bottomless_vault_with_no_counters_adds_black() {
+    let (mut scenario, squandered) = board();
+    let vault = scenario
+        .add_land_from_oracle(P0, "Bottomless Vault", BOTTOMLESS_VAULT)
+        .id();
+    let mut runner = scenario.build();
+    assert!(
+        runner.state().objects[&vault].counters.is_empty(),
+        "reach-guard: the Vault has no storage counters"
+    );
+
+    let activation = activate_and_sacrifice(&mut runner, squandered, vault);
+
+    assert_in_graveyard(&runner, vault);
+    assert_eq!(activation.prompt_options, None);
+    assert_eq!(pool(&runner, P0), vec![ManaType::Black]);
+}
+
+/// T30 (CR 608.2c): a gate on the ability's own resolution count is read both
+/// ways — the resolution that asks it bumps the ledger first, so the reading
+/// cannot settle it beforehand. Soulbright Seeker could produce {R}.
+#[test]
+fn sacrificed_soulbright_seeker_offers_its_ordinal_red() {
+    let (mut runner, squandered, seeker) =
+        ashaya_board_with("Soulbright Seeker", SOULBRIGHT_SEEKER);
+    assert!(
+        !runner
+            .state()
+            .ability_resolutions_this_turn
+            .keys()
+            .any(|(source, _)| *source == seeker),
+        "reach-guard: the Seeker's ability has not resolved this turn"
+    );
+
+    let activation = activate_and_sacrifice(&mut runner, squandered, seeker);
+
+    assert_in_graveyard(&runner, seeker);
+    assert_eq!(
+        activation.prompt_options,
+        Some(vec![ManaType::Red, ManaType::Green])
+    );
+    choose(&mut runner, ManaType::Red);
+    assert_eq!(pool(&runner, P0), vec![ManaType::Red]);
+}
+
+/// T30's behavioral control: the Seeker's ordinal gate really adds
+/// {R}{R}{R}{R} on the third resolution and nothing on the first two, so T30
+/// reads a real ordinal producer, not an AST shape.
+#[test]
+fn soulbright_seeker_adds_red_only_on_its_third_resolution() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let seeker = scenario
+        .add_creature_from_oracle(P0, "Soulbright Seeker", 2, 1, SOULBRIGHT_SEEKER)
+        .id();
+    let mountains: Vec<ObjectId> = (0..3)
+        .map(|_| scenario.add_basic_land(P0, ManaColor::Red))
+        .collect();
+    let mut runner = scenario.build();
+
+    let red_in_pool = |runner: &GameRunner| {
+        pool(runner, P0)
+            .iter()
+            .filter(|mana_type| **mana_type == ManaType::Red)
+            .count()
+    };
+    for (resolution, mountain) in mountains.iter().enumerate() {
+        runner
+            .activate(seeker, 0)
+            .pay_with(&[*mountain])
+            .target_object(seeker)
+            .resolve();
+        let expected = if resolution == 2 { 4 } else { 0 };
+        assert_eq!(
+            red_in_pool(&runner),
+            expected,
+            "resolution {} of the Seeker's ability",
+            resolution + 1
+        );
+    }
+}
+
+/// Whether `object`'s layered abilities include a mana ability.
+fn has_mana_ability(runner: &GameRunner, object: ObjectId) -> bool {
+    runner.state().objects[&object]
+        .abilities
+        .iter()
+        .any(|ability| matches!(&*ability.effect, Effect::Mana { .. }))
+}
+
+fn urzas_saga_board() -> (GameRunner, ObjectId, ObjectId) {
+    let (mut scenario, squandered) = board();
+    // The Saga subtype must be in place before the Oracle text is parsed, so
+    // the chapter lines lower to chapter triggers.
+    let saga = scenario
+        .add_enchantment_from_oracle(P0, "Urza's Saga", "")
+        .as_land()
+        .with_subtypes(vec!["Urza's", "Saga"])
+        .from_oracle_text(URZAS_SAGA)
+        .id();
+    let mut runner = scenario.build();
+    flush(&mut runner);
+    (runner, squandered, saga)
+}
+
+/// T27 (CR 106.7 + CR 603.3): only an ability's OWN resolution counts. Urza's
+/// Saga's chapter I *grants* "{T}: Add {C}" — a payload registered for later —
+/// so before chapter I the Saga could produce nothing; once the chapter's effect
+/// has resolved, the granted ability is in its layered abilities and it could
+/// produce {C}.
+#[test]
+fn urzas_saga_could_produce_colorless_only_once_chapter_one_granted_it() {
+    let (mut runner, squandered, saga) = urzas_saga_board();
+    assert!(
+        !has_mana_ability(&runner, saga),
+        "reach-guard: before chapter I the Saga has no mana ability"
+    );
+    let activation = activate_and_sacrifice(&mut runner, squandered, saga);
+    assert_in_graveyard(&runner, saga);
+    assert_eq!(activation.prompt_options, None);
+    assert!(pool(&runner, P0).is_empty());
+
+    let (mut runner, squandered, saga) = urzas_saga_board();
+    let chapter_one = runner.state().objects[&saga]
+        .trigger_definitions
+        .as_slice()
+        .iter()
+        .map(|entry| entry.definition())
+        .find_map(|trigger| {
+            trigger
+                .execute
+                .as_deref()
+                .filter(|execute| matches!(&*execute.effect, Effect::GenericEffect { .. }))
+                .cloned()
+        })
+        .expect("reach-guard: chapter I lowers to a granting effect");
+    let resolved = build_resolved_from_def(&chapter_one, saga, P0);
+    let mut events = Vec::new();
+    resolve_ability_chain(runner.state_mut(), &resolved, &mut events, 0)
+        .expect("chapter I's effect resolves");
+    flush(&mut runner);
+    assert!(
+        has_mana_ability(&runner, saga),
+        "reach-guard: chapter I granted the Saga its mana ability"
+    );
+    let activation = activate_and_sacrifice(&mut runner, squandered, saga);
+    assert_in_graveyard(&runner, saga);
+    assert_eq!(activation.prompt_options, None);
+    assert_eq!(pool(&runner, P0), vec![ManaType::Colorless]);
 }

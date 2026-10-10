@@ -30,7 +30,7 @@ use crate::types::game_state::{
     WaitingFor,
 };
 use crate::types::identifiers::{ObjectId, ObjectIncarnationRef};
-use crate::types::mana::{StepEndManaAction, UnitDisposition};
+use crate::types::mana::{ManaType, ManaTypeSet, StepEndManaAction, UnitDisposition};
 use crate::types::player::PlayerId;
 use crate::types::proposed_event::{
     AppliedReplacementKey, BoundSearchFoundCandidate, BoundSearchFoundDisposition,
@@ -5090,6 +5090,114 @@ fn produce_mana_matcher(event: &ProposedEvent, _source: ObjectId, _state: &GameS
     matches!(event, ProposedEvent::ProduceMana { .. })
 }
 
+/// CR 614.1a: the `ManaModification` the replacement `rid` makes, if any. A
+/// parse-only definition (`mana_modification: None`) passes production through.
+fn produce_mana_modification(
+    state: &GameState,
+    rid: ReplacementId,
+) -> Option<crate::types::ability::ManaModification> {
+    state
+        .objects
+        .get(&rid.source)
+        .and_then(|obj| obj.replacement_definitions.get(rid.index))
+        .and_then(|def| def.mana_modification.clone())
+}
+
+/// CR 106.3 + CR 614.1a: the type and amount a production of `count` mana of
+/// `mana_type` becomes under `modification`. Shared by the runtime applier and
+/// the CR 106.7 hypothetical, so the two cannot drift.
+fn apply_mana_modification(
+    modification: Option<&crate::types::ability::ManaModification>,
+    mana_type: ManaType,
+    count: u32,
+) -> (ManaType, u32) {
+    use crate::types::ability::ManaModification;
+    match modification {
+        Some(ManaModification::ReplaceWith {
+            mana_type: replacement,
+        }) => (*replacement, count),
+        Some(ManaModification::Multiply { factor }) => (mana_type, count.saturating_mul(*factor)),
+        None => (mana_type, count),
+    }
+}
+
+/// CR 106.7 + CR 614.1a + CR 616.1 + CR 616.1e + CR 616.1f: the mana types a
+/// production of `count` mana of `mana_type` by `source` for `player` would
+/// yield after the applicable `ProduceMana` replacements, applied in every
+/// possible order.
+///
+/// CR 106.7 asks for the types an ability would produce "taking into account
+/// any applicable replacement effects in any possible order". Each order is
+/// explored depth-first: the candidates `find_applicable_replacements` returns
+/// (it already excludes ones applied to this event, applies each definition's
+/// `valid_card` filter and the CR 106.12b `TappedForMana` scope), each applied
+/// in turn (CR 616.1e: any applicable one may be chosen), marked applied, and the
+/// process repeated (CR 616.1f) until none applies. Read-only: no event is
+/// replaced, no state is mutated and no choice is offered.
+///
+/// `produce_mana_applier` is the registry's only `ProduceMana` handler and it
+/// never prevents production, so a positive count never becomes zero.
+/// Termination: each recursion applies one more distinct `ReplacementId`.
+pub(crate) fn hypothetical_produced_mana_types(
+    state: &GameState,
+    source: ObjectId,
+    player: PlayerId,
+    mana_type: ManaType,
+    count: u32,
+    tap_state: crate::types::events::ManaTapState,
+) -> ManaTypeSet {
+    let mut event = ProposedEvent::produce_mana_with_context(
+        source,
+        player,
+        mana_type,
+        tap_state.tapped_for_mana(),
+    );
+    if let ProposedEvent::ProduceMana {
+        count: event_count, ..
+    } = &mut event
+    {
+        *event_count = count;
+    }
+    produced_mana_types_in_every_order(state, &event)
+}
+
+/// The depth-first order exploration of [`hypothetical_produced_mana_types`].
+fn produced_mana_types_in_every_order(state: &GameState, event: &ProposedEvent) -> ManaTypeSet {
+    let ProposedEvent::ProduceMana {
+        mana_type, count, ..
+    } = event
+    else {
+        return ManaTypeSet::EMPTY;
+    };
+    let candidates = find_applicable_replacements(state, event, replacement_registry());
+    if candidates.is_empty() {
+        // CR 106.5: an amount of zero is no mana of any type.
+        if *count == 0 {
+            return ManaTypeSet::EMPTY;
+        }
+        return ManaTypeSet::of(*mana_type);
+    }
+    let mut types = ManaTypeSet::EMPTY;
+    for rid in candidates {
+        let modification = produce_mana_modification(state, rid);
+        let (new_mana_type, new_count) =
+            apply_mana_modification(modification.as_ref(), *mana_type, *count);
+        let mut next = event.clone();
+        if let ProposedEvent::ProduceMana {
+            mana_type: next_mana_type,
+            count: next_count,
+            ..
+        } = &mut next
+        {
+            *next_mana_type = new_mana_type;
+            *next_count = new_count;
+        }
+        next.mark_applied(rid);
+        types = types.union(produced_mana_types_in_every_order(state, &next));
+    }
+    types
+}
+
 /// CR 106.3 + CR 614.1a: Applies a `ManaModification` to a produced mana unit,
 /// replacing its type before it enters the player's mana pool.
 fn produce_mana_applier(
@@ -5098,12 +5206,7 @@ fn produce_mana_applier(
     state: &mut GameState,
     _events: &mut Vec<GameEvent>,
 ) -> ApplyResult {
-    use crate::types::ability::ManaModification;
-    let modification = state
-        .objects
-        .get(&rid.source)
-        .and_then(|obj| obj.replacement_definitions.get(rid.index))
-        .and_then(|def| def.mana_modification.clone());
+    let modification = produce_mana_modification(state, rid);
 
     if let ProposedEvent::ProduceMana {
         source_id,
@@ -5114,15 +5217,8 @@ fn produce_mana_applier(
         applied,
     } = event
     {
-        let (new_mana_type, new_count) = match modification {
-            Some(ManaModification::ReplaceWith {
-                mana_type: replacement,
-            }) => (replacement, count),
-            Some(ManaModification::Multiply { factor }) => {
-                (mana_type, count.saturating_mul(factor))
-            }
-            None => (mana_type, count),
-        };
+        let (new_mana_type, new_count) =
+            apply_mana_modification(modification.as_ref(), mana_type, count);
         ApplyResult::Modified(ProposedEvent::ProduceMana {
             source_id,
             player_id,
