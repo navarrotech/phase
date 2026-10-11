@@ -67,6 +67,46 @@ pub(crate) fn finalized_spell_cast_ledger_error(
     EngineError::InvalidAction(format!("failed to record finalized spell cast: {error}"))
 }
 
+/// CR 601.2i + CR 707.12: a copy of an object cast during a resolution
+/// becomes cast once its casting steps (CR 601.2a?h, including the target
+/// announcement) are complete: publish `SpellCast`, record the cast in the
+/// ledger and stamp its occurrence. A copy whose announcement walk is
+/// abandoned (CR 601.2e) therefore never becomes cast and leaves no cast
+/// record, observer or latch. Idempotent: a copy already stamped (a save made
+/// before the commit moved to announcement completion) is not recorded twice.
+pub(crate) fn commit_copy_cast(
+    state: &mut GameState,
+    copy_id: ObjectId,
+    controller: crate::types::player::PlayerId,
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EngineError> {
+    let copy =
+        state.objects.get(&copy_id).cloned().ok_or_else(|| {
+            EngineError::InvalidAction(format!("cast copy {copy_id:?} not found"))
+        })?;
+    if copy.cast_occurrence.is_some() {
+        return Ok(());
+    }
+    let origin = copy
+        .cast_from_zone
+        .unwrap_or(crate::types::zones::Zone::Exile);
+    events.push(GameEvent::SpellCast {
+        card_id: copy.card_id,
+        controller,
+        object_id: copy_id,
+        cast_mana_value: Some(copy.spell_mana_value()),
+    });
+    let occurrence = crate::game::restrictions::record_spell_cast_from_zone(
+        state,
+        controller,
+        &copy,
+        origin,
+        crate::types::game_state::CastingVariant::Normal,
+    )
+    .map_err(finalized_spell_cast_ledger_error)?;
+    stamp_cast_occurrence_on_stack_spell(state, copy_id, occurrence)
+}
+
 /// CR 601.2i: Attach the ledger-minted identity to the finalized stack spell
 /// and every complete resolved-ability graph it carries.
 pub(crate) fn stamp_cast_occurrence_on_stack_spell(
@@ -3373,7 +3413,7 @@ fn validate_delve_selection_at_commit(
         state
             .objects
             .get(id)
-            .is_some_and(|obj| obj.is_delve_eligible(player))
+            .is_some_and(|obj| obj.is_delve_eligible(state, player))
     }) {
         Ok(())
     } else {
@@ -8424,7 +8464,7 @@ fn check_additional_cost_or_pay_with_kept_cost(
                         .map(|extra| extra.cost)
                     })
                 })
-        } else if super::casting::object_in_players_library(state, obj, player) {
+        } else if state.object_in_players_zone(obj, Zone::Library, player) {
             // CR 401.5 + CR 118.9 + CR 601.2a: Top-of-library cast with an
             // alt-cost rider (Bolas's Citadel: "pay life equal to its mana
             // value rather than paying its mana cost").
@@ -12367,7 +12407,7 @@ fn finalize_cast_with_phyrexian_choices_inner(
     // goes through the single entry while the consult is skipped (PLAN §3). The
     // spell moves itself, so the attribution source is the object.
     let stack_req =
-        crate::game::zone_pipeline::ZoneMoveRequest::casting_to_stack(object_id, object_id);
+        crate::game::zone_pipeline::ZoneMoveRequest::casting_to_stack(object_id, object_id, player);
     crate::game::zone_pipeline::move_object(state, stack_req, events);
 
     // CR 614.1a + CR 608.2n: install the graveyard-redirect rider captured above
@@ -28993,7 +29033,7 @@ its replicate cost was paid.)\nDraw a card.";
             0,
             "excluding one real card leaves insufficient Delve capacity for {{X}}{{X}}"
         );
-        assert!(state.objects[&real_b].is_delve_eligible(PlayerId(0)));
+        assert!(state.objects[&real_b].is_delve_eligible(&state, PlayerId(0)));
     }
 
     #[test]

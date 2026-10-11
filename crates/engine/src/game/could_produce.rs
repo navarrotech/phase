@@ -67,7 +67,7 @@ use super::effects::mana::{distinct_colors_among_permanents, object_colors_for_s
 use super::effects::{
     condition_depends_on_result_object, count_top_level_resolution,
     effect_writes_last_revealed_ids, evaluate_condition, false_gate_escape,
-    inherited_parent_targets, inject_last_revealed_targets, instead_declined_continuation,
+    inherited_parent_occurrences, inject_last_revealed_targets, instead_declined_continuation,
     instead_swap_applies, is_instead_override, published_revealed_ids, receives_last_revealed,
     should_propagate_parent_targets, InsteadDeclined,
 };
@@ -747,7 +747,7 @@ fn bind_child<'s, 'n>(
     let mut node = Cow::Borrowed(child);
     let targets = match handed {
         Some(handed) => {
-            node.to_mut().targets = handed;
+            node.to_mut().set_unpinned_targets(handed);
             HypotheticalTargets::EstablishedByEarlierInstruction
         }
         None => HypotheticalTargets::Unchosen,
@@ -774,7 +774,7 @@ fn bind_child<'s, 'n>(
 /// 1. The look/reveal hand-off (`effects::receives_last_revealed`), taken
 ///    first, as the runtime takes it first: the child receives the objects the
 ///    parent published (`effects::published_revealed_ids`).
-/// 2. Otherwise, target inheritance (`effects::inherited_parent_targets`) from
+/// 2. Otherwise, target inheritance (`effects::inherited_parent_occurrences`) from
 ///    a parent whose own objects an earlier instruction established.
 ///
 /// A gated child is bound only when its gate reads the same objects twice at
@@ -834,7 +834,7 @@ fn performed_hand_off<'s>(
 
 /// CR 608.2c: the targets `child` inherits from `parent` after the parent's
 /// effect ran, when the parent's own objects were established by an earlier
-/// instruction (`effects::inherited_parent_targets`, the runtime's rule).
+/// instruction (`effects::inherited_parent_occurrences`, the runtime's rule).
 /// `after_parent` is the state the parent's handler leaves when it published
 /// to `last_revealed_ids`.
 fn inherited_targets(
@@ -848,7 +848,13 @@ fn inherited_targets(
     {
         return None;
     }
-    let inherited = inherited_parent_targets(parent, child);
+    // The walker's nodes carry no incarnation pins (the root is built from the
+    // printed definition and every hand-off binds unpinned), so projecting the
+    // runtime's inherited occurrences to their targets loses nothing.
+    let inherited: Vec<TargetRef> = inherited_parent_occurrences(parent, child)
+        .into_iter()
+        .map(|(target, _)| target)
+        .collect();
     if inherited.is_empty() {
         return None;
     }
@@ -2848,7 +2854,7 @@ mod tests {
             .sub_ability
             .map(|middle| *middle)
             .unwrap();
-        middle.targets = vec![TargetRef::Object(library[0])];
+        middle.set_unpinned_targets(vec![TargetRef::Object(library[0])]);
         let gated = middle.sub_ability.as_deref().unwrap();
         let scratch = after_publishing(runner.state(), &library[..1]);
         assert_eq!(
@@ -2899,7 +2905,7 @@ mod tests {
             .and_then(|reveal| reveal.sub_ability)
             .map(|look| *look)
             .unwrap();
-        second_look.targets = vec![TargetRef::Object(library[0])];
+        second_look.set_unpinned_targets(vec![TargetRef::Object(library[0])]);
         let gated = second_look.sub_ability.as_deref().unwrap();
         let scratch = after_publishing(runner.state(), &library);
         assert_eq!(
@@ -2957,7 +2963,7 @@ mod tests {
             .and_then(|reveal| reveal.sub_ability)
             .map(|look| *look)
             .unwrap();
-        second_look.targets = vec![TargetRef::Object(library[0])];
+        second_look.set_unpinned_targets(vec![TargetRef::Object(library[0])]);
         let mana_child = second_look.sub_ability.as_deref().unwrap();
         let scratch = after_publishing(runner.state(), &library);
         assert!(
@@ -2965,8 +2971,8 @@ mod tests {
             "reach-guard: the mana child takes the inheritance hop"
         );
         assert_eq!(
-            inherited_parent_targets(&second_look, mana_child),
-            vec![TargetRef::Object(library[0])],
+            inherited_parent_occurrences(&second_look, mana_child),
+            vec![(TargetRef::Object(library[0]), None)],
             "reach-guard: it inherits the top card"
         );
         assert_eq!(

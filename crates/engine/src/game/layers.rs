@@ -31,11 +31,11 @@ use crate::game::quantity::{
 };
 use crate::game::speed::{effective_speed, has_max_speed};
 use crate::types::ability::{
-    AbilityCost, AbilityDefinition, AbilityKind, ActivationRestriction, AttackedYouScope,
-    BasicLandType, CardTypeSetSource, CastingPermission, ChosenSubtypeKind, CommanderOwnership,
-    ContinuousModification, CopiableValues, Designation, Duration, Effect, FilterProp,
-    ManaContribution, ManaProduction, PlayerFilter, PlayerScope, QuantityExpr, QuantityRef,
-    StaticCondition, StaticDefinition, TargetFilter, TriggerGrantProducerKey,
+    AbilityCost, AbilityDefinition, AbilityKind, ActivationRestriction, AttachmentReferent,
+    AttackedYouScope, BasicLandType, CardTypeSetSource, CastingPermission, ChosenSubtypeKind,
+    CommanderOwnership, ContinuousModification, CopiableValues, Designation, Duration, Effect,
+    FilterProp, ManaContribution, ManaProduction, PlayerFilter, PlayerScope, QuantityExpr,
+    QuantityRef, StaticCondition, StaticDefinition, TargetFilter, TriggerGrantProducerKey,
     TriggerProducerOrigin, TypedFilter,
 };
 use crate::types::ability_visit::{
@@ -1352,8 +1352,9 @@ pub(crate) struct ConditionContext {
     /// CR 113.1b + CR 109.5: the PLAYER who has the ability being evaluated,
     /// when that differs from the source object's controller — a permission a
     /// resolved effect granted to a player ("target player gains \"During your
-    /// turn, …\""). "You"/"your" in that ability mean this player, so the
-    /// whose-turn leaves (`DuringYourTurn`, `DuringOpponentsTurn`) read it in
+    /// turn, …\""), or the would-be caster of a graveyard-resident permission.
+    /// "You"/"your" in that ability mean this player, so the whose-turn leaves
+    /// (`DuringYourTurn`, `DuringOpponentsTurn`) and `IsPresent` read it in
     /// preference to the source object's controller. `None` everywhere else.
     pub ability_holder: Option<PlayerId>,
 }
@@ -2075,7 +2076,11 @@ fn evaluate_condition_inner(
         }
         StaticCondition::IsPresent { filter } => match filter {
             Some(f) => {
-                let ctx = FilterContext::from_source(state, source_id);
+                // CR 113.1b + CR 109.5: a bound holder is the "you" of "you control".
+                let ctx = match context.ability_holder {
+                    Some(holder) => FilterContext::from_source_with_controller(source_id, holder),
+                    None => FilterContext::from_source(state, source_id),
+                };
                 state
                     .objects
                     .keys()
@@ -4316,9 +4321,18 @@ fn filter_prop_reads_life(prop: &FilterProp) -> bool {
         | FilterProp::HasAdventure
         | FilterProp::EnchantedBy
         | FilterProp::EquippedBy
-        | FilterProp::AttachedToSource
-        | FilterProp::AttachedToRecipient
-        | FilterProp::AttachedToPlayer { .. }
+        | FilterProp::AttachedTo {
+            to: AttachmentReferent::Source,
+        }
+        | FilterProp::AttachedTo {
+            to: AttachmentReferent::Recipient,
+        }
+        | FilterProp::AttachedTo {
+            to: AttachmentReferent::Player { .. },
+        }
+        | FilterProp::AttachedTo {
+            to: AttachmentReferent::DeclaredTarget { .. },
+        }
         | FilterProp::HasAttachment { .. }
         | FilterProp::HasAnyAttachmentOf { .. }
         | FilterProp::Another
@@ -15496,7 +15510,9 @@ mod tests {
                     TypeFilter::Subtype("Equipment".into()),
                 ])],
                 controller: None,
-                properties: vec![FilterProp::AttachedToRecipient],
+                properties: vec![FilterProp::AttachedTo {
+                    to: AttachmentReferent::Recipient,
+                }],
             });
             let qty = QuantityExpr::Multiply {
                 factor: 2,
@@ -15851,7 +15867,9 @@ mod tests {
                                 TypeFilter::Subtype("Equipment".into()),
                             ])],
                             controller: None,
-                            properties: vec![FilterProp::AttachedToRecipient],
+                            properties: vec![FilterProp::AttachedTo {
+                                to: AttachmentReferent::Recipient,
+                            }],
                         }),
                     },
                 }),
