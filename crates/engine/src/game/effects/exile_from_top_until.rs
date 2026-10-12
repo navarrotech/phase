@@ -61,7 +61,10 @@ pub fn resolve(
     // (The Infamous Cruelclaw, issue #2881) and would exile from the wrong library.
     // Per-iteration "their library" uses `TargetFilter::ScopedPlayer` or a typed
     // `ControllerRef::ScopedPlayer` filter instead.
-    let acting_player = super::resolve_player_for_context_ref(state, ability, player_filter);
+    let Some(acting_player) = super::resolve_player_for_context_ref(state, ability, player_filter)
+    else {
+        return Ok(());
+    };
     let resume = state.pending_exile_from_top_until.take();
     let player = state
         .players
@@ -192,11 +195,13 @@ pub fn resolve(
         // move also created this resolver's source link.
         if resumed_card == Some(obj_id)
             && index == 0
-            && state.exile_links.iter().any(|link| {
-                link.exiled_id == obj_id
-                    && link.source_id == ability.source_id
-                    && link.kind == crate::types::game_state::ExileLinkKind::TrackedBySource
-            })
+            // CR 607.2a + CR 113.7a: this resolution's own tracked exile, as the
+            // acting incarnation made it.
+            && crate::game::exile_links::tracked_exile_of_acting_incarnation(
+                state,
+                ability.source_id,
+                obj_id,
+            )
         {
             let pin = crate::types::identifiers::ObjectIncarnationRef::from_object(object);
             if !linked_batch.contains(&pin) {

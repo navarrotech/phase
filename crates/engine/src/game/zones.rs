@@ -1,7 +1,8 @@
 use crate::types::card_type::CoreType;
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
-    GameState, ResolutionSourceRelatch, StackEntry, StackEntryKind, ZoneChangeCombatStatus,
+    GameState, LinkedExileLki, LinkedExileSnapshot, ResolutionSourceRelatch, StackEntry,
+    StackEntryKind, ZoneChangeCombatStatus,
 };
 use crate::types::identifiers::{CardId, ObjectId, ObjectIncarnationRef};
 use crate::types::player::PlayerId;
@@ -128,7 +129,8 @@ fn counters_persist_on_move(state: &GameState, object_id: ObjectId, to: Zone) ->
 /// moment of the zone change. The snapshot records each attachment's current
 /// controller and kind (Aura/Equipment) so that look-back triggers of the form
 /// "for each Aura you controlled that was attached to it" (Hateful Eidolon)
-/// can resolve their quantity after SBA has already unattached the Auras.
+/// can resolve their quantity after the departure has already unattached the
+/// Auras (CR 701.3d).
 pub(crate) fn capture_attachment_snapshot(
     state: &GameState,
     obj: &GameObject,
@@ -279,10 +281,11 @@ pub(crate) fn apply_zone_exit_cleanup(
                 // CR 701.60b: Capture suspected status at zone exit for
                 // "was suspected" look-back riders.
                 is_suspected: obj.is_suspected,
-                // CR 608.2h: The attachment set as it stood BEFORE SBA unattached it
-                // (CR 704.5m/n), so a source-referential intervening-if re-checked at
-                // resolution ("if this creature is enchanted" — Dreampod Druid) reads
-                // last known information once its source has left the battlefield.
+                // CR 608.2h: The attachment set as it stood BEFORE the departure
+                // sever (CR 701.3d) cleared it, so a source-referential intervening-if
+                // re-checked at resolution ("if this creature is enchanted" — Dreampod
+                // Druid) reads last known information once its source has left the
+                // battlefield.
                 // Supplied by the caller: the sever already ran by the time we get here.
                 attachments,
             };
@@ -1187,7 +1190,7 @@ pub fn apply_resolved_zone_change(
             command.cause,
         );
     }
-    // CR 704.5m + CR 704.5n + CR 702.26i: the command carries no attachment
+    // CR 701.3d: the command carries no attachment
     // payload, so replay re-runs the same severing authority the live
     // transition used. Idempotent, so the live path's earlier call is not
     // double-applied; the returned ids are dropped because replay reproduces
@@ -1491,7 +1494,8 @@ pub(crate) fn move_to_zone_with_entry_flags(
     let snapshot_object = liminal_entry_projection.as_ref().unwrap_or(obj);
     let mut zone_change_record =
         snapshot_object.snapshot_for_zone_change(object_id, Some(from), to);
-    // CR 603.10a + CR 603.6e: Capture attachment snapshot before SBA can detach.
+    // CR 603.10a + CR 603.6e: Capture attachment snapshot before the departure
+    // sever (CR 701.3d) clears it.
     zone_change_record.attachments = capture_attachment_snapshot(state, obj);
     // CR 603.10a + CR 607.2a: Leaves-the-battlefield triggers look back to the
     // object as it existed immediately before the move. Snapshot linked "exiled
@@ -1505,15 +1509,6 @@ pub(crate) fn move_to_zone_with_entry_flags(
             .cloned()
             .unwrap_or_default(),
     );
-    // CR 607.2b + CR 603.10e: Persist the linked-exile snapshot as last-known
-    // information so a self-sacrifice ability that refers to "cards exiled with
-    // this permanent" (Rod of Absorption) still resolves correctly after its own
-    // source is gone and the live `TrackedBySource` links have been pruned.
-    if !zone_change_record.linked_exile_snapshot.is_empty() {
-        state
-            .linked_exile_lki
-            .insert(object_id, zone_change_record.linked_exile_snapshot.clone());
-    }
     zone_change_record.combat_status = if let Some(target) = liminal_attack_target {
         ZoneChangeCombatStatus {
             attacking: true,
@@ -1608,13 +1603,20 @@ pub(crate) fn move_to_zone_with_entry_flags(
                 true,
             )
         };
+    record_linked_exile_departure(
+        state,
+        object_id,
+        pre_bump_incarnation,
+        new_incarnation,
+        &zone_change_record.linked_exile_snapshot,
+    );
 
     // CR 603.6c: Drop the leaving permanent from the TriggerIndex. The
     // leaves-battlefield last-known-information scan in
     // `collect_pending_triggers` reads `state.objects` directly (the object's
     // zone is no longer Battlefield), unaffected by this removal. The
-    // authoritative correctness path is the `evaluate_layers` rebuild
-    // (CR 611.2e); this hook is incremental optimization between layer flushes.
+    // authoritative correctness path is the `evaluate_layers` rebuild; this
+    // hook is incremental optimization between layer flushes.
     if from == Zone::Battlefield {
         state.trigger_index.remove(object_id);
     }
@@ -1774,7 +1776,7 @@ pub(crate) fn move_to_zone_with_entry_flags(
     // CR 603.6a: Register the post-reset trigger definitions in the index so
     // `state.clone()` consumers see a coherent battlefield → trigger candidate
     // map. AUTHORITATIVE PATH: the end-of-`evaluate_layers` rebuild
-    // (CR 611.2e, `layers.rs`) is the safety net; this hook is incremental
+    // (`layers.rs`) is the safety net; this hook is incremental
     // optimization between layer flushes. `state.layers_dirty = true` was set
     // above, guaranteeing a post-layer rebuild on the next
     // `collect_pending_triggers` consult.
@@ -1793,7 +1795,7 @@ pub(crate) fn move_to_zone_with_entry_flags(
         });
     }
 
-    // CR 701.3d + CR 704.5n: the other direction of the same relationship — each
+    // CR 701.3d: the other direction of the same relationship — each
     // attachment this departing permanent hosted has become unattached. Emitted
     // here, beside the attachment-side event, so both directions share one
     // ordering relative to the `ZoneChanged` that follows.
@@ -2140,13 +2142,41 @@ pub(crate) fn capture_linked_exile_snapshot(
         .collect()
 }
 
+/// CR 607.2a + CR 607.2b + CR 113.7a: Persist a battlefield departure's
+/// linked-exile snapshot as last-known information so an ability of the departed
+/// source (Rod of Absorption sacrificing itself) still finds the cards exiled
+/// with it. CR 400.7: bound it to this departure's incarnations so a later
+/// object under the same id cannot read it. Shared by every departure path
+/// (`move_to_zone_with_entry_flags`, `move_to_library_at_index`).
+fn record_linked_exile_departure(
+    state: &mut GameState,
+    object_id: ObjectId,
+    departed: u64,
+    successor: u64,
+    snapshot: &[LinkedExileSnapshot],
+) {
+    if snapshot.is_empty() {
+        return;
+    }
+    state
+        .linked_exile_lki
+        .entry(object_id)
+        .or_default()
+        .push(LinkedExileLki {
+            departed,
+            successor,
+            snapshot: snapshot.to_vec(),
+        });
+}
+
 /// After leave-time snapshots are captured on the zone-change record, sever
 /// live attachment graph edges for a permanent departing the battlefield.
 ///
-/// Attached Auras/Equipment that remain on the battlefield are cleaned up by
-/// SBAs (CR 704.5m/704.5n). Hosts must not carry a stale `attachments` list
-/// into other zones (commander zone return, blink, etc.), and attachments that
-/// leave the battlefield must not keep a dangling `attached_to` pointer.
+/// An Aura left unattached on the battlefield is then put into its owner's
+/// graveyard by the SBA sweep (CR 704.5m); an unattached Equipment stays where
+/// it is. Hosts must not carry a stale `attachments` list into other zones
+/// (commander zone return, blink, etc.), and attachments that leave the
+/// battlefield must not keep a dangling `attached_to` pointer.
 ///
 /// The severing is symmetric: the departing host's `attachments` list is
 /// cleared AND each of those attachments has its `attached_to` back-pointer
@@ -2376,9 +2406,14 @@ pub fn move_to_library_at_index(
             .map(super::effects::attach::target_ref_from_attach_target)
     });
     let mut zone_change_record = obj.snapshot_for_zone_change(object_id, Some(from), Zone::Library);
-    // CR 603.10a + CR 603.6e: Capture attachment snapshot before SBA can detach.
+    // CR 603.10a + CR 603.6e: Capture attachment snapshot before the departure
+    // sever (CR 701.3d) clears it.
     zone_change_record.attachments = capture_attachment_snapshot(state, obj);
     zone_change_record.combat_status = capture_combat_status(state, object_id);
+    // CR 603.10a + CR 607.2a: as in `move_to_zone_with_entry_flags`, snapshot
+    // the linked "exiled with" cards before CR 400.7 cleanup prunes them.
+    zone_change_record.linked_exile_snapshot =
+        capture_linked_exile_snapshot(state, object_id, from);
     zone_change_record.sync_trigger_source_exiled_cards(
         state
             .cards_exiled_with_source_this_turn
@@ -2433,6 +2468,13 @@ pub fn move_to_library_at_index(
     }
     if let Some((pre, new)) = bump {
         record_resolution_source_relatch(state, object_id, from, pre, new);
+        record_linked_exile_departure(
+            state,
+            object_id,
+            pre,
+            new,
+            &zone_change_record.linked_exile_snapshot,
+        );
     }
 
     super::restrictions::record_zone_change(state, &mut zone_change_record);
@@ -2444,7 +2486,7 @@ pub fn move_to_library_at_index(
         });
     }
 
-    // CR 701.3d + CR 704.5n: mirrors the `move_to_zone` emit — the attachments
+    // CR 701.3d: mirrors the `move_to_zone` emit — the attachments
     // this departing permanent hosted have become unattached.
     for attachment_id in severed_attachments {
         events.push(GameEvent::Unattached {
@@ -5031,6 +5073,55 @@ mod tests {
         );
     }
 
+    /// CR 400.7 + CR 607.2a + CR 113.7a: each battlefield departure of a source
+    /// records its own linked-exile entry, bounded to that departure's
+    /// incarnations; a second departure in the same step does not overwrite
+    /// the first.
+    #[test]
+    fn each_battlefield_departure_records_its_own_bounded_linked_exile_entry() {
+        let mut state = setup();
+        let source = create_object(
+            &mut state,
+            CardId(64),
+            PlayerId(0),
+            "Departing Source".to_string(),
+            Zone::Battlefield,
+        );
+        let mut events = Vec::new();
+        let mut departures = Vec::new();
+        for card_id in [65, 66] {
+            if state.objects[&source].zone != Zone::Battlefield {
+                move_to_zone(&mut state, source, Zone::Battlefield, &mut events);
+            }
+            let exiled = create_object(
+                &mut state,
+                CardId(card_id),
+                PlayerId(1),
+                "Exiled With Source".to_string(),
+                Zone::Exile,
+            );
+            state.exile_links.push(crate::types::game_state::ExileLink {
+                source_id: source,
+                exiled_id: exiled,
+                kind: crate::types::game_state::ExileLinkKind::TrackedBySource,
+            });
+            let departed = state.objects[&source].incarnation;
+            move_to_zone(&mut state, source, Zone::Graveyard, &mut events);
+            departures.push(LinkedExileLki {
+                departed,
+                successor: state.objects[&source].incarnation,
+                snapshot: vec![LinkedExileSnapshot {
+                    exiled_id: exiled,
+                    owner: PlayerId(1),
+                    mana_value: 0,
+                }],
+            });
+        }
+
+        assert_ne!(departures[0].successor, departures[1].departed);
+        assert_eq!(state.linked_exile_lki.get(&source), Some(&departures));
+    }
+
     /// CR 712.8a + CR 400.7: An MDFC permanent that entered the battlefield as
     /// its back face (modal_back_face = true) must revert to its front face when
     /// it leaves the battlefield (battlefield is the only non-stack zone where
@@ -5588,7 +5679,7 @@ mod tests {
         assert_eq!(
             state.objects[&equipment].zone,
             Zone::Battlefield,
-            "CR 704.5n: the equipment itself remains on the battlefield"
+            "CR 701.3d: the Equipment must remain on the battlefield, not vanish"
         );
         // CR 701.3d: becoming unattached is a real event. `match_unattach`'s
         // `ZoneChanged` fallback arm re-derives this by reading the
@@ -5836,6 +5927,250 @@ mod tests {
         assert!(
             !state.objects[&host].attachments.contains(&equipment),
             "the returned permanent must not list the attachment"
+        );
+    }
+
+    /// Build a merged permanent (CR 730.2) whose absorbed component carries a
+    /// live attachment edge in both directions. Returns
+    /// `(survivor, component, attachment)`. Production does not build this shape
+    /// today — every `absorb_component` caller absorbs a component that is not a
+    /// battlefield object while the survivor is, so a live edge names the
+    /// survivor — which is what these rows fence: a delivery route that ended
+    /// edges without regard for which object left.
+    fn merged_permanent_with_attached_component(
+        state: &mut GameState,
+    ) -> (ObjectId, ObjectId, ObjectId) {
+        use crate::game::effects::attach::attach_to;
+        use crate::types::card_type::CoreType;
+
+        let survivor = create_object(
+            state,
+            CardId(1),
+            PlayerId(0),
+            "Survivor".to_string(),
+            Zone::Battlefield,
+        );
+        let component = create_object(
+            state,
+            CardId(2),
+            PlayerId(0),
+            "Component".to_string(),
+            Zone::Battlefield,
+        );
+        for id in [survivor, component] {
+            state
+                .objects
+                .get_mut(&id)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(CoreType::Creature);
+        }
+        let attachment = create_object(
+            state,
+            CardId(3),
+            PlayerId(0),
+            "Equipment".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&attachment).unwrap();
+            obj.card_types.core_types.push(CoreType::Artifact);
+            obj.card_types.subtypes.push("Equipment".to_string());
+        }
+        attach_to(state, attachment, component);
+
+        // CR 730.2b: the component is absorbed into the survivor — it is no
+        // longer an independent member of the battlefield list, and the
+        // survivor's component list is what routes it on the way out.
+        absorb_component(state, component, Some(Zone::Battlefield));
+        state.objects.get_mut(&survivor).unwrap().merged_components = vec![survivor, component];
+        (survivor, component, attachment)
+    }
+
+    /// CR 730.3: an absorbed component is delivered to its owner's zone by
+    /// `route_component`, which runs no sever. The authority that ends an
+    /// attachment edge when an object leaves the zone it was in (CR 701.3d) is
+    /// `sever_battlefield_attachment_graph_on_exit`, reached from the departure
+    /// routes in this file and not from the delivery — so the delivered
+    /// component keeps its edge in both directions and announces nothing.
+    #[test]
+    fn merge_component_delivery_leaves_the_component_attachment_edge_intact() {
+        let mut state = setup();
+        let (survivor, component, attachment) =
+            merged_permanent_with_attached_component(&mut state);
+        assert_eq!(
+            state.objects[&attachment].attached_to,
+            Some(crate::game::game_object::AttachTarget::Object(component)),
+            "precondition: the component must hold the edge before the delivery"
+        );
+        assert!(
+            state.objects[&component].attachments.contains(&attachment),
+            "precondition: the edge must be live in both directions"
+        );
+        let incarnation_before = state.objects[&component].incarnation;
+
+        let mut events = Vec::new();
+        move_to_zone(&mut state, survivor, Zone::Graveyard, &mut events);
+
+        // CR 400.7: the component became a new object in its owner's zone.
+        // This is what fails when the route did not run: both
+        // `split_merged_permanent_on_leave` and `put_component_into_zone`
+        // return silently on an absent component, and the intact edge the
+        // assertions below read is also what an unrun route leaves behind.
+        assert!(
+            state.objects[&component].incarnation > incarnation_before,
+            "the delivery route must run to its end and bump the component's incarnation"
+        );
+        assert_eq!(
+            state.objects[&component].zone,
+            Zone::Graveyard,
+            "the component must reach its owner's destination zone"
+        );
+
+        assert_eq!(
+            state.objects[&attachment].attached_to,
+            Some(crate::game::game_object::AttachTarget::Object(component)),
+            "the delivery leaves the attachment's own reference intact"
+        );
+        assert!(
+            state.objects[&component].attachments.contains(&attachment),
+            "the delivery leaves the component's record of the attachment intact"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                GameEvent::Unattached { attachment_id, .. } if *attachment_id == attachment
+            )),
+            "a delivery that severs nothing announces no unattachment"
+        );
+
+        // Live control at the same reading point: the same constructed state
+        // whose component leaves by the departure primitive instead has both
+        // directions ended and the unattachment announced. Without it, an
+        // intact verdict above could be a reading taken before anything could
+        // have severed.
+        let mut control = setup();
+        let (_, control_component, control_attachment) =
+            merged_permanent_with_attached_component(&mut control);
+        let mut control_events = Vec::new();
+        move_to_zone(
+            &mut control,
+            control_component,
+            Zone::Graveyard,
+            &mut control_events,
+        );
+        assert_eq!(
+            control.objects[&control_attachment].attached_to, None,
+            "a departure ends the attachment's own reference (CR 701.3d)"
+        );
+        assert!(
+            control.objects[&control_component].attachments.is_empty(),
+            "a departure ends the host's record of the attachment (CR 701.3d)"
+        );
+        assert!(
+            control_events.iter().any(|event| matches!(
+                event,
+                GameEvent::Unattached { attachment_id, .. } if *attachment_id == control_attachment
+            )),
+            "a departure announces the unattachment it performed"
+        );
+    }
+
+    /// A delivery carrying no attachment edge announces nothing, so a route
+    /// that ended edges indiscriminately is refused by this row rather than by
+    /// the intact verdict above.
+    #[test]
+    fn merge_component_delivery_without_an_edge_announces_nothing() {
+        let mut state = setup();
+        let (survivor, component, attachment) =
+            merged_permanent_with_attached_component(&mut state);
+        // Take the edge away in both directions before the delivery.
+        state.objects.get_mut(&attachment).unwrap().attached_to = None;
+        state
+            .objects
+            .get_mut(&component)
+            .unwrap()
+            .attachments
+            .clear();
+        let incarnation_before = state.objects[&component].incarnation;
+
+        let mut events = Vec::new();
+        move_to_zone(&mut state, survivor, Zone::Graveyard, &mut events);
+
+        // CR 400.7: the route ran, so this row is not green for the trivial
+        // reason that nothing happened.
+        assert!(
+            state.objects[&component].incarnation > incarnation_before,
+            "the delivery route must still run to its end"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                GameEvent::Unattached { attachment_id, .. } if *attachment_id == attachment
+            )),
+            "a delivery with nothing attached announces no unattachment"
+        );
+    }
+
+    /// CR 701.3d binds the edge that is live at the moment of the departure: an
+    /// attachment re-pointed to a different host before the delivery keeps that
+    /// edge and announces nothing, so a sever driven by the departing object's
+    /// `attachments` list rather than by the live edge is refused here.
+    #[test]
+    fn merge_component_delivery_leaves_a_repointed_attachment_on_its_new_host() {
+        use crate::types::card_type::CoreType;
+
+        let mut state = setup();
+        let (survivor, component, attachment) =
+            merged_permanent_with_attached_component(&mut state);
+        let new_host = create_object(
+            &mut state,
+            CardId(4),
+            PlayerId(0),
+            "New host".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&new_host)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        // Re-point the attachment while the component still lists it.
+        state.objects.get_mut(&attachment).unwrap().attached_to =
+            Some(crate::game::game_object::AttachTarget::Object(new_host));
+        state
+            .objects
+            .get_mut(&new_host)
+            .unwrap()
+            .attachments
+            .push(attachment);
+
+        let incarnation_before = state.objects[&component].incarnation;
+        let mut events = Vec::new();
+        move_to_zone(&mut state, survivor, Zone::Graveyard, &mut events);
+
+        assert!(
+            state.objects[&component].incarnation > incarnation_before,
+            "the delivery route must still run to its end"
+        );
+        assert_eq!(
+            state.objects[&attachment].attached_to,
+            Some(crate::game::game_object::AttachTarget::Object(new_host)),
+            "the re-pointed attachment keeps the host it actually names"
+        );
+        assert!(
+            state.objects[&new_host].attachments.contains(&attachment),
+            "the new host keeps its record of the attachment"
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                GameEvent::Unattached { attachment_id, .. } if *attachment_id == attachment
+            )),
+            "no unattachment is announced for an edge that did not end"
         );
     }
 

@@ -257,6 +257,12 @@ const PROMPTS: &[(&str, Raised)] = &[
         "PayManaAbilityMana",
         Raised::DuringResolution("dual-origin; its only arm is a mana ability (class B)"),
     ),
+    (
+        "ManaAbilityManaPayment",
+        Raised::DuringResolution(
+            "nested mana-ability cost window; its answers are mana actions (class B)",
+        ),
+    ),
     ("ChooseXValue", Raised::DuringResolution(DUAL_ORIGIN_CAST)),
     ("ModeChoice", Raised::DuringResolution(DUAL_ORIGIN_CAST)),
     (
@@ -746,7 +752,12 @@ const MANA_ACTIONS: &[&str] = &[
 ];
 /// The prompts under which `ActivateAbility` is a mana ability activated mid-payment
 /// (CR 605.3a).
-const MANA_ACTIVATE_UNDER: &[&str] = &["UnlessPayment", "ManaPayment", "ManaSourceSelection"];
+const MANA_ACTIVATE_UNDER: &[&str] = &[
+    "UnlessPayment",
+    "ManaPayment",
+    "ManaAbilityManaPayment",
+    "ManaSourceSelection",
+];
 
 // ── Token reader ──────────────────────────────────────────────────────────────
 
@@ -984,9 +995,14 @@ fn classify(index: usize, arm: &Arm) -> ClassifiedArm {
     variants_after(&arm.head, "WaitingFor", &mut prompts);
     let mut actions = Vec::new();
     variants_after(&arm.head, "GameAction", &mut actions);
-    let is_mana_action = actions
-        .iter()
-        .any(|action| MANA_ACTIONS.contains(&action.as_str()))
+    // CR 605.3a + CR 605.3b: this private window withdraws the mana activation,
+    // including when it is nested beneath an outer resolving-effect payment.
+    // It does not cancel that outer clause's own cost or replace its prompt owner.
+    let is_mana_withdrawal = actions == ["CancelCast"] && prompts == ["ManaAbilityManaPayment"];
+    let is_mana_action = is_mana_withdrawal
+        || actions
+            .iter()
+            .any(|action| MANA_ACTIONS.contains(&action.as_str()))
         || (actions == ["ActivateAbility"]
             && !prompts.is_empty()
             && prompts
@@ -1444,5 +1460,30 @@ fn planted_arms_and_handlers_are_classified_by_tokens_not_text() {
             .iter()
             .any(|finding| finding.contains("class-D handler")),
         "a handler that calls the bracket is not a finding: {findings:?}"
+    );
+}
+
+#[test]
+fn nested_mana_payment_answers_keep_their_mana_action_class() {
+    let planted = r#"
+        fn apply_non_priority_pass_action(state: &mut GameState, action: GameAction) {
+            let waiting_for = match (&state.waiting_for.clone(), action) {
+                (WaitingFor::ManaAbilityManaPayment { .. }, GameAction::CancelCast) => withdraw(state),
+                (WaitingFor::ManaAbilityManaPayment { .. }, GameAction::ActivateAbility { source_id, ability_index }) => activate(state),
+                (WaitingFor::ManaPayment { .. }, GameAction::CancelCast) => cancel_outer(state),
+                (WaitingFor::ManaAbilityManaPayment { .. }, GameAction::Foo) => non_mana_answer(state),
+            };
+        }
+    "#;
+    let (arms, findings) = arm_findings(planted, "");
+    assert_eq!(
+        arms.iter().map(|arm| arm.class).collect::<Vec<_>>(),
+        vec![Some(Class::B), Some(Class::B), Some(Class::A), Some(Class::A)],
+        "the private withdrawal and activation are mana work; an outer cancellation and unrelated answer still require attribution"
+    );
+    assert_eq!(
+        findings.len(),
+        2,
+        "unbracketed non-mana answers remain findings"
     );
 }

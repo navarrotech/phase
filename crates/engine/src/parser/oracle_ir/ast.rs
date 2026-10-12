@@ -1265,7 +1265,7 @@ pub(crate) enum TargetedImperativeAst {
         /// the targeting pipeline.
         selection: BounceSelection,
     },
-    /// CR 400.7 + CR 611.2c: Mass return-to-hand. Mirrors `TapAll`/`UntapAll`
+    /// CR 400.7: Mass return-to-hand. Mirrors `TapAll`/`UntapAll`
     /// for "return all/each [filter] to their owners' hands" Oracle text.
     /// Lowers to `Effect::BounceAll`, not `Effect::Bounce`, so the runtime
     /// resolver iterates every matching permanent instead of prompting for one.
@@ -1609,9 +1609,14 @@ pub(crate) enum HandRevealImperativeAst {
         target: TargetFilter,
         card_filter: TargetFilter,
     },
-    /// "reveals a number of cards from their hand equal to X" (CR 701.20a).
+    /// CR 701.20a: a counted reveal from a hand — "reveals X cards from their
+    /// hand, where X is …", "reveals a card at random from their hand". `target`
+    /// is the hand's owner; `selection` is `Random` exactly when the text says
+    /// "at random".
     RevealPartial {
         count: crate::types::ability::QuantityExpr,
+        target: TargetFilter,
+        selection: crate::types::ability::CardSelectionMode,
     },
     /// CR 701.20a: Back-reference reveal — "reveal it" / "reveal that card" /
     /// "reveal those cards" — reveals a specific card identified by the parent

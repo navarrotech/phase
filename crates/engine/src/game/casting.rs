@@ -690,6 +690,7 @@ pub(crate) fn begin_variable_speed_payment(
     ability_index: usize,
     target_selection: ActivationTargetSelection,
     activation_cost_snapshot: Option<Box<ActivationCostSnapshot>>,
+    activation_trigger_collection: Option<Box<super::triggers::PendingActivationTriggerCollection>>,
 ) -> WaitingFor {
     let max_speed = effective_speed(state, player);
     let (min, max) = variable_speed_payment_range(&cost, max_speed).unwrap_or((0, max_speed));
@@ -702,6 +703,9 @@ pub(crate) fn begin_variable_speed_payment(
     );
     pending.activation_cost = Some(cost);
     pending.activation_target_selection = target_selection;
+    // CR 602.2b + CR 603.2: the speed choice is one more announcement step;
+    // target-declaration triggers already collected stay with the activation.
+    pending.activation_trigger_collection = activation_trigger_collection;
     state.pending_cast = Some(Box::new(pending));
     WaitingFor::NamedChoice {
         player,
@@ -2595,8 +2599,7 @@ pub(crate) fn spell_cast_origin(state: &GameState, object_id: ObjectId) -> Optio
     {
         return Some(zone);
     }
-    // Fallback: placeholder/permanent path where `cast_from_zone` is stamped
-    // on the object directly.
+    // Fallback: `finalize_cast` also stamps `cast_from_zone` on the object.
     state.objects.get(&object_id).and_then(|o| o.cast_from_zone)
 }
 
@@ -3118,6 +3121,7 @@ fn matches_via_origin_scoped_branch(
         | TargetFilter::EventTargetController
         | TargetFilter::ParentTarget
         | TargetFilter::ParentTargetSlot { .. }
+        | TargetFilter::DeclaredPlayer { .. }
         | TargetFilter::ParentTargetController
         | TargetFilter::ParentTargetOwner
         | TargetFilter::SourceChosenPlayer
@@ -3663,6 +3667,29 @@ fn has_exile_cast_permission(
         } else {
             exile_cast_permission_source(state, player, obj.id).is_some()
         }
+        || own_exile_cast_permission(state, obj, player)
+}
+
+/// CR 604.6 + CR 113.6f: a card's own "You may cast this card from exile"
+/// functions while it is in exile; its owner may cast it there (CR 109.5 +
+/// CR 108.4a).
+fn own_exile_cast_permission(state: &GameState, obj: &GameObject, player: PlayerId) -> bool {
+    obj.zone == Zone::Exile
+        && obj.owner == player
+        && active_static_definitions(state, obj).any(|definition| {
+            matches!(
+                definition.mode,
+                StaticMode::GraveyardCastPermission {
+                    play_mode: CardPlayMode::Cast,
+                    frequency: CastFrequency::Unlimited,
+                    extra_cost: None,
+                    enters_with_counter: None,
+                    graveyard_destination_replacement: None,
+                    required_cast_keyword: None,
+                    pool: GraveyardPermissionPool::OwnGraveyard,
+                }
+            ) && matches!(definition.affected, Some(TargetFilter::SelfRef))
+        })
 }
 
 /// CR 305.9 + CR 300.2a: an object that is both a land and another card type can be
@@ -7721,7 +7748,7 @@ mod pool_payability_tests {
             "the public predicate must reuse the exact production pool-payment authority"
         );
         let mut unfunded = scenario.state.clone();
-        unfunded.players[caster.0 as usize].mana_pool.mana.clear();
+        unfunded.players[caster.0 as usize].mana_pool.clear();
         assert!(
             !spell_cost_is_payable_from_pool(&unfunded, caster, spell),
             "removing only pool coverage makes the exact predicate false"
@@ -18474,6 +18501,10 @@ fn announce_spell_on_stack(
     // resolution (#5051; cancel rewind uses the same clear in handle_cancel_cast).
     clear_cast_scoped_creature_type_choice(state, prepared.object_id);
 
+    // CR 601.2a + CR 603.2: the announcement owns this action's events from
+    // here on, wherever in the action it began.
+    super::announcement_triggers::begin_announcement(state, events.len());
+
     // CR 601.2a + CR 400.7: a new identity for this spell, carried through
     // targeting, payment and the finalization move to the stack.
     let announcement = state.mint_spell_announcement();
@@ -21394,7 +21425,7 @@ pub(crate) fn has_manual_mana_ability_for_spell_payment(
 ) -> bool {
     let spell_meta = build_spell_meta(state, player, source_id);
     let spell_ctx = spell_meta.as_ref().map(PaymentContext::Spell);
-    super::mana_sources::has_activatable_non_tap_mana_ability_for_payment(
+    super::mana_sources::has_activatable_player_choice_mana_ability_for_payment(
         state,
         player,
         Some(source_id),
@@ -21891,7 +21922,7 @@ fn can_feasibly_pay_mana_cost_without_x_with_probe(
     // mana ability that requires a manual choice can make the cast reachable.
     // Do not re-estimate tap-cost or unambiguous self-sacrifice sources here:
     // their resource dependencies belong exclusively to the exact probe.
-    if !super::mana_sources::has_activatable_non_tap_mana_ability_for_payment(
+    if !super::mana_sources::has_activatable_player_choice_mana_ability_for_payment(
         state,
         player,
         source_id,
@@ -21902,7 +21933,7 @@ fn can_feasibly_pay_mana_cost_without_x_with_probe(
 
     // CR 117.1d + CR 601.2g: Residual shard feasibility under non-tap mana
     // sources (issue #583: Vivi Ornitier {0} combination mana; extends #1234).
-    let (shards_covered, shard_consumed) =
+    let (shards_covered, shard_charge) =
         super::mana_sources::can_cover_shards_with_activatable_mana(
             state,
             player,
@@ -21923,9 +21954,11 @@ fn can_feasibly_pay_mana_cost_without_x_with_probe(
     // controller could currently activate (covering Sacrifice / Discard /
     // PayLife costs that auto-tap cannot simulate).
     //
-    // Subtract mana already allocated to shard coverage so one activation is
-    // not counted twice (issue #583 review: power-2 Vivi must not cover {1}
-    // generic after paying {U}{R}).
+    // Subtract the capacity shard coverage used up, so one activation is not
+    // counted twice (issue #583 review: power-2 Vivi must not cover {1}
+    // generic after paying {U}{R}), and an activation is credited only with
+    // the color it was planned to make (blue from Nyx Lotus adds its blue
+    // amount, not its larger green amount).
     //
     // The per-permanent sum over-counts in chain-sacrifice configurations
     // (e.g. 2× KCI + 1 fodder reports cap=4 when the actual reachable yield
@@ -21942,7 +21975,7 @@ fn can_feasibly_pay_mana_cost_without_x_with_probe(
             super::mana_sources::feasible_mana_capacity(state, id, player, spell_ctx.as_ref())
         })
         .sum::<u32>()
-        .saturating_sub(shard_consumed);
+        .saturating_sub(shard_charge);
 
     capacity >= residual_generic
 }
@@ -22475,7 +22508,7 @@ fn cleanup_unused_convoke_payments(
     }
 
     if let Some(player_data) = state.players.iter_mut().find(|p| p.id == player) {
-        player_data.mana_pool.mana.retain(|unit| {
+        player_data.mana_pool.retain_shapes(|unit| {
             !(unit.is_convoke_payment() && unused_sources.contains(&unit.source_id))
         });
     }
@@ -25186,6 +25219,36 @@ pub(crate) fn can_pay_ability_cost_now(
     )
 }
 
+/// CR 602.2: True when `obj` has an activated ability that `player` may begin to
+/// activate although `player` does not control `obj` — the "unless the object
+/// specifically says otherwise" exception ("Any player may activate this
+/// ability", "Only your opponents may activate this ability").
+///
+/// A cheap pre-filter for enumerators that otherwise scope a zone scan to the
+/// acting player's own objects. It reads the same permission authority as
+/// activation itself ([`player_may_begin_activating`]) but nothing else:
+/// timing, restrictions, targets and costs are still decided per ability by
+/// [`can_activate_ability_now`]. Runtime-granted activations (cycling, equip,
+/// plot, graveyard grants) are never non-controller permissions, so the
+/// object's own ability list is the complete domain.
+pub fn object_permits_non_controller_activation(
+    state: &GameState,
+    player: PlayerId,
+    obj: &GameObject,
+) -> bool {
+    let reference = obj.controller_or_owner();
+    reference != player
+        && obj.abilities.iter().any(|ability| {
+            ability.kind == AbilityKind::Activated
+                && player_may_begin_activating(
+                    state,
+                    player,
+                    reference,
+                    ability.activator_filter.as_ref(),
+                )
+        })
+}
+
 /// CR 602.2: Whether `player` may begin to activate an activated ability whose
 /// permission reference point is `source_controller`.
 ///
@@ -26305,6 +26368,9 @@ fn activate_with_cost_carrier(
     if !state.objects.contains_key(&source_id) {
         return Err(EngineError::InvalidAction("Object not found".to_string()));
     }
+    // CR 602.2a + CR 603.2: the activation's announcement owns this action's
+    // events from here on.
+    super::announcement_triggers::begin_announcement(state, events.len());
 
     // CR 602.2: Only players permitted by `activator_filter` may begin activation.
     let Some(mut ability_def) = activation_ability_definition(state, source_id, ability_index)
@@ -27445,6 +27511,7 @@ fn activate_with_cost_carrier(
                 ability_index,
                 ActivationTargetSelection::Pending,
                 carrier.clone(),
+                None,
             ));
         }
         stamp_self_ref_discard_cost_paid_object(state, source_id, &mut resolved, cost);
@@ -27853,8 +27920,7 @@ pub fn handle_cancel_cast(
     for player in &mut state.players {
         player
             .mana_pool
-            .mana
-            .retain(|unit| !unit.is_convoke_payment());
+            .retain_shapes(|unit| !unit.is_convoke_payment());
     }
     if let Some(obj) = state.objects.get_mut(&pending.object_id) {
         obj.convoked_creatures.clear();
@@ -28410,9 +28476,10 @@ enum TargetRead {
     /// Every read: the question "must this wait for the committed targets?".
     Any,
     /// Only reads target settlement can't bind: a player filter anchored on a
-    /// parent target (`PlayerFilter::ParentObjectTarget*`), which the filter
-    /// matcher resolves without the ability's targets. A rider that reads its
-    /// target this way can't be priced, so it is refused, never priced wrong.
+    /// parent target (`PlayerFilter::ParentObjectTarget*`) or on the declared
+    /// player target (`PlayerFilter::TargetPlayer`), which the filter matcher
+    /// resolves without the ability's targets. A rider that reads its target
+    /// this way can't be priced, so it is refused, never priced wrong.
     Unbindable,
 }
 
@@ -28715,6 +28782,7 @@ fn controller_ref_reads_chosen_target(controller: &ControllerRef, read: TargetRe
     match controller {
         ControllerRef::TargetPlayer
         | ControllerRef::TargetOpponent
+        | ControllerRef::DeclaredPlayer { .. }
         | ControllerRef::ParentTargetController
         | ControllerRef::ParentTargetOwner => read.includes_bindable(),
         ControllerRef::You
@@ -28735,9 +28803,15 @@ fn player_filter_reads_chosen_target(filter: &PlayerFilter, read: TargetRead) ->
     match filter {
         // CR 109.4: a player filter anchored on a parent target. The filter
         // matcher binds no targets for it (see `effects::matches_player_scope`),
-        // so it is the one read settlement can't price.
-        PlayerFilter::ParentObjectTargetController | PlayerFilter::ParentObjectTargetOwner => true,
+        // so it is the one read settlement can't price. CR 115.1: the
+        // declared-player-target anchor has the same property.
+        PlayerFilter::ParentObjectTargetController
+        | PlayerFilter::ParentObjectTargetOwner
+        | PlayerFilter::TargetPlayer => true,
         PlayerFilter::AllExcept { exclude } => player_filter_reads_chosen_target(exclude, read),
+        PlayerFilter::AnyOf { filters } => filters
+            .iter()
+            .any(|f| player_filter_reads_chosen_target(f, read)),
         PlayerFilter::OpponentDealtDamage { source, .. } => source
             .as_deref()
             .is_some_and(|x| target_filter_reads_chosen_target(x, read)),
@@ -28798,6 +28872,7 @@ fn target_filter_reads_chosen_target(filter: &TargetFilter, read: TargetRead) ->
     match filter {
         TargetFilter::ParentTarget
         | TargetFilter::ParentTargetSlot { .. }
+        | TargetFilter::DeclaredPlayer { .. }
         | TargetFilter::ParentTargetController
         | TargetFilter::ParentTargetOwner => read.includes_bindable(),
         TargetFilter::Typed(TypedFilter {

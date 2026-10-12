@@ -4049,12 +4049,14 @@ fn gendered_past_type_condition_does_not_hoist_outside_leading_dies_position() {
     assert_eq!(trailing.origin, Some(Zone::Battlefield));
     assert_eq!(trailing.destination, Some(Zone::Graveyard));
     assert_eq!(trailing.condition, None);
+    // The draw count position reads "a card" only; the trailing "if she was a
+    // land" it cannot read makes the clause an honest gap (CR 603.4).
     assert!(matches!(
         trailing
             .execute
             .as_deref()
             .map(|ability| ability.effect.as_ref()),
-        Some(Effect::Draw { .. })
+        Some(Effect::Unimplemented { .. })
     ));
     assert_eq!(
         trailing
@@ -4072,18 +4074,12 @@ fn gendered_past_type_condition_does_not_hoist_outside_leading_dies_position() {
         &[],
     );
     assert!(
-        trailing_card.parse_warnings.iter().any(|warning| matches!(
-            warning,
-            OracleDiagnostic::SwallowedClause {
-                detector,
-                description,
-                line_index: 0,
-                ..
-            } if detector == "Condition_If"
-                && description == "When this creature dies, draw a card if she was a land."
-        )),
-        "the trailing predicate must remain an exact honest deferral: {:?}",
-        trailing_card.parse_warnings
+        trailing_card.triggers.iter().any(|trigger| trigger
+            .execute
+            .as_deref()
+            .is_some_and(|ability| matches!(&*ability.effect, Effect::Unimplemented { .. }))),
+        "the trailing predicate must remain an honest deferral: a clause gap, not an \
+         unconditional draw"
     );
 
     let leading_card = parse_oracle_text(
@@ -30804,7 +30800,7 @@ fn attack_one_or_more_opponents_uses_defending_player_controller() {
 /// cards) — distinct from the "attack a player ... that player controls"
 /// anaphor path covered above. Drives the full trigger→effect→target
 /// pipeline on the real Oracle text; the assertion flips to `None` if the
-/// `parse_zone_controller` arm is reverted.
+/// "defending player" arm of `nom_target::parse_controller_phrase` is reverted.
 #[test]
 fn attack_trigger_destroy_or_target_defending_player_controls() {
     use crate::types::ability::Effect;
@@ -33851,7 +33847,7 @@ fn thieving_skydiver_dependent_continuation_is_never_replicated_or_branch() {
 /// Mishra's Command mode 1: "Choose target player. They may discard up to X
 /// cards." Before the fix: `Discard { target: Any, .. }`, non-optional —
 /// unbound to the just-chosen player and mandatory despite "may". After: the
-/// discard binds to `ParentTarget` (the chosen player) and is optional.
+/// discard binds to the chosen player and is optional.
 #[test]
 fn mishras_command_they_may_discard_binds_to_chosen_player_and_is_optional() {
     let parsed = parse_oracle_text(
@@ -33876,10 +33872,9 @@ fn mishras_command_they_may_discard_binds_to_chosen_player_and_is_optional() {
         .expect("the discard must remain chained to the chosen target");
     match &*discard.effect {
         Effect::Discard { target, .. } => {
-            assert_eq!(
-                target,
-                &TargetFilter::ParentTarget,
-                "\"they\" discard must bind to the just-chosen target player, not float unbound"
+            assert!(
+                matches!(target, TargetFilter::DeclaredPlayer { .. }),
+                "\"they\" discard must bind to the just-chosen target player, not float unbound: {target:?}"
             );
         }
         other => panic!("expected Discard, got {other:?}"),
@@ -33895,7 +33890,7 @@ fn mishras_command_they_may_discard_binds_to_chosen_player_and_is_optional() {
 /// the second Discard's target was `Any` (unbound) and non-optional, so the
 /// "if they don't" branch's condition was unreachable in practice.
 #[test]
-fn undercity_plunder_they_may_discard_additional_binds_to_parent_target() {
+fn undercity_plunder_they_may_discard_additional_binds_to_the_declared_player() {
     let parsed = parse_oracle_text(
         "Target opponent discards a card. Then they may discard an additional card. If they don't, conjure a duplicate of a random card from their library into your hand. It perpetually gains \"You may spend mana as though it were mana of any color to cast this spell.\"",
         "Undercity Plunder",
@@ -33911,11 +33906,15 @@ fn undercity_plunder_they_may_discard_additional_binds_to_parent_target() {
         .sub_ability
         .as_ref()
         .expect("\"they may discard an additional card\" must remain chained");
+    let declared = TargetFilter::DeclaredPlayer {
+        group: head
+            .declares_chosen_group
+            .expect("the declaring clause carries its tag"),
+    };
     match &*second_discard.effect {
         Effect::Discard { target, .. } => {
             assert_eq!(
-                target,
-                &TargetFilter::ParentTarget,
+                target, &declared,
                 "the additional discard must bind to the same targeted opponent"
             );
         }
@@ -33924,6 +33923,11 @@ fn undercity_plunder_they_may_discard_additional_binds_to_parent_target() {
     assert!(
         second_discard.optional,
         "\"they may discard an additional card\" must be optional"
+    );
+    assert_eq!(
+        second_discard.optional_player.as_ref(),
+        Some(&declared),
+        "the opponent, not the caster, is offered the additional discard"
     );
     let conjure_gate = second_discard
         .sub_ability

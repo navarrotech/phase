@@ -4,12 +4,93 @@
 //! All parser branches import from this single location (Phase 50, D-01).
 
 use super::diagnostic::OracleDiagnostic;
+use crate::parser::oracle_nom::target::{ControllerPhrase, ControllerSubject, PlayerAnaphor};
 use crate::types::ability::{
-    ControllerRef, Duration, MultiTargetSpec, PlayerFilter, PtValue, QuantityExpr, QuantityRef,
-    TargetChoiceTiming, TargetFilter, TargetSelectionMode, ZoneChoiceCandidateSource,
+    ChosenGroupId, ControllerRef, Duration, MultiTargetSpec, PlayerFilter, PtValue, QuantityExpr,
+    QuantityRef, TargetChoiceTiming, TargetFilter, TargetSelectionMode, ZoneChoiceCandidateSource,
 };
 use crate::types::card_type::CoreType;
 use crate::types::zones::Zone;
+
+/// The players an anaphoric controller phrase can bind to, read from the parse
+/// context (`ParseContext::player_antecedents`) or supplied by a named seed.
+/// `None` means no antecedent is in scope.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PlayerAntecedents {
+    /// CR 608.2c + CR 115.1a: the player the effect chain itself declared, the
+    /// nearer antecedent of "that player" than `third_person`.
+    pub declared_that_player: Option<ControllerRef>,
+    /// CR 608.2c: the chain-declared player "they" names, set only when the
+    /// chain declared exactly one player; the nearer antecedent of "they" than
+    /// `third_person`.
+    pub declared_they: Option<ControllerRef>,
+    /// The referent of "that player" / "they" when no chain-declared rung above applies.
+    pub third_person: Option<ControllerRef>,
+    /// The referent of "its controller" / "their controller".
+    pub object_controller: Option<ControllerRef>,
+}
+
+impl PlayerAntecedents {
+    /// CR 109.5 + CR 608.2c: inside a "for each" iteration body, "they" is the
+    /// iterating player unless the context already introduced one. Permanent
+    /// seed: `ScopedPlayer` falls back to the source controller at runtime when
+    /// no iteration is active. A chain-declared player is not an antecedent
+    /// here.
+    pub(crate) fn for_each_iteration(ctx: &ParseContext) -> Self {
+        PlayerAntecedents {
+            third_person: ctx
+                .relative_player_scope
+                .clone()
+                .or(Some(ControllerRef::ScopedPlayer)),
+            object_controller: ctx.player_antecedents().object_controller,
+            ..Default::default()
+        }
+    }
+
+    /// CR 109.5: a context-free "for each" body, where "they" is the iterating
+    /// player. Permanent seed.
+    pub(crate) fn for_each_iteration_unscoped() -> Self {
+        PlayerAntecedents {
+            third_person: Some(ControllerRef::ScopedPlayer),
+            ..Default::default()
+        }
+    }
+
+    /// CR 109.4 + CR 115.1: in "the number of basic land types among lands they
+    /// control", "they" is a target player, not an iterating one. Permanent
+    /// seed.
+    pub(crate) fn basic_land_type_count() -> Self {
+        PlayerAntecedents {
+            third_person: Some(ControllerRef::TargetPlayer),
+            ..Default::default()
+        }
+    }
+}
+
+/// The single binder for a parsed controller phrase. A direct phrase names its
+/// own player; an anaphor binds to its antecedent, and with none in scope the
+/// result is `None` (fail closed). Tense does not affect the binding.
+pub(crate) fn bind_controller_phrase(
+    phrase: &ControllerPhrase,
+    antecedents: &PlayerAntecedents,
+) -> Option<ControllerRef> {
+    match &phrase.subject {
+        ControllerSubject::Direct(controller) => Some(controller.clone()),
+        // CR 608.2c: "that player" / "they" refer to a player introduced
+        // earlier in the ability; one the chain itself declared is nearer.
+        ControllerSubject::Anaphoric(PlayerAnaphor::ThatPlayer) => antecedents
+            .declared_that_player
+            .clone()
+            .or_else(|| antecedents.third_person.clone()),
+        ControllerSubject::Anaphoric(PlayerAnaphor::They) => antecedents
+            .declared_they
+            .clone()
+            .or_else(|| antecedents.third_person.clone()),
+        ControllerSubject::Anaphoric(PlayerAnaphor::ItsController) => {
+            antecedents.object_controller.clone()
+        }
+    }
+}
 
 /// Parser-only lookahead for token body clauses split across adjacent sentences.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -370,6 +451,14 @@ pub(crate) struct ParseContext {
     /// resolver's outermost-repeat driver. Set and consumed within a single
     /// chunk parse; never serialized.
     pub pending_repeat_for: Option<QuantityExpr>,
+    /// CR 701.38a + CR 608.2c: A count a re-parsing caller already bound for a
+    /// count head whose binder it stripped before re-parsing (the vote tally's
+    /// "a number of <tokens> equal to the number of <choice> votes" reaches the
+    /// body as the binder-less "a number of <tokens>"). Read only by
+    /// `oracle_util::parse_count_slot`'s binder-less "a number of" / absent-head
+    /// arm; an in-text binder wins over it. `parse_effect_chain_ir_body` hands it
+    /// to the first chunk only (`take()`). Never serialized.
+    pub caller_bound_count: Option<QuantityExpr>,
     /// CR 601.2c + CR 115.4: The announced target count recovered by
     /// `parse_each_of_target_distribution` for a "… damage to each of ⟨N⟩
     /// ⟨noun⟩" head, produced by the SAME parse that produced the target
@@ -606,6 +695,32 @@ pub(crate) struct ParseContext {
     /// lowered through them). `None` on the first chunk of every chain and on
     /// every standalone parse. Never serialized.
     pub chain_declared_object_target: Option<TargetFilter>,
+    /// CR 608.2c: the reference to the player slot an ENCLOSING effect chain
+    /// already declared, for a nested `parse_effect_chain_ir` whose own builder
+    /// starts empty (a conditional body re-parsed as its own chain: "If you do,
+    /// that player discards that card, then draws a card"). Set by the caller
+    /// immediately before that one call; the callee `take`s it on entry, so it is
+    /// `None` everywhere else. Never serialized.
+    pub enclosing_declared_player: Option<TargetFilter>,
+    /// Ordinal of the next player-declaring clause's `ChosenGroupId`
+    /// (`ChosenGroupId::declared_player`). `parse_effect_chain_ir_body` owns the
+    /// running count in a chain-level local and hands it across a nested chain
+    /// and each per-chunk context, so ids stay unique across one ability.
+    pub next_declared_player_group: u32,
+    /// CR 608.2c: the chain's nearest earlier clause announced exactly one player, so
+    /// a bare "they" subject names that player (`ParentTargetController`, the
+    /// spelling "that player" takes) instead of an earlier object. Seeded per chunk
+    /// from the chain; `false` on every standalone parse.
+    pub prior_player_declaration: bool,
+    /// CR 608.2c + CR 115.1a: the controller scope "that player controls" and "they
+    /// control" take after a player the chain already declared. Seeded per chunk from
+    /// the chain; `None` on every standalone parse, which keeps `relative_player_scope`
+    /// (then `You`) as the reading.
+    pub declared_player_scope: Option<ControllerRef>,
+    /// The group a damage clause minted for the player it announces itself, so its own
+    /// continuations ("... and 1 damage to each creature that player controls") can name it.
+    /// The chunk loop takes it onto the clause.
+    pub clause_declared_group: Option<ChosenGroupId>,
     /// CR 601.2c + CR 608.2c: every target slot announced by the EARLIER clauses
     /// of this effect chain, in declared order, with its declared-slot index
     /// where that index is exactly computable (see [`DeclaredSlotRegistry`]).
@@ -775,12 +890,44 @@ impl ParseContext {
             .any(|t| matches!(t, CoreType::Instant | CoreType::Sorcery))
     }
 
-    /// Resolve third-person player pronouns ("they", "their") against the
-    /// nearest parser context that introduced a player referent.
+    /// The nearest player referent a third-person pronoun could name, counting
+    /// the "you may" / "any opponent may" `actor`. Read only by detectors;
+    /// controller phrases bind through `bind_controller_phrase`, which does not
+    /// read `actor`.
     pub fn third_person_player_controller_ref(&self) -> Option<ControllerRef> {
         self.relative_player_scope
             .clone()
             .or_else(|| self.actor.clone())
+    }
+
+    /// The antecedents `bind_controller_phrase` reads for an anaphoric
+    /// controller phrase. `actor` is not one: an "any opponent may" actor is the
+    /// accepting player only in that player's own frame.
+    pub(crate) fn player_antecedents(&self) -> PlayerAntecedents {
+        PlayerAntecedents {
+            declared_that_player: self.declared_player_scope.clone(),
+            declared_they: self
+                .declared_player_scope
+                .clone()
+                .filter(|_| self.prior_player_declaration),
+            third_person: self.relative_player_scope.clone(),
+            // CR 508.1 + CR 608.2c: "its controller" is the controller of the
+            // anaphoric object ("it"). In a trigger subject context the anaphor
+            // is the triggering source, whose controller is the triggering
+            // player (the active player who declared attackers per CR 508.1, or
+            // whichever player the triggering event identifies); otherwise ("it"
+            // refers to a chosen parent target) it is that target's controller.
+            // The subject discriminator is a verbatim mirror of
+            // `resolve_pronoun_target` / `resolve_it_pronoun`, so "its
+            // controller" binds to the SAME anaphor as a sibling "shares … with
+            // it" clause.
+            object_controller: Some(match &self.subject {
+                Some(subject) if !matches!(subject, TargetFilter::SelfRef | TargetFilter::Any) => {
+                    ControllerRef::TriggeringPlayer
+                }
+                _ => ControllerRef::ParentTargetController,
+            }),
+        }
     }
 
     /// Push a diagnostic (replaces oracle_warnings::push_diagnostic).
@@ -860,6 +1007,8 @@ impl ParseContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::oracle_nom::target::{ControllerForm, ControllerTense};
+    use crate::types::ability::TypedFilter;
 
     #[test]
     fn target_fallback_diagnostics_are_idempotent() {
@@ -955,5 +1104,139 @@ mod tests {
             Some((Zone::Battlefield, Zone::Graveyard)),
             "neither named operation may disturb the source context"
         );
+    }
+
+    fn phrase(subject: ControllerSubject, tense: ControllerTense) -> ControllerPhrase {
+        ControllerPhrase {
+            subject,
+            form: ControllerForm::Singular,
+            tense,
+        }
+    }
+
+    fn bind(
+        ctx: &ParseContext,
+        subject: ControllerSubject,
+        tense: ControllerTense,
+    ) -> Option<ControllerRef> {
+        bind_controller_phrase(&phrase(subject, tense), &ctx.player_antecedents())
+    }
+
+    /// CR 608.2c: an anaphoric player phrase binds only to an antecedent the
+    /// context introduced; with none it fails closed instead of defaulting.
+    #[test]
+    fn controller_phrase_binder_fails_closed_without_antecedent() {
+        let default_ctx = ParseContext::default();
+        let scoped_ctx = ParseContext {
+            relative_player_scope: Some(ControllerRef::TargetPlayer),
+            ..Default::default()
+        };
+        for anaphor in [PlayerAnaphor::ThatPlayer, PlayerAnaphor::They] {
+            for tense in [ControllerTense::Present, ControllerTense::Past] {
+                let subject = ControllerSubject::Anaphoric(anaphor);
+                assert_eq!(bind(&default_ctx, subject.clone(), tense), None);
+                assert_eq!(
+                    bind(&scoped_ctx, subject, tense),
+                    Some(ControllerRef::TargetPlayer)
+                );
+            }
+        }
+
+        // A direct phrase names its own player whatever the context holds.
+        for ctx in [&default_ctx, &scoped_ctx] {
+            assert_eq!(
+                bind(
+                    ctx,
+                    ControllerSubject::Direct(ControllerRef::You),
+                    ControllerTense::Present
+                ),
+                Some(ControllerRef::You)
+            );
+            assert_eq!(
+                bind(
+                    ctx,
+                    ControllerSubject::Direct(ControllerRef::DefendingPlayer),
+                    ControllerTense::Past
+                ),
+                Some(ControllerRef::DefendingPlayer)
+            );
+        }
+
+        // CR 508.1 + CR 608.2c: "its controller" reads the subject.
+        let its = ControllerSubject::Anaphoric(PlayerAnaphor::ItsController);
+        let trigger_ctx = ParseContext {
+            subject: Some(TargetFilter::Typed(TypedFilter::creature())),
+            ..Default::default()
+        };
+        assert_eq!(
+            bind(&trigger_ctx, its.clone(), ControllerTense::Present),
+            Some(ControllerRef::TriggeringPlayer)
+        );
+        let selfref_ctx = ParseContext {
+            subject: Some(TargetFilter::SelfRef),
+            ..Default::default()
+        };
+        for ctx in [&default_ctx, &selfref_ctx] {
+            assert_eq!(
+                bind(ctx, its.clone(), ControllerTense::Present),
+                Some(ControllerRef::ParentTargetController)
+            );
+        }
+    }
+
+    /// `actor` is not an antecedent: Reservoir Kraken's "any opponent may tap
+    /// an untapped creature they control" must not bind "they" to `Opponent`,
+    /// which the accepting opponent's frame would read as "not mine".
+    #[test]
+    fn controller_phrase_binder_does_not_read_actor() {
+        for actor in [ControllerRef::Opponent, ControllerRef::You] {
+            let ctx = ParseContext {
+                actor: Some(actor.clone()),
+                relative_player_scope: None,
+                ..Default::default()
+            };
+            assert_eq!(
+                bind(
+                    &ctx,
+                    ControllerSubject::Anaphoric(PlayerAnaphor::They),
+                    ControllerTense::Present
+                ),
+                None,
+                "actor {actor:?} must not bind \"they\""
+            );
+        }
+    }
+
+    /// CR 608.2c + CR 115.1a: a player the chain declared is a nearer
+    /// antecedent than the relative scope. "That player" always takes it;
+    /// "they" takes it only when the chain declared exactly one player.
+    #[test]
+    fn controller_phrase_binder_prefers_declared_player() {
+        let declared = ControllerRef::DeclaredPlayer {
+            group: ChosenGroupId::declared_player(0),
+        };
+        let that_player = ControllerSubject::Anaphoric(PlayerAnaphor::ThatPlayer);
+        let they = ControllerSubject::Anaphoric(PlayerAnaphor::They);
+        for prior_player_declaration in [false, true] {
+            let ctx = ParseContext {
+                declared_player_scope: Some(declared.clone()),
+                prior_player_declaration,
+                relative_player_scope: Some(ControllerRef::TargetPlayer),
+                ..Default::default()
+            };
+            assert_eq!(
+                bind(&ctx, that_player.clone(), ControllerTense::Present),
+                Some(declared.clone())
+            );
+            let expected_they = if prior_player_declaration {
+                declared.clone()
+            } else {
+                ControllerRef::TargetPlayer
+            };
+            assert_eq!(
+                bind(&ctx, they.clone(), ControllerTense::Present),
+                Some(expected_they)
+            );
+        }
     }
 }

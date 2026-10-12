@@ -143,6 +143,7 @@ pub fn resolve(
         // cast from a graveyard" riders (Sevinne's Reclamation, issue #3283)
         // re-fire when a flashback copy resolves.
         copy_obj.cast_from_zone = None;
+        copy_obj.cast_controller = None;
         // CR 707.10: no mana was spent to cast a spell copy — reset the
         // cast-payment stamps so spend-color riders ("if {W}{W} was spent to
         // cast it", issue #5943) do not re-fire off the original's payment.
@@ -190,6 +191,10 @@ pub fn resolve(
             StackEntryKind::Spell { ability: None, .. } => {}
             StackEntryKind::ActivatedAbility { ability, .. } => {
                 preserve_ability_copy_source_recursive(ability);
+                // CR 610.3a + CR 707.10: the copy is put onto the stack now, so
+                // only "until" events after this point can stop its move; it
+                // does not inherit the events latched onto the original.
+                ability.clear_duration_events_recursive();
             }
             StackEntryKind::TriggeredAbility { ability, .. } => {
                 preserve_ability_copy_source_recursive(ability);
@@ -468,6 +473,7 @@ fn resolve_copier_player(
         ControllerRef::ScopedPlayer
         | ControllerRef::TargetPlayer
         | ControllerRef::TargetOpponent
+        | ControllerRef::DeclaredPlayer { .. }
         | ControllerRef::ParentTargetController
         | ControllerRef::EventTargetController
         | ControllerRef::ParentTargetOwner
@@ -742,6 +748,15 @@ fn copy_source_entry(state: &GameState, ability: &ResolvedAbility) -> CopySource
     }
     if let Some(entry) = triggering_spell_stack_entry(state) {
         return CopySourceLookup::Source(Box::new(CopySource::on_stack(entry)));
+    }
+    // CR 113.7a + CR 701.6a: an activation event names the activated ability
+    // itself. Once that ability has left the stack (countered), nothing on the
+    // stack is "that ability" — the top of the stack is an unrelated object.
+    if matches!(
+        state.current_trigger_event,
+        Some(GameEvent::AbilityActivated { .. })
+    ) {
+        return CopySourceLookup::Gone;
     }
     state
         .stack

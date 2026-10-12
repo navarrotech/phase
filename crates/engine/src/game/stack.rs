@@ -62,6 +62,10 @@ pub(super) fn begin_resolving_stack_entry(
 }
 
 /// Settles the active resolution carrier after its owning resolution completes.
+///
+/// Every resolution end — resolved, an intervening-if or CR 608.2b no-op, or an
+/// abandoned family — routes through here, so this is where the resolving
+/// stack object finally ceases to exist (CR 608.2n).
 pub(super) fn finish_resolving_stack_entry(
     state: &mut GameState,
     disposition: super::lifecycle::DelayedTerminalDisposition,
@@ -72,6 +76,13 @@ pub(super) fn finish_resolving_stack_entry(
     // occurrence, including ones parked across replacement choices.
     state.return_result_frames.clear();
     state.active_return_result_occurrence = None;
+    // CR 701.20a + CR 608.2n: a reveal-caused triggered ability keeps its card
+    // revealed until it leaves the stack, which a resolving ability does only
+    // as the final part of its resolution — after any pause for a choice, not
+    // when it was popped to begin resolving.
+    if let Some(entry) = entry.as_ref() {
+        state.release_stack_bound_reveals(entry.id);
+    }
     debug_assert!(
         firing.is_none()
             || entry
@@ -530,6 +541,18 @@ pub(crate) struct PoppedStackEntry {
     pub trigger_firing: Option<TriggerFiring>,
 }
 
+/// Empties the stack together with every per-entry table [`PoppedStackEntry`] carries, the bulk
+/// counterpart of [`remove_stack_entry_at_unobserved`]: a new per-entry table joins both.
+///
+/// It neither journals the removal (CR 733) nor records delayed-trigger outcomes, so it is only
+/// for throwaway comparison copies.
+pub(crate) fn clear_stack_with_entry_tables(state: &mut GameState) {
+    state.stack.clear();
+    state.stack_paid_facts.clear();
+    state.stack_trigger_event_batches.clear();
+    state.stack_trigger_firings.clear();
+}
+
 /// Takes the firing classification coupled to a stack entry.
 ///
 /// Current scheduler pushes always install a row for triggered entries. Older
@@ -594,11 +617,12 @@ fn remove_stack_entry_at_unobserved(
             cause,
         })
         .expect("resolved stack removal must have a live journal cause");
-    // CR 701.20a: a triggered ability caused by revealing a card keeps that
-    // card revealed only until it leaves the stack — resolved, countered,
-    // fizzled, or drained. The release is its own journaled information edit,
-    // so replay applies it after this removal without re-deriving it.
-    state.release_stack_bound_reveals(entry.id);
+    // CR 701.20a: the reveal lease is NOT released here. A non-resolving
+    // removal (countered, drained, rolled back) ends it at once — see
+    // `remove_nonresolving_stack_entry_at` and `pop_nonresolving_top_stack_entry`
+    // — but the CR 405.5 resolution pop only begins resolution: the ability
+    // leaves the stack as the final part of that resolution (CR 608.2n), which
+    // `finish_resolving_stack_entry` settles.
 
     Some(PoppedStackEntry {
         entry,
@@ -648,11 +672,22 @@ pub(super) fn remove_nonresolving_stack_entry_at(
     disposition: super::lifecycle::DelayedTerminalDisposition,
 ) -> Option<PoppedStackEntry> {
     let popped = remove_stack_entry_at_unobserved(state, index)?;
+    release_departed_entry_reveals(state, &popped);
     record_departed_stack_spell(state, &popped.entry);
     if let Some(firing) = popped.trigger_firing {
         super::lifecycle::record_delayed_terminal(firing, disposition);
     }
     Some(popped)
+}
+
+/// CR 701.20a: "If revealing a card causes a triggered ability to trigger, the
+/// card remains revealed until that triggered ability leaves the stack." An
+/// entry removed WITHOUT resolving (countered, drained, rolled back) has left
+/// the stack for good, so its lease ends with the removal. The release is its
+/// own journaled information edit, so replay applies it after the removal
+/// without re-deriving it.
+fn release_departed_entry_reveals(state: &mut GameState, popped: &PoppedStackEntry) {
+    state.release_stack_bound_reveals(popped.entry.id);
 }
 
 /// CR 405.2: removes the topmost object from the stack.
@@ -661,6 +696,10 @@ pub(super) fn remove_nonresolving_stack_entry_at(
 /// index N-1 — kept because the resolution and drain callers have no index to
 /// pass and reading `remove_stack_entry_at_unobserved(state, state.stack.len() - 1)` at
 /// each of them would obscure that they are simply resolving the top object.
+///
+/// Releases no CR 701.20a reveal lease: the resolution caller hands the entry
+/// to the carrier, whose `finish_resolving_stack_entry` releases it, and the
+/// drain caller goes through [`pop_nonresolving_top_stack_entry`].
 pub(crate) fn pop_top_stack_entry(state: &mut GameState) -> Option<PoppedStackEntry> {
     remove_stack_entry_at_unobserved(state, state.stack.len().checked_sub(1)?)
 }
@@ -671,6 +710,7 @@ pub(super) fn pop_nonresolving_top_stack_entry(
     disposition: super::lifecycle::DelayedTerminalDisposition,
 ) -> Option<PoppedStackEntry> {
     let popped = pop_top_stack_entry(state)?;
+    release_departed_entry_reveals(state, &popped);
     if let Some(firing) = popped.trigger_firing {
         super::lifecycle::record_delayed_terminal(firing, disposition);
     }
@@ -996,7 +1036,15 @@ fn deliver_resolved_spell_off_stack(
         // redirect INTO exile still records correctly.
         if spell_in_zone(state, spell_id, Zone::Exile) {
             if let Some(link_source) = stack_exile_link_source {
-                super::exile_links::push_tracked_by_source(state, spell_id, link_source);
+                // CR 607.2b + CR 113.7a: exiled with the Rod that stamped the
+                // rider, which may have left since (CR 400.7).
+                super::exile_links::push_with_kind_as(
+                    state,
+                    spell_id,
+                    link_source.object_id,
+                    Some(link_source.incarnation),
+                    ExileLinkKind::TrackedBySource,
+                );
             }
             // CR 603.7a + CR 702.170c: the exile-instead
             // replacement has now actually been APPLIED (the
@@ -1027,7 +1075,7 @@ fn deliver_resolved_spell_off_stack(
                     state,
                     spell_id,
                     spell_controller,
-                    stack_exile_link_source.unwrap_or(spell_id),
+                    stack_exile_link_source.map_or(spell_id, |source| source.object_id),
                     rider,
                     events,
                 );
@@ -1220,7 +1268,10 @@ fn top_pending_trigger_has_no_legal_required_targets(
 
 /// CR 614.1a + CR 608.2n + CR 607.2b: The per-object linked source is also the
 /// exile-instead marker for Rod of Absorption's resolving-spell rider.
-fn stack_exile_linked_source(state: &GameState, object_id: ObjectId) -> Option<ObjectId> {
+fn stack_exile_linked_source(
+    state: &GameState,
+    object_id: ObjectId,
+) -> Option<ObjectIncarnationRef> {
     state
         .objects
         .get(&object_id)
@@ -1419,6 +1470,7 @@ pub(crate) fn bind_resolution_scope(
     entry: &StackEntry,
     trigger_event_batch: Option<Vec<GameEvent>>,
 ) -> bool {
+    let rederived: Option<Option<TriggerCondition>>;
     let triggered = match &entry.kind {
         StackEntryKind::TriggeredAbility {
             condition,
@@ -1426,19 +1478,28 @@ pub(crate) fn bind_resolution_scope(
             subject_match_count,
             die_result,
             ..
-        } => Some(TriggeredResolutionScope {
-            condition: condition.as_ref(),
-            controller: entry.controller,
-            trigger_source: entry
-                .ability()
-                .and_then(|ability| ability.trigger_source.as_ref()),
-            trigger_definition: entry
-                .ability()
-                .and_then(|ability| ability.trigger_definition_ref.as_ref()),
-            trigger_event: trigger_event.as_ref(),
-            subject_match_count: *subject_match_count,
-            die_result: *die_result,
-        }),
+        } => {
+            // CR 603.4 + CR 608.2b: a stored recheck of a payload carrying declared players is
+            // derived again now, so a carried player who has since left names no one.
+            rederived = condition
+                .as_ref()
+                .and(entry.ability())
+                .filter(|ability| !ability.context.outer_declared_players.is_empty())
+                .map(|ability| super::triggers::delayed_intervening_if(state, ability));
+            Some(TriggeredResolutionScope {
+                condition: rederived.as_ref().unwrap_or(condition).as_ref(),
+                controller: entry.controller,
+                trigger_source: entry
+                    .ability()
+                    .and_then(|ability| ability.trigger_source.as_ref()),
+                trigger_definition: entry
+                    .ability()
+                    .and_then(|ability| ability.trigger_definition_ref.as_ref()),
+                trigger_event: trigger_event.as_ref(),
+                subject_match_count: *subject_match_count,
+                die_result: *die_result,
+            })
+        }
         _ => None,
     };
     bind_triggered_resolution_scope(state, triggered, trigger_event_batch)
@@ -4277,6 +4338,7 @@ fn self_counter_ability_is_batch_candidate(ability: &ResolvedAbility) -> bool {
         source_incarnation,
         trigger_source,
         trigger_definition_ref,
+        delayed_origin: _,
         force_block_attacker: _,
         target_incarnations: _, // CR 400.7 referent pins; batch candidacy is shape-only
         target_pins: _,         // CR 400.7 selected-target pins; batch candidacy is shape-only
@@ -4525,6 +4587,7 @@ fn fixed_controller_gain_life_ability_is_batch_candidate(ability: &ResolvedAbili
         source_incarnation: _,
         trigger_source: _,
         trigger_definition_ref: _,
+        delayed_origin: _,
         force_block_attacker: _,
         target_incarnations: _, // CR 400.7 referent pins; batch candidacy is shape-only
         target_pins: _,         // CR 400.7 selected-target pins; batch candidacy is shape-only
@@ -4753,6 +4816,7 @@ fn fixed_opponent_effect_ability_is_batch_candidate(ability: &ResolvedAbility) -
         source_incarnation: _,
         trigger_source: _,
         trigger_definition_ref: _,
+        delayed_origin: _,
         force_block_attacker: _,
         target_incarnations: _, // CR 400.7 referent pins; batch candidacy is shape-only
         target_pins: _,         // CR 400.7 selected-target pins; batch candidacy is shape-only
@@ -5090,6 +5154,7 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         source_incarnation: _,
         trigger_source: _,
         trigger_definition_ref: _,
+        delayed_origin: _,
         force_block_attacker: a_force_block_attacker,
         target_incarnations: a_target_incarnations,
         controller: a_controller,
@@ -5175,6 +5240,7 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         source_incarnation: _,
         trigger_source: _,
         trigger_definition_ref: _,
+        delayed_origin: _,
         force_block_attacker: b_force_block_attacker,
         target_incarnations: b_target_incarnations,
         controller: b_controller,
@@ -16212,8 +16278,13 @@ mod tests {
 #[cfg(test)]
 mod stack_bound_reveal_release_tests {
     //! CR 603.3d + CR 701.20a: the uncommitted-trigger pop releases the popped
-    //! entry's reveal lease, and only when it actually popped.
-    use super::pop_uncommitted_pending_trigger_entry;
+    //! entry's reveal lease, and only when it actually popped. CR 608.2n: the
+    //! resolution pop leaves the lease to the carrier's finish.
+    use super::{
+        begin_resolving_stack_entry, finish_resolving_stack_entry,
+        pop_nonresolving_top_stack_entry, pop_top_stack_entry,
+        pop_uncommitted_pending_trigger_entry,
+    };
     use crate::game::zones::create_object;
     use crate::types::ability::{Effect, ResolvedAbility, TargetFilter};
     use crate::types::game_state::{GameState, StackEntry, StackEntryKind};
@@ -16291,6 +16362,59 @@ mod stack_bound_reveal_release_tests {
         );
         assert!(state.stack.is_empty(), "reach guard: popped");
         assert!(!state.holds_stack_bound_reveal(card));
+        assert!(state.stack_bound_reveals.is_empty());
+    }
+
+    /// CR 701.20a + CR 608.2n: the CR 405.5 resolution pop only begins
+    /// resolution, so the lease survives it and ends when the carrier finishes;
+    /// a non-resolving drain of the top entry (CR 724.1b) ends it at once.
+    #[test]
+    fn only_the_carrier_finish_or_a_nonresolving_pop_releases_the_lease() {
+        let mut state = GameState::new_two_player(3);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Source".into(),
+            Zone::Battlefield,
+        );
+        let card = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Leased".into(),
+            Zone::Hand,
+        );
+
+        let resolving = trigger_entry(&mut state, source);
+        state.grant_stack_bound_reveal(resolving, &[card]);
+        let popped = pop_top_stack_entry(&mut state).expect("reach guard: popped");
+        assert_eq!(popped.entry.id, resolving, "reach guard: the leased entry");
+        assert!(
+            state.holds_stack_bound_reveal(card),
+            "the resolution pop keeps the lease"
+        );
+        begin_resolving_stack_entry(&mut state, popped.entry, popped.trigger_firing)
+            .expect("reach guard: carrier installed");
+        assert!(state.holds_stack_bound_reveal(card), "still resolving");
+        finish_resolving_stack_entry(
+            &mut state,
+            crate::game::lifecycle::DelayedTerminalDisposition::Resolved,
+        );
+        assert!(!state.holds_stack_bound_reveal(card), "finish releases it");
+        assert!(state.stack_bound_reveals.is_empty());
+
+        let drained = trigger_entry(&mut state, source);
+        state.grant_stack_bound_reveal(drained, &[card]);
+        pop_nonresolving_top_stack_entry(
+            &mut state,
+            crate::game::lifecycle::DelayedTerminalDisposition::Removed,
+        )
+        .expect("reach guard: drained");
+        assert!(
+            !state.holds_stack_bound_reveal(card),
+            "the drain releases it"
+        );
         assert!(state.stack_bound_reveals.is_empty());
     }
 }
