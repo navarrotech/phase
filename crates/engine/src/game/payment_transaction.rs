@@ -514,9 +514,10 @@ mod tests {
     use crate::game::deck_loading::DeckEntry;
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, Effect, EffectOutcomeSignal,
-        PlayerFilter, QuantityExpr, QuantityModification, ReplacementDefinition, SubAbilityLink,
-        TargetFilter, TargetRef,
+        AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction,
+        DamageChannel, Effect, EffectOutcomeSignal, PlayerFilter, QuantityExpr,
+        QuantityModification, QuantityRef, ReplacementDefinition, SubAbilityLink, TargetFilter,
+        TargetRef,
     };
     use crate::types::card::CardFace;
     use crate::types::events::GameEvent;
@@ -525,6 +526,9 @@ mod tests {
     use crate::types::mana::{ManaCost, ManaCostShard};
     use crate::types::player::PlayerId;
     use crate::types::replacements::ReplacementEvent;
+    use crate::types::resolution::{
+        ClauseAttribution, ClausePublication, PendingPlayerScopeClause, ResolutionFrame,
+    };
     use crate::types::zones::Zone;
 
     // The behavioral T1–T4 fixtures live beside the payment authority in the
@@ -2075,10 +2079,6 @@ mod tests {
     /// much life. P1's life is touched by nothing else, so its gain reads the
     /// clause span: each attributed event counted once.
     fn park_owner_below_legs(state: &mut GameState, root: &ResolvedAbility, measure: Measure) {
-        use crate::types::ability::{AggregateFunction, DamageChannel, QuantityRef};
-        use crate::types::resolution::{
-            ClauseAttribution, ClausePublication, PendingPlayerScopeClause, ResolutionFrame,
-        };
         let fixed = QuantityExpr::Fixed { value: 1 };
         let template_effect = match measure {
             Measure::LifeLost => Effect::LoseLife {

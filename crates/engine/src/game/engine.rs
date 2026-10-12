@@ -1,3 +1,6 @@
+use crate::analysis::decision_template::{
+    ChoicePoint, DecisionSlot, LoopAnswer, LoopAnswerValue, MayChoiceOption,
+};
 use crate::types::game_state::RandomDraw;
 use rand::Rng;
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
@@ -13,16 +16,17 @@ use crate::types::actions::{
 };
 use crate::types::events::{BendingType, ContestRound, GameEvent, ManaTapState};
 use crate::types::game_state::{
-    ActionResult, AssistState, AutoMayChoice, AutoPassMode, AutoPassRequest, CastOfferKind,
-    CastingVariant, ConvokeMode, CostResume, GameState, LandPlayRecord, LoopDetectionMode,
-    ManaAbilityResume, MayTriggerAutoChoiceKey, PayCostKind, PendingCostMoveCompletion,
-    PendingCostMoveResume, PendingCounterPostAction, PendingEffectResolved, PersistedRestoreError,
-    ResolveAllConsentParticipant, ResolveAllConsentRun, ResolveAllPrioritySnapshot, RetargetScope,
-    RetargetSlotAddress, StackEntry, StackEntryKind, StackResolutionAutoPassOverlay,
-    StackResolutionBudget, StackResolutionEntryFence, StackResolutionPolicy,
-    StackResolutionSession, WaitingFor,
+    ActionResult, AlternativeCastKeyword, AssistState, AutoMayChoice, AutoPassMode,
+    AutoPassRequest, CastOfferKind, CastingVariant, ConvokeMode, CostResume, GameState,
+    LandPlayRecord, LoopDetectionMode, ManaAbilityResume, MayTriggerAutoChoiceKey, PayCostKind,
+    PendingCostMoveCompletion, PendingCostMoveResume, PendingCounterPostAction,
+    PendingEffectResolved, PersistedRestoreError, ResolveAllConsentParticipant,
+    ResolveAllConsentRun, ResolveAllPrioritySnapshot, RetargetScope, RetargetSlotAddress,
+    StackEntry, StackEntryKind, StackResolutionAutoPassOverlay, StackResolutionBudget,
+    StackResolutionEntryFence, StackResolutionPolicy, StackResolutionSession, WaitingFor,
 };
 use crate::types::identifiers::{CardId, DelayedTriggerOrigin, ObjectId, ObjectIncarnationRef};
+use crate::types::mana::ManaCost;
 use crate::types::match_config::MatchType;
 use crate::types::phase::Phase;
 use crate::types::player::PlayerId;
@@ -11805,7 +11809,6 @@ fn apply_non_priority_pass_action(
             ClauseSite::Answer,
             |state, events| -> Result<WaitingFor, EngineError> {
                 Ok({
-                    use crate::types::game_state::AlternativeCastKeyword;
                     match keyword {
                         AlternativeCastKeyword::Warp => casting::handle_warp_cost_choice_with_payment_mode(
                             state,
@@ -13170,9 +13173,6 @@ fn apply_non_priority_pass_action(
                     // carries the `samples() && !in_simulation_probe()` gate.
                     let (answering_player, may_source) = (*player, *source_id);
                     if let Some(source) = object_decision_source(state, may_source) {
-                        use crate::analysis::decision_template::{
-                            ChoicePoint, DecisionSlot, LoopAnswer, LoopAnswerValue, MayChoiceOption,
-                        };
                         // CR 603.5 rides `ChoicePoint::MayGate`, through the SAME constructor
                         // `entry_publishes_pin_slots` publishes the gate with, so the point is named
                         // once and no number is a literal on either side of the journal.
@@ -13914,7 +13914,6 @@ fn apply_non_priority_pass_action(
                         )));
                     }
                     if generic > 0 {
-                        use crate::types::mana::ManaCost;
                         // CR 702.132a: validate the helper can actually produce the committed
                         // generic (simulated auto-tap on a clone) before reducing the
                         // caster's cost. No real taps happen here — see `apply_committed_assist`.
