@@ -125,7 +125,7 @@ fn run_post_action_pipeline_from_with_policy(
     // resumption site, and a prompt the pass leaves standing is never recorded
     // as one the clause raised.
     crate::game::effects::suspend_clause_attribution(state, events, |state, events| {
-        run_post_action_pipeline_core(
+        run_post_action_pipeline_staged(
             state,
             events,
             event_start,
@@ -139,7 +139,7 @@ fn run_post_action_pipeline_from_with_policy(
 
 /// The body of [`run_post_action_pipeline_from_with_policy`], run with clause
 /// attribution suspended.
-fn run_post_action_pipeline_core(
+fn run_post_action_pipeline_staged(
     state: &mut GameState,
     events: &mut Vec<GameEvent>,
     event_start: usize,
