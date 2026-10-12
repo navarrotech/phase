@@ -286,13 +286,33 @@ describe("openPhaseSocket", () => {
     expect(ws.close).toHaveBeenCalled();
   });
 
-  it("rejects Full v133 before it can read the player-scope clause owner frame", async () => {
+  it("rejects Full v133 before it can read the activation's stack entry", async () => {
     const promise = openPhaseSocket("ws://test");
     const ws = MockWebSocket.instances[0];
     ws.deliverMessage(helloFrame({ protocol_version: 133 }));
 
+    await expect(promise).rejects.toMatchObject({
+      kind: "protocol_mismatch",
+    });
+    expect(ws.close).toHaveBeenCalled();
+  });
+
+  it.each([134, 135, 136, 137, 138, 139])("refuses Full v%s before the player-scope owner frame", async (version) => {
+    const promise = openPhaseSocket("ws://test");
+    const ws = MockWebSocket.instances[0];
+    ws.deliverMessage(helloFrame({ protocol_version: version }));
     await expect(promise).rejects.toMatchObject({ kind: "protocol_mismatch" });
     expect(ws.close).toHaveBeenCalled();
+  });
+
+  it("admits its own Full v140 with the player-scope owner frame", async () => {
+    const promise = openPhaseSocket("ws://test");
+    const ws = MockWebSocket.instances[0];
+    ws.deliverMessage(helloFrame({ protocol_version: 140 }));
+    await expect(promise).resolves.toMatchObject({
+      ws, serverInfo: { protocolVersion: 140, mode: "Full" },
+    });
+    expect(ws.close).not.toHaveBeenCalled();
   });
 
   it("rejects Full v131 before it can read the stack-exile rider's incarnation", async () => {
