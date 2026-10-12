@@ -12683,7 +12683,7 @@ fn apply_non_priority_pass_action(
                         // CR 605.1a: the aggregate form never resumes a mana ability;
                         // fixed-count and X-sentinel forms both do.
                         PayCostKind::TapCreatures { mode } => {
-                            let wf = engine_casting::handle_tap_creatures_for_mana_ability(
+                            engine_casting::handle_tap_creatures_for_mana_ability(
                                 state,
                                 *min_count,
                                 *count,
@@ -12692,8 +12692,7 @@ fn apply_non_priority_pass_action(
                                 pending_mana_ability,
                                 &chosen,
                                 events,
-                            )?;
-                            wf
+                            )?
                         }
                         PayCostKind::Discard => engine_casting::handle_discard_for_mana_ability(
                             state,
