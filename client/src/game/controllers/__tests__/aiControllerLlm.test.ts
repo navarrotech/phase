@@ -944,9 +944,18 @@ describe("LLM seats on a message thread", () => {
     controller.dispose();
   });
 
-  it("drops the resend when the seat's settings change while the first request is out", async () => {
+  // Both ways the player leaves the configuration the first request used:
+  // opting the seat out of message threads, and retargeting it.
+  it.each([
+    ["turns message threads off", { decisionContext: "selfContained" }],
+    ["switches the seat's model", { model: "gpt-5-mini" }],
+  ] as const)("drops the resend when the player %s while the first request is out", async (
+    _change,
+    settingsChange,
+  ) => {
     bindSeatToProvider();
     const profileId = useLlmStore.getState().profiles[0]?.id ?? "";
+    useLlmStore.getState().updateProfile(profileId, { decisionContext: "messageThread" });
     const adapter = threadedAdapter(() => THREAD_LOST);
     let answer: (reply: { status: number; body: string }) => void = () => {};
     llmMocks.executeLlmRequest.mockImplementation(
@@ -961,9 +970,9 @@ describe("LLM seats on a message thread", () => {
     await runOnce();
     expect(llmMocks.executeLlmRequest).toHaveBeenCalledTimes(1);
 
-    // The player retargets the seat while its request is out; the provider
-    // then reports the thread lost.
-    useLlmStore.getState().updateProfile(profileId, { model: "gpt-5-mini" });
+    // The player changes the seat's settings while its request is out; the
+    // provider then reports the thread lost.
+    useLlmStore.getState().updateProfile(profileId, settingsChange);
     answer({ status: 404, body: "{}" });
     await runOnce();
 
