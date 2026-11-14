@@ -16209,6 +16209,7 @@ mod node_counts_tracked_set_cards_tests {
         QuantityRef::FilteredTrackedSetSize {
             filter: Box::new(TargetFilter::Typed(filter)),
             caused_by: None,
+            destination: None,
         }
     }
 
@@ -31675,6 +31676,7 @@ mod tests {
                     QuantityRef::FilteredTrackedSetSize {
                         filter: Box::new(filter.clone()),
                         caused_by: Some(ThisWayCause::Destroyed),
+                        destination: None,
                     },
                     QuantityRef::PlayerCount {
                         filter: PlayerFilter::ControlsCount {
@@ -34386,6 +34388,7 @@ mod tests {
                 qty: QuantityRef::FilteredTrackedSetSize {
                     filter: Box::new(TargetFilter::Any),
                     caused_by: Some(ThisWayCause::Destroyed),
+                    destination: None,
                 },
             };
         }
@@ -46977,6 +46980,7 @@ mod tests {
                                 .properties(vec![FilterProp::NonToken]),
                         )),
                         caused_by: None,
+                        destination: None,
                     },
                 },
                 owner: TargetFilter::Controller,

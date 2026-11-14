@@ -20374,10 +20374,18 @@ fn try_parse_for_each_effect(text: &str, ctx: &mut ParseContext) -> Option<Parse
                 // where the preceding Dig puts the rest into Graveyard.
                 // Every other Token for-each count, and every bare-graveyard
                 // clause with no preceding Dig split, is unaffected.
+                // The bare graveyard-destination count parses to the card
+                // count carrying its destination (CR 614.6); a Dig rest pile
+                // re-resolves it through the `PutIntoGraveyard` cause.
                 let count = if matches!(
                     scoped_count,
                     QuantityExpr::Ref {
                         qty: QuantityRef::TrackedSetSize
+                            | QuantityRef::FilteredTrackedSetSize {
+                                caused_by: None,
+                                destination: Some(Zone::Graveyard),
+                                ..
+                            }
                     }
                 ) && ctx.nearest_dig_rest_zone == Some(Zone::Graveyard)
                 {
