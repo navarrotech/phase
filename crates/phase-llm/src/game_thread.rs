@@ -137,8 +137,9 @@ enum Idle {
     /// continue builds on: the thread cannot have expired, so a loss is the
     /// API's doing.
     WithinExpiry,
-    /// Long enough for the thread to have expired: a loss is ordinary expiry,
-    /// and the conversation is recovered again.
+    /// Long enough for the thread to have expired, or unknown because the
+    /// caller's clock stepped back: a loss is read as ordinary expiry, and the
+    /// conversation is recovered again, which costs one more create.
     PastExpiry,
 }
 
@@ -234,9 +235,9 @@ struct OpenThread {
     /// `None` when it reported no usable usage.
     context_tokens: Option<u64>,
     origin: ThreadOrigin,
-    /// When the request whose reply this is went out, on the caller's
-    /// monotonic clock: the thread expires [`THREAD_IDLE_EXPIRY_MS`] after it
-    /// at the earliest.
+    /// When the request whose reply this is went out, on the caller's wall
+    /// clock: the thread expires [`THREAD_IDLE_EXPIRY_MS`] after it at the
+    /// earliest.
     requested_at_ms: u64,
 }
 
@@ -249,7 +250,7 @@ struct PendingTurn {
     /// The newest log entry the request showed the seat.
     seen_through: Option<u32>,
     shape: PendingShape,
-    /// When the request was built, on the caller's monotonic clock.
+    /// When the request was built, on the caller's wall clock.
     requested_at_ms: u64,
 }
 
@@ -299,9 +300,11 @@ impl LlmThreadMemory {
     ///
     /// `history` is the log handed to the prompt builder; its newest entry is
     /// what the seat will have seen once this decision is answered. `now_ms`
-    /// is the caller's monotonic clock as the request goes out, which tells a
-    /// thread's ordinary expiry apart from a conversation the API cannot keep
-    /// ([`Idle`]).
+    /// is the caller's wall clock, in milliseconds, as the request goes out,
+    /// which tells a thread's ordinary expiry apart from a conversation the API
+    /// cannot keep ([`Idle`]). It is a wall clock because the API's expiry runs
+    /// in real time, through a sleeping machine too, while a monotonic clock
+    /// can stop for as long as the machine sleeps.
     ///
     /// # Errors
     ///
@@ -374,10 +377,11 @@ impl LlmThreadMemory {
             });
         let request = match continuation {
             Some((open, update)) => {
-                let idle = if now_ms.saturating_sub(open.requested_at_ms) < THREAD_IDLE_EXPIRY_MS {
-                    Idle::WithinExpiry
-                } else {
-                    Idle::PastExpiry
+                // A wall clock can step back (a clock correction), which leaves
+                // the idle time unknown: that reads as the cheap case.
+                let idle = match now_ms.checked_sub(open.requested_at_ms) {
+                    Some(elapsed) if elapsed < THREAD_IDLE_EXPIRY_MS => Idle::WithinExpiry,
+                    _ => Idle::PastExpiry,
                 };
                 next.shape = PendingShape::Continue(open.origin, idle);
                 DecisionHttpRequest {
@@ -1594,6 +1598,41 @@ mod tests {
             after,
             build_chat_request(&threaded(), &decision(4, AiDifficulty::Medium).prompt).unwrap()
         );
+    }
+
+    /// The caller's clock is a wall clock, which a clock correction can step
+    /// back. A replacement thread lost at a first continue that reads earlier
+    /// than its create has an unknown idle time, which is read as an ordinary
+    /// expiry: the conversation is recovered again, not made self-contained.
+    #[test]
+    fn a_recovery_thread_lost_after_the_clock_stepped_back_is_recovered_again() {
+        let mut memory = LlmThreadMemory::new();
+        let recovered_at = 10 * THREAD_IDLE_EXPIRY_MS;
+        lose_and_recover(&mut memory, recovered_at);
+        let stepped_back = recovered_at - 1_000;
+        let first_continue = memory
+            .decision_request(
+                SEAT,
+                &threaded(),
+                &decision(3, AiDifficulty::Medium),
+                &log(4),
+                stepped_back,
+            )
+            .unwrap()
+            .request;
+        assert_eq!(continued_from(&first_continue), Some("msg_2".to_string()));
+        lose_thread(&mut memory, ThreadErrorCode::NotFound);
+        let recovered = memory
+            .decision_request(
+                SEAT,
+                &threaded(),
+                &decision(3, AiDifficulty::Medium),
+                &log(4),
+                stepped_back,
+            )
+            .unwrap()
+            .request;
+        assert!(is_create(&recovered));
     }
 
     /// A recovery belongs to the conversation it replaces. The seat's thread

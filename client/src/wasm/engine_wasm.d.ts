@@ -56,9 +56,9 @@ export function bestOfThreeCeilingForFormat(format: any): any;
  * `endpoint_json` is the player's configured `LlmEndpointConfig`. `history_json`
  * is the engine-authored game log the caller has accumulated from prior
  * `ActionResult`s — engine data handed back for rendering, not a client
- * derivation. `now_ms` is the caller's monotonic clock (`performance.now()`)
- * as the request goes out: a message thread expires after five idle minutes,
- * and the time since the seat's last request tells that apart from a
+ * derivation. `now_ms` is the caller's wall clock (`Date.now()`) as the
+ * request goes out: a message thread expires after five idle minutes of real
+ * time, and the time since the seat's last request tells that apart from a
  * conversation the API cannot keep. Returns `null` when the seat has no
  * decision to make; throws only on a malformed argument, which is a
  * programming error rather than a runtime outcome.

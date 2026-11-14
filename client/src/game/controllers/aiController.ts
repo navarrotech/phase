@@ -190,7 +190,10 @@ async function llmActionProposal(
       playerId,
       endpointJson,
       historyJson,
-      performance.now(),
+      // The wall clock, not `performance.now()`: a message thread's idle
+      // expiry runs in real time, and a monotonic clock can stop while the
+      // machine sleeps, which would make an expired thread look unstorable.
+      Date.now(),
     );
     if (signal.aborted || !isCurrent()) return null;
     // A decision this provider cannot be asked at all (a forced move has no

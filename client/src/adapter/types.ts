@@ -5946,9 +5946,10 @@ export interface EngineAdapter {
    * Optional capability: an adapter that omits it simply has no LLM seats, and
    * the AI controller uses the heuristic path. `historyJson` is the
    * engine-authored game log the caller has accumulated, handed back for
-   * rendering. `nowMs` is the caller's monotonic clock (`performance.now()`)
-   * as the request goes out, which the engine needs to tell a message
-   * thread's idle expiry apart from a conversation the API cannot keep.
+   * rendering. `nowMs` is the caller's wall clock (`Date.now()`) as the
+   * request goes out. The engine needs it to tell a message thread's idle
+   * expiry, which runs in real time, apart from a conversation the API cannot
+   * keep.
    */
   buildLlmDecisionRequest?(
     difficulty: string,

@@ -924,6 +924,45 @@ describe("LLM seats on a message thread", () => {
     controller.dispose();
   });
 
+  it("hands the engine the wall clock, which runs on while the machine sleeps", async () => {
+    bindSeatToProvider();
+    const replies = [THREAD_LOST, { proposal: proposal(CAST, "llm-after-sleep") }];
+    const adapter = threadedAdapter(() => replies.shift() ?? THREAD_LOST);
+    // Each build's clock argument, beside the wall clock as the build ran.
+    const clocks: Array<{ passed: unknown; wall: number }> = [];
+    adapter.buildLlmDecisionRequest.mockImplementation(async (...args: unknown[]) => {
+      clocks.push({ passed: args[4], wall: Date.now() });
+      return {
+        fingerprint: "fp-1",
+        optionCount: 2,
+        promptChars: 100,
+        request: HTTP_SPEC,
+        threadTurn: THREAD_TURN,
+      };
+    });
+    // The machine sleeps for ten minutes while the first request is out: the
+    // wall clock moves on, and no timer runs.
+    const sleepMs = 10 * 60 * 1000;
+    llmMocks.executeLlmRequest.mockImplementationOnce(async () => {
+      vi.setSystemTime(Date.now() + sleepMs);
+      return { status: 404, body: "{}" };
+    });
+    endGameOnDispatch();
+
+    const controller = createAIController({
+      seats: [{ playerId: 1, difficulty: "Medium", llmSeatIndex: 0 }],
+    });
+    controller.start();
+    await runOnce();
+    await runOnce();
+
+    expect(clocks).toHaveLength(2);
+    for (const { passed, wall } of clocks) expect(passed).toBe(wall);
+    const [first, resend] = clocks;
+    expect((resend?.wall ?? 0) - (first?.wall ?? 0)).toBeGreaterThanOrEqual(sleepMs);
+    controller.dispose();
+  });
+
   it("does not ask again for a decision that moved on while its reply was read", async () => {
     bindSeatToProvider();
     const adapter = threadedAdapter(() => {
