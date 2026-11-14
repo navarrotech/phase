@@ -532,9 +532,10 @@ export class EngineWorkerClient {
     playerId: number,
     endpointJson: string,
     historyJson: string,
+    nowMs: number,
   ): Promise<LlmDecisionRequestResult | null> {
     return this.request<LlmDecisionRequestResult | null>(
-      { type: "buildLlmDecisionRequest", difficulty, playerId, endpointJson, historyJson },
+      { type: "buildLlmDecisionRequest", difficulty, playerId, endpointJson, historyJson, nowMs },
       ENGINE_REQUEST_TIMEOUT_MS,
     );
   }

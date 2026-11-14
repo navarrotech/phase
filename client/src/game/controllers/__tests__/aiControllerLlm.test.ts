@@ -59,6 +59,7 @@ interface TestAdapter {
     playerId: number,
     endpointJson: string,
     historyJson: string,
+    nowMs: number,
   ) => Promise<LlmDecisionRequestResult | null>;
   getAiActionProposalFromLlmResponse?: (
     playerId: number,
@@ -225,6 +226,7 @@ describe("LLM-driven AI seats", () => {
         playerId: number,
         endpointJson: string,
         historyJson: string,
+        nowMs: number,
       ) => Promise<LlmDecisionRequestResult>
     >(async () => ({
       fingerprint: "fp-2", optionCount: 2, request: HTTP_SPEC,
@@ -403,6 +405,7 @@ describe("LLM-driven AI seats", () => {
         playerId: number,
         endpointJson: string,
         historyJson: string,
+        nowMs: number,
       ) => Promise<LlmDecisionRequestResult>
     >(async () => ({
       fingerprint: "default-fp", optionCount: 2, request: HTTP_SPEC,
@@ -421,7 +424,9 @@ describe("LLM-driven AI seats", () => {
     controller.start();
     await runOnce();
 
-    expect(buildLlmDecisionRequest).toHaveBeenCalledWith("Hard", 1, expect.any(String), "[]");
+    expect(buildLlmDecisionRequest).toHaveBeenCalledWith(
+      "Hard", 1, expect.any(String), "[]", expect.any(Number),
+    );
     const endpointJson = buildLlmDecisionRequest.mock.calls[0]?.[2] ?? "";
     expect(JSON.parse(endpointJson)).toMatchObject({ provider: "OpenAi", apiKey: "default-key" });
     expect(llmMocks.executeLlmRequest).toHaveBeenCalledWith(HTTP_SPEC, expect.anything());
@@ -485,7 +490,9 @@ describe("LLM-driven AI seats", () => {
 
     // Difficulty reaches the engine so it can shape the persona and the amount
     // of the position the model is shown.
-    expect(buildLlmDecisionRequest).toHaveBeenCalledWith("Hard", 1, expect.any(String), "[]");
+    expect(buildLlmDecisionRequest).toHaveBeenCalledWith(
+      "Hard", 1, expect.any(String), "[]", expect.any(Number),
+    );
     // Status travels with the body so the engine can refuse a non-2xx reply.
     expect(getAiActionProposalFromLlmResponse).toHaveBeenCalledWith(
       1,
@@ -635,6 +642,7 @@ describe("LLM-driven AI seats", () => {
         playerId: number,
         endpointJson: string,
         historyJson: string,
+        nowMs: number,
       ) => Promise<LlmDecisionRequestResult>
     >(async () => ({
       fingerprint: "fp-1",
@@ -879,8 +887,9 @@ describe("LLM seats on a message thread", () => {
 
     // The engine dropped the thread, so the second build is the fresh request.
     expect(adapter.buildLlmDecisionRequest).toHaveBeenCalledTimes(2);
-    expect(adapter.buildLlmDecisionRequest.mock.calls[1]).toEqual(
-      adapter.buildLlmDecisionRequest.mock.calls[0],
+    // The same decision: every argument but the clock is the first build's.
+    expect(adapter.buildLlmDecisionRequest.mock.calls[1]?.slice(0, 4)).toEqual(
+      adapter.buildLlmDecisionRequest.mock.calls[0]?.slice(0, 4),
     );
     expect(llmMocks.executeLlmRequest).toHaveBeenCalledTimes(2);
     expect(dispatchMocks.dispatchAiActionProposal).toHaveBeenCalledWith(llmProposal);
@@ -932,6 +941,63 @@ describe("LLM seats on a message thread", () => {
     expect(adapter.getAiActionProposalFromLlmResponse).toHaveBeenCalledTimes(1);
     expect(adapter.buildLlmDecisionRequest).toHaveBeenCalledTimes(1);
     expect(llmMocks.executeLlmRequest).toHaveBeenCalledTimes(1);
+    controller.dispose();
+  });
+
+  it("drops the resend when the seat's settings change while the first request is out", async () => {
+    bindSeatToProvider();
+    const profileId = useLlmStore.getState().profiles[0]?.id ?? "";
+    const adapter = threadedAdapter(() => THREAD_LOST);
+    let answer: (reply: { status: number; body: string }) => void = () => {};
+    llmMocks.executeLlmRequest.mockImplementation(
+      () => new Promise((resolve) => { answer = resolve; }),
+    );
+    endGameOnDispatch();
+
+    const controller = createAIController({
+      seats: [{ playerId: 1, difficulty: "Medium", llmSeatIndex: 0 }],
+    });
+    controller.start();
+    await runOnce();
+    expect(llmMocks.executeLlmRequest).toHaveBeenCalledTimes(1);
+
+    // The player retargets the seat while its request is out; the provider
+    // then reports the thread lost.
+    useLlmStore.getState().updateProfile(profileId, { model: "gpt-5-mini" });
+    answer({ status: 404, body: "{}" });
+    await runOnce();
+
+    expect(adapter.getAiActionProposalFromLlmResponse).toHaveBeenCalledTimes(1);
+    expect(adapter.buildLlmDecisionRequest).toHaveBeenCalledTimes(1);
+    expect(llmMocks.executeLlmRequest).toHaveBeenCalledTimes(1);
+    expect(dispatchMocks.dispatchAiActionProposal).toHaveBeenCalledWith(adapter.heuristic);
+    controller.dispose();
+  });
+
+  it("never counts a resend dropped for a settings change against the provider", async () => {
+    bindSeatToProvider();
+    const profileId = useLlmStore.getState().profiles[0]?.id ?? "";
+    const adapter = threadedAdapter(() => THREAD_LOST);
+    // Every decision's request is out when the player switches the model.
+    let model = "gpt-5";
+    llmMocks.executeLlmRequest.mockImplementation(async () => {
+      model = model === "gpt-5" ? "gpt-5-mini" : "gpt-5";
+      useLlmStore.getState().updateProfile(profileId, { model });
+      return { status: 404, body: "{}" };
+    });
+    dispatchMocks.dispatchAiActionProposal.mockResolvedValue({ status: "stale" });
+
+    const controller = createAIController({
+      seats: [{ playerId: 1, difficulty: "Medium", llmSeatIndex: 0 }],
+    });
+    controller.start();
+    for (let decision = 0; decision < 12; decision += 1) await runOnce();
+
+    // Well past the three-failure ceiling, and the provider is still asked.
+    expect(adapter.buildLlmDecisionRequest.mock.calls.length).toBeGreaterThan(8);
+    expect(llmMocks.executeLlmRequest.mock.calls.length).toBe(
+      adapter.buildLlmDecisionRequest.mock.calls.length,
+    );
     controller.dispose();
   });
 

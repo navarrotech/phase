@@ -5940,13 +5940,16 @@ export interface EngineAdapter {
    * Optional capability: an adapter that omits it simply has no LLM seats, and
    * the AI controller uses the heuristic path. `historyJson` is the
    * engine-authored game log the caller has accumulated, handed back for
-   * rendering.
+   * rendering. `nowMs` is the caller's monotonic clock (`performance.now()`)
+   * as the request goes out, which the engine needs to tell a message
+   * thread's idle expiry apart from a conversation the API cannot keep.
    */
   buildLlmDecisionRequest?(
     difficulty: string,
     playerId: number,
     endpointJson: string,
     historyJson: string,
+    nowMs: number,
   ): Promise<LlmDecisionRequestResult | null>;
   /**
    * Binds an LLM response to an engine-issued proposal, or reports why it could

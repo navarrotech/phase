@@ -56,11 +56,14 @@ export function bestOfThreeCeilingForFormat(format: any): any;
  * `endpoint_json` is the player's configured `LlmEndpointConfig`. `history_json`
  * is the engine-authored game log the caller has accumulated from prior
  * `ActionResult`s — engine data handed back for rendering, not a client
- * derivation. Returns `null` when the seat has no decision to make; throws only
- * on a malformed argument, which is a programming error rather than a runtime
- * outcome.
+ * derivation. `now_ms` is the caller's monotonic clock (`performance.now()`)
+ * as the request goes out: a message thread expires after five idle minutes,
+ * and the time since the seat's last request tells that apart from a
+ * conversation the API cannot keep. Returns `null` when the seat has no
+ * decision to make; throws only on a malformed argument, which is a
+ * programming error rather than a runtime outcome.
  */
-export function buildLlmDecisionRequest(difficulty: string, player_id: number, endpoint_json: string, history_json: string): any;
+export function buildLlmDecisionRequest(difficulty: string, player_id: number, endpoint_json: string, history_json: string, now_ms: number): any;
 
 /**
  * Build the connection-probe request for an endpoint.
@@ -855,7 +858,7 @@ export interface InitOutput {
     readonly __wbg_statecodechandle_free: (a: number, b: number) => void;
     readonly apply_seat_mutation: (a: number, b: number, c: number, d: number) => [number, number, number];
     readonly bestOfThreeCeilingForFormat: (a: any) => any;
-    readonly buildLlmDecisionRequest: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => [number, number, number];
+    readonly buildLlmDecisionRequest: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => [number, number, number];
     readonly buildLlmProbeRequest: (a: number, b: number) => [number, number, number];
     readonly build_ai_card_subset: () => [number, number, number, number];
     readonly cancel_takeback_js: (a: number) => [number, number, number];

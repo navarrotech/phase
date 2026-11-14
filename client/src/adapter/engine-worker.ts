@@ -146,6 +146,7 @@ type EngineRequest =
       playerId: number;
       endpointJson: string;
       historyJson: string;
+      nowMs: number;
     }
   | {
       type: "getAiActionProposalFromLlmResponse";
@@ -709,6 +710,7 @@ self.onmessage = async (e: MessageEvent<EngineRequest>) => {
             msg.playerId,
             msg.endpointJson,
             msg.historyJson,
+            msg.nowMs,
           ) ?? null,
         );
         break;

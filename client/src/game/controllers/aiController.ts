@@ -157,6 +157,10 @@ const LLM_THREAD_RESENDS = 1;
  * The engine owns everything of consequence here: it builds the prompt, it
  * builds the HTTP request, and it is the only thing that turns a reply back
  * into an action. This function performs the call and passes bytes along.
+ *
+ * `setCharged` says whether the outcome is the provider's: set once the
+ * provider is in play, and withdrawn when the player's own settings change
+ * ends the decision instead.
  */
 async function llmActionProposal(
   playerId: number,
@@ -164,7 +168,7 @@ async function llmActionProposal(
   llmSeatIndex: number | undefined,
   signal: AbortSignal,
   isCurrent: () => boolean,
-  onAttempt: () => void,
+  setCharged: (charged: boolean) => void,
 ): Promise<AiActionProposal | null> {
   if (llmSeatIndex == null) return null;
   const catalog = await loadProviderCatalog();
@@ -186,6 +190,7 @@ async function llmActionProposal(
       playerId,
       endpointJson,
       historyJson,
+      performance.now(),
     );
     if (signal.aborted || !isCurrent()) return null;
     // A decision this provider cannot be asked at all (a forced move has no
@@ -199,7 +204,7 @@ async function llmActionProposal(
       return built.proposal;
     }
     // From here the provider is in play, so an outcome without a proposal counts.
-    onAttempt();
+    setCharged(true);
     if (!built?.request || !built.fingerprint) {
       // The engine's refusal text can carry a PROVIDER-authored diagnostic, and
       // the game log is prompt-renderable. Only the Phase-authored summary is
@@ -239,6 +244,17 @@ async function llmActionProposal(
       return resolved.proposal;
     }
     if (resolved?.errorKind?.kind === "threadUnavailable" && resends < LLM_THREAD_RESENDS) {
+      // The seat's settings can change while a request is out: message threads
+      // turned off, or another endpoint, model or key. The resend goes only to
+      // the configuration the first request used. For any other it is dropped,
+      // and the decision ends as the player's choice rather than the
+      // provider's failure.
+      const current = profileForSeat(useLlmStore.getState(), llmSeatIndex, catalog);
+      if (!current || JSON.stringify(resolvedEndpointOf(current)) !== endpointJson) {
+        console.info(`[LLM] seat ${llmSeatIndex}: the provider settings changed; not asking again`);
+        setCharged(false);
+        return null;
+      }
       // Console only, like every provider diagnostic: the game log is
       // prompt-renderable (see `diagnostics.ts`).
       console.info(
@@ -527,14 +543,14 @@ export function createAIController(config: AIControllerConfig): AIController {
       llmAbort?.abort();
       const abort = new AbortController();
       llmAbort = abort;
-      let attemptedLlm = false;
+      let chargedToProvider = false;
       proposalPromise = llmActionProposal(
         playerId,
         difficulty,
         llmSeatIndex,
         abort.signal,
         () => isAttemptCurrent(attempt),
-        () => { attemptedLlm = true; },
+        (charged) => { chargedToProvider = charged; },
       )
         .catch((error) => {
           if (abort.signal.aborted || !isAttemptCurrent(attempt)) return null;
@@ -548,7 +564,9 @@ export function createAIController(config: AIControllerConfig): AIController {
           if (!isAttemptCurrent(attempt)) return null;
           // A cancelled call is not the provider's fault — the decision simply
           // moved on — so it must not count toward giving up on the seat.
-          if (!abort.signal.aborted && attemptedLlm) recordLlmOutcome(playerId, proposal != null);
+          if (!abort.signal.aborted && chargedToProvider) {
+            recordLlmOutcome(playerId, proposal != null);
+          }
           return proposal ?? heuristicProposal();
         });
     }

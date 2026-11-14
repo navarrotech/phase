@@ -905,6 +905,7 @@ export class WasmAdapter
     playerId: number,
     endpointJson: string,
     historyJson: string,
+    nowMs: number,
   ): Promise<LlmDecisionRequestResult | null> {
     this.assertInitialized("buildLlmDecisionRequest");
     try {
@@ -914,6 +915,7 @@ export class WasmAdapter
           playerId,
           endpointJson,
           historyJson,
+          nowMs,
         );
       }
       return await this.fallback!.buildLlmDecisionRequest(
@@ -921,6 +923,7 @@ export class WasmAdapter
         playerId,
         endpointJson,
         historyJson,
+        nowMs,
       );
     } catch (err) {
       throw await classifyEngineErrorAsync(err, this.takePanic);
@@ -1737,6 +1740,7 @@ interface MainThreadFallback {
     playerId: number,
     endpointJson: string,
     historyJson: string,
+    nowMs: number,
   ): Promise<LlmDecisionRequestResult | null>;
   getAiActionProposalFromLlmResponse(
     playerId: number,
@@ -1973,10 +1977,11 @@ async function createMainThreadFallback(): Promise<MainThreadFallback> {
       playerId: number,
       endpointJson: string,
       historyJson: string,
+      nowMs: number,
     ) =>
       enqueue(
         () =>
-          (wasm.buildLlmDecisionRequest(difficulty, playerId, endpointJson, historyJson) ??
+          (wasm.buildLlmDecisionRequest(difficulty, playerId, endpointJson, historyJson, nowMs) ??
             null) as LlmDecisionRequestResult | null,
       ),
 

@@ -4879,7 +4879,7 @@ mod restored_card_db_requirements_tests {
         LLM_THREAD_MEMORY.with(|cell| {
             let mut memory = cell.borrow_mut();
             let built = memory
-                .decision_request(player, &endpoint, &decision, &[])
+                .decision_request(player, &endpoint, &decision, &[], 0)
                 .expect("a threaded request builds");
             memory.record_reply(player, built.thread_turn, reply, Ok(()));
             assert!(memory.has_open_thread(player));
@@ -4953,8 +4953,9 @@ mod restored_card_db_requirements_tests {
         history: &[engine::types::log::GameLogEntry],
     ) -> serde_json::Value {
         let history = serde_json::to_string(history).expect("the log serializes");
-        let built = build_llm_decision_request_inner("Medium", seat.0, THREADED_ENDPOINT, &history)
-            .expect("the decision request builds");
+        let built =
+            build_llm_decision_request_inner("Medium", seat.0, THREADED_ENDPOINT, &history, 0)
+                .expect("the decision request builds");
         assert!(
             built["request"].is_object(),
             "no request was built: {built}"
@@ -6891,19 +6892,29 @@ pub fn validate_llm_probe_response(
 /// `endpoint_json` is the player's configured `LlmEndpointConfig`. `history_json`
 /// is the engine-authored game log the caller has accumulated from prior
 /// `ActionResult`s — engine data handed back for rendering, not a client
-/// derivation. Returns `null` when the seat has no decision to make; throws only
-/// on a malformed argument, which is a programming error rather than a runtime
-/// outcome.
+/// derivation. `now_ms` is the caller's monotonic clock (`performance.now()`)
+/// as the request goes out: a message thread expires after five idle minutes,
+/// and the time since the seat's last request tells that apart from a
+/// conversation the API cannot keep. Returns `null` when the seat has no
+/// decision to make; throws only on a malformed argument, which is a
+/// programming error rather than a runtime outcome.
 #[wasm_bindgen(js_name = buildLlmDecisionRequest)]
 pub fn build_llm_decision_request(
     difficulty: &str,
     player_id: u8,
     endpoint_json: &str,
     history_json: &str,
+    now_ms: f64,
 ) -> Result<JsValue, JsValue> {
-    build_llm_decision_request_inner(difficulty, player_id, endpoint_json, history_json)
-        .map(|built| to_js(&built))
-        .map_err(|error| JsValue::from_str(&error))
+    build_llm_decision_request_inner(
+        difficulty,
+        player_id,
+        endpoint_json,
+        history_json,
+        now_ms.max(0.0) as u64,
+    )
+    .map(|built| to_js(&built))
+    .map_err(|error| JsValue::from_str(&error))
 }
 
 /// The natively-callable body of [`build_llm_decision_request`].
@@ -6912,6 +6923,7 @@ fn build_llm_decision_request_inner(
     player_id: u8,
     endpoint_json: &str,
     history_json: &str,
+    now_ms: u64,
 ) -> Result<serde_json::Value, String> {
     let endpoint: phase_llm::LlmEndpointConfig = serde_json::from_str(endpoint_json)
         .map_err(|error| format!("Invalid LLM endpoint config: {error}"))?;
@@ -6967,8 +6979,13 @@ fn build_llm_decision_request_inner(
         // A profile that opted into message threads continues the seat's
         // thread when it can; every other profile gets today's request.
         let http = LLM_THREAD_MEMORY.with(|cell| {
-            cell.borrow_mut()
-                .decision_request(semantic_owner, &endpoint, &request, &history)
+            cell.borrow_mut().decision_request(
+                semantic_owner,
+                &endpoint,
+                &request,
+                &history,
+                now_ms,
+            )
         });
         let http = match http {
             Ok(http) => http,

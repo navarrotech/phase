@@ -46,10 +46,12 @@
 //! - **Thread errors.** A thread is best effort: the API drops one after five
 //!   idle minutes, among other reasons. On a thread error the seat's thread is
 //!   dropped ([`LlmThreadMemory::record_reply`]) and the caller asks the same
-//!   decision once more, which then goes out as a fresh create. An API
-//!   that refuses threads outright, or loses the recovery thread at its first
-//!   continue, is answered with self-contained requests for that endpoint for
-//!   as long as this memory lasts.
+//!   decision once more, which then goes out as a fresh create. An API that
+//!   refuses threads outright is answered with self-contained requests for that
+//!   endpoint and account. A conversation the API lost again at the first
+//!   continue of its replacement, with no idle time to explain the loss, is
+//!   one the API cannot store: its decisions are self-contained from then on,
+//!   while any other conversation still uses threads.
 //!
 //! A thread belongs to one seat of one game. Nothing in it reaches another seat
 //! or the shared game log. The owner of this memory clears it when a new game
@@ -116,11 +118,28 @@ enum ThreadOrigin {
     /// lost (`thread_not_found`), and not continued since. Anthropic: "If a
     /// continue request still returns a 404 error right after you replay, the
     /// API might be unable to store that conversation … Send it without
-    /// `thread`." A seat whose recovery thread is lost at its first continue
-    /// therefore sends self-contained requests from then on.
+    /// `thread`." Losing a recovery thread at its first continue is that case
+    /// only when the thread cannot have expired first ([`Idle`]).
     Recovery,
     /// Continued at least once.
     Continued,
+}
+
+/// How long a thread the API holds lives without a request. Anthropic: "A
+/// thread is best-effort. It expires 5 minutes after its last request".
+const THREAD_IDLE_EXPIRY_MS: u64 = 5 * 60 * 1000;
+
+/// How long a thread had been idle when a request continued it, which tells
+/// an ordinary expiry apart from a conversation the API cannot keep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Idle {
+    /// Less than [`THREAD_IDLE_EXPIRY_MS`] since the request whose reply the
+    /// continue builds on: the thread cannot have expired, so a loss is the
+    /// API's doing.
+    WithinExpiry,
+    /// Long enough for the thread to have expired: a loss is ordinary expiry,
+    /// and the conversation is recovered again.
+    PastExpiry,
 }
 
 /// Every LLM seat's message thread for the game in progress.
@@ -150,11 +169,17 @@ struct SeatThread {
     /// create for any other conversation (another account, game or system
     /// prompt) is an ordinary one, with a first recovery of its own to come.
     lost: Option<Conversation>,
-    /// An endpoint the seat sends self-contained requests to for as long as
-    /// this memory lasts: the rest of the match, unless a restore (an undo or
-    /// a resume) clears it first. Its API refused threads
-    /// (`thread_unsupported_request`), or lost a recovery thread at its first
-    /// continue. A fresh create would only be refused, or lost, again.
+    /// A conversation the API could not store: it lost the thread replacing a
+    /// lost one at its first continue, within the thread's lifetime
+    /// ([`Idle::WithinExpiry`]). The seat's decisions in it are
+    /// self-contained, as Anthropic advises ("Send it without `thread`");
+    /// every other conversation still uses threads.
+    unstored: Option<Conversation>,
+    /// The endpoint and account whose API refused threads
+    /// (`thread_unsupported_request`), which the seat sends self-contained
+    /// requests to, since a fresh create would only be refused again. The seat
+    /// keeps the most recent refusal until another replaces it or a restore
+    /// (an undo or a resume) clears this memory.
     refused: Option<ThreadEndpoint>,
 }
 
@@ -209,6 +234,10 @@ struct OpenThread {
     /// `None` when it reported no usable usage.
     context_tokens: Option<u64>,
     origin: ThreadOrigin,
+    /// When the request whose reply this is went out, on the caller's
+    /// monotonic clock: the thread expires [`THREAD_IDLE_EXPIRY_MS`] after it
+    /// at the earliest.
+    requested_at_ms: u64,
 }
 
 /// A threaded request awaiting its reply.
@@ -220,6 +249,8 @@ struct PendingTurn {
     /// The newest log entry the request showed the seat.
     seen_through: Option<u32>,
     shape: PendingShape,
+    /// When the request was built, on the caller's monotonic clock.
+    requested_at_ms: u64,
 }
 
 /// Whether a pending request creates a thread or continues one.
@@ -227,8 +258,8 @@ struct PendingTurn {
 enum PendingShape {
     /// A create, and the origin the thread it creates will have.
     Create(ThreadOrigin),
-    /// A continue of a thread of this origin.
-    Continue(ThreadOrigin),
+    /// A continue of a thread of this origin, idle this long.
+    Continue(ThreadOrigin, Idle),
 }
 
 impl OpenThread {
@@ -260,13 +291,17 @@ impl LlmThreadMemory {
     /// not opt in, and every protocol but Anthropic Messages — and a seat whose
     /// decision may not use one ([`GameDecisionRequest::thread_game`]) get
     /// exactly [`build_chat_request`]'s request, and any thread the seat held
-    /// is forgotten (an endpoint's refusal of threads is kept). Otherwise the
-    /// request continues the seat's thread when it can and creates a new one
-    /// when it cannot, and is remembered as pending until
+    /// is forgotten (an endpoint's refusal of threads is kept). So do the
+    /// decisions of a refused endpoint and of a conversation the API could not
+    /// store. Otherwise the request continues the seat's thread when it can
+    /// and creates a new one when it cannot, and is remembered as pending until
     /// [`Self::record_reply`].
     ///
     /// `history` is the log handed to the prompt builder; its newest entry is
-    /// what the seat will have seen once this decision is answered.
+    /// what the seat will have seen once this decision is answered. `now_ms`
+    /// is the caller's monotonic clock as the request goes out, which tells a
+    /// thread's ordinary expiry apart from a conversation the API cannot keep
+    /// ([`Idle`]).
     ///
     /// # Errors
     ///
@@ -277,6 +312,7 @@ impl LlmThreadMemory {
         endpoint: &LlmEndpointConfig,
         decision: &GameDecisionRequest,
         history: &[GameLogEntry],
+        now_ms: u64,
     ) -> LlmResult<DecisionHttpRequest> {
         let full = |request| DecisionHttpRequest {
             request,
@@ -309,6 +345,10 @@ impl LlmThreadMemory {
             endpoint: target,
             system: fingerprint_of([decision.prompt.system.as_str()]),
         };
+        if thread.unstored.as_ref() == Some(&conversation) {
+            thread.pending = None;
+            return build_chat_request(endpoint, &decision.prompt).map(full);
+        }
         let create_origin = if thread.lost.as_ref() == Some(&conversation) {
             ThreadOrigin::Recovery
         } else {
@@ -321,6 +361,7 @@ impl LlmThreadMemory {
             conversation,
             seen_through: history.iter().map(|entry| entry.seq).max(),
             shape: PendingShape::Create(create_origin),
+            requested_at_ms: now_ms,
         };
         let continuation = thread
             .open
@@ -333,7 +374,12 @@ impl LlmThreadMemory {
             });
         let request = match continuation {
             Some((open, update)) => {
-                next.shape = PendingShape::Continue(open.origin);
+                let idle = if now_ms.saturating_sub(open.requested_at_ms) < THREAD_IDLE_EXPIRY_MS {
+                    Idle::WithinExpiry
+                } else {
+                    Idle::PastExpiry
+                };
+                next.shape = PendingShape::Continue(open.origin, idle);
                 DecisionHttpRequest {
                     request: build_thread_request(
                         endpoint,
@@ -372,14 +418,14 @@ impl LlmThreadMemory {
     ///   asked again goes out as a fresh create. After `thread_not_found` that
     ///   create is a recovery of the lost conversation; a create for another
     ///   one (a new account, game or system prompt) is not. When the API
-    ///   refuses threads outright (`thread_unsupported_request`), or loses a
-    ///   recovery thread at its first continue (`thread_not_found`), the
-    ///   endpoint is remembered and the seat's decisions to it are
-    ///   self-contained from then on, because a fresh create would only be
-    ///   refused, or lost, again. That second rule cannot tell a conversation
-    ///   the API cannot store from a recovery thread that aged out before its
-    ///   first continue; either way the seat then costs what it costs without
-    ///   threads.
+    ///   refuses threads outright (`thread_unsupported_request`), the endpoint
+    ///   and account are remembered and the seat's decisions to them are
+    ///   self-contained, because a fresh create would only be refused again.
+    ///   When it loses a recovery thread at its first continue while the
+    ///   thread could not yet have expired ([`Idle::WithinExpiry`]), the API
+    ///   cannot store that conversation, and its decisions are self-contained
+    ///   from then on. Lost after it could have expired, the conversation is
+    ///   recovered again like any other.
     /// - **Any other refusal of a 2xx reply.** The API stored that turn after
     ///   the seat's last answered one, and an id can be continued only once, so
     ///   the seat's next decision starts a new thread instead of sending a
@@ -410,7 +456,7 @@ impl LlmThreadMemory {
             Ok(()) => {
                 let origin = match answered.shape {
                     PendingShape::Create(origin) => origin,
-                    PendingShape::Continue(_) => ThreadOrigin::Continued,
+                    PendingShape::Continue(..) => ThreadOrigin::Continued,
                 };
                 // The seat has an answered turn again: no conversation is
                 // waiting on a recovery any more.
@@ -425,6 +471,7 @@ impl LlmThreadMemory {
                                 .as_ref()
                                 .and_then(context_tokens),
                             origin,
+                            requested_at_ms: answered.requested_at_ms,
                         }
                     });
             }
@@ -434,12 +481,19 @@ impl LlmThreadMemory {
                     ThreadErrorCode::UnsupportedRequest => {
                         thread.refused = Some(answered.conversation.endpoint);
                     }
+                    // The replacement for a lost thread was lost at its first
+                    // continue, too soon to have expired: Anthropic's "right
+                    // after you replay" case.
                     ThreadErrorCode::NotFound
-                        if answered.shape == PendingShape::Continue(ThreadOrigin::Recovery) =>
+                        if answered.shape
+                            == PendingShape::Continue(
+                                ThreadOrigin::Recovery,
+                                Idle::WithinExpiry,
+                            ) =>
                     {
-                        thread.refused = Some(answered.conversation.endpoint);
+                        thread.unstored = Some(answered.conversation);
                     }
-                    // Anthropic's replay rule is about a thread the API lost:
+                    // Any other lost thread, an expired replacement included:
                     // the create that replaces it, in the same conversation,
                     // is a recovery.
                     ThreadErrorCode::NotFound => thread.lost = Some(answered.conversation),
@@ -513,6 +567,8 @@ mod tests {
     use serde_json::{json, Value};
 
     const SEAT: PlayerId = PlayerId(1);
+    /// The caller's clock for a request whose timing does not matter.
+    const NOW_MS: u64 = 0;
 
     fn endpoint(provider: LlmProvider, context: DecisionContext) -> LlmEndpointConfig {
         LlmEndpointConfig {
@@ -656,7 +712,7 @@ mod tests {
         id: &str,
     ) -> HttpRequestSpec {
         let spec = memory
-            .decision_request(SEAT, config, decision, history)
+            .decision_request(SEAT, config, decision, history, NOW_MS)
             .unwrap()
             .request;
         accept_reply(memory, LlmProvider::Anthropic, &reply(id, 900));
@@ -689,7 +745,7 @@ mod tests {
         let mut memory = LlmThreadMemory::new();
         let first = decision(1, AiDifficulty::Medium);
         let spec = memory
-            .decision_request(SEAT, &threaded(), &first, &log(4))
+            .decision_request(SEAT, &threaded(), &first, &log(4), NOW_MS)
             .unwrap()
             .request;
 
@@ -730,7 +786,7 @@ mod tests {
 
         let second = decision(2, AiDifficulty::Medium);
         let spec = memory
-            .decision_request(SEAT, &threaded(), &second, &log(7))
+            .decision_request(SEAT, &threaded(), &second, &log(7), NOW_MS)
             .unwrap()
             .request;
 
@@ -757,14 +813,14 @@ mod tests {
         let mut memory = LlmThreadMemory::new();
         let first = decision(1, AiDifficulty::Medium);
         let create = memory
-            .decision_request(SEAT, &threaded(), &first, &log(4))
+            .decision_request(SEAT, &threaded(), &first, &log(4), NOW_MS)
             .unwrap();
         assert_eq!(create.prompt_chars, first.prompt.char_count());
         accept_reply(&mut memory, LlmProvider::Anthropic, &reply("msg_1", 900));
 
         let second = decision(2, AiDifficulty::Medium);
         let continuation = memory
-            .decision_request(SEAT, &threaded(), &second, &log(6))
+            .decision_request(SEAT, &threaded(), &second, &log(6), NOW_MS)
             .unwrap();
         let update = second.thread_update(&log(6), Some(3)).unwrap();
         assert_eq!(continuation.prompt_chars, update.chars().count());
@@ -785,7 +841,7 @@ mod tests {
         // The second decision goes out but its reply is never accepted.
         let unanswered = decision(2, AiDifficulty::Medium);
         memory
-            .decision_request(SEAT, &threaded(), &unanswered, &log(6))
+            .decision_request(SEAT, &threaded(), &unanswered, &log(6), NOW_MS)
             .unwrap();
         // A reply to some other decision does not advance it either.
         let elsewhere = LlmReply {
@@ -797,7 +853,7 @@ mod tests {
 
         let third = decision(3, AiDifficulty::Medium);
         let spec = memory
-            .decision_request(SEAT, &threaded(), &third, &log(8))
+            .decision_request(SEAT, &threaded(), &third, &log(8), NOW_MS)
             .unwrap()
             .request;
         assert_eq!(continued_from(&spec), Some("msg_1".to_string()));
@@ -825,7 +881,7 @@ mod tests {
         );
         let second = decision(2, AiDifficulty::Medium);
         memory
-            .decision_request(SEAT, &threaded(), &second, &log(6))
+            .decision_request(SEAT, &threaded(), &second, &log(6), NOW_MS)
             .unwrap();
         let overloaded = LlmReply {
             provider: LlmProvider::Anthropic,
@@ -839,7 +895,7 @@ mod tests {
         memory.record_reply(SEAT, turn, overloaded, Err(&error));
 
         let retry = memory
-            .decision_request(SEAT, &threaded(), &second, &log(6))
+            .decision_request(SEAT, &threaded(), &second, &log(6), NOW_MS)
             .unwrap()
             .request;
         assert_eq!(continued_from(&retry), Some("msg_1".to_string()));
@@ -860,7 +916,7 @@ mod tests {
         );
         let second = decision(2, AiDifficulty::Medium);
         memory
-            .decision_request(SEAT, &threaded(), &second, &log(6))
+            .decision_request(SEAT, &threaded(), &second, &log(6), NOW_MS)
             .unwrap();
         // Whatever the body says, the engine's verdict is what counts here.
         let body = reply("msg_2", 900);
@@ -883,6 +939,7 @@ mod tests {
                 &threaded(),
                 &decision(3, AiDifficulty::Medium),
                 &log(7),
+                NOW_MS,
             )
             .unwrap()
             .request;
@@ -907,7 +964,7 @@ mod tests {
             );
             let second = decision(2, AiDifficulty::Medium);
             let lost = memory
-                .decision_request(SEAT, &threaded(), &second, &log(6))
+                .decision_request(SEAT, &threaded(), &second, &log(6), NOW_MS)
                 .unwrap()
                 .request;
             assert_eq!(continued_from(&lost), Some("msg_1".to_string()));
@@ -916,7 +973,7 @@ mod tests {
             assert!(!memory.has_open_thread(SEAT), "{code:?}");
 
             let retry = memory
-                .decision_request(SEAT, &threaded(), &second, &log(6))
+                .decision_request(SEAT, &threaded(), &second, &log(6), NOW_MS)
                 .unwrap()
                 .request;
             assert!(is_create(&retry), "{code:?}");
@@ -931,6 +988,7 @@ mod tests {
                     &threaded(),
                     &decision(3, AiDifficulty::Medium),
                     &log(8),
+                    NOW_MS,
                 )
                 .unwrap()
                 .request;
@@ -949,13 +1007,13 @@ mod tests {
         let mut memory = LlmThreadMemory::new();
         let first = decision(1, AiDifficulty::Medium);
         memory
-            .decision_request(SEAT, &threaded(), &first, &log(2))
+            .decision_request(SEAT, &threaded(), &first, &log(2), NOW_MS)
             .unwrap();
         lose_thread(&mut memory, ThreadErrorCode::UnsupportedRequest);
 
         let today = build_chat_request(&threaded(), &first.prompt).unwrap();
         let retry = memory
-            .decision_request(SEAT, &threaded(), &first, &log(2))
+            .decision_request(SEAT, &threaded(), &first, &log(2), NOW_MS)
             .unwrap()
             .request;
         assert_eq!(retry, today);
@@ -971,6 +1029,7 @@ mod tests {
                 &elsewhere,
                 &decision(2, AiDifficulty::Medium),
                 &log(3),
+                NOW_MS,
             )
             .unwrap()
             .request;
@@ -983,7 +1042,7 @@ mod tests {
             let mut memory = LlmThreadMemory::new();
             let first = decision(1, AiDifficulty::Medium);
             memory
-                .decision_request(SEAT, &threaded(), &first, &log(2))
+                .decision_request(SEAT, &threaded(), &first, &log(2), NOW_MS)
                 .unwrap();
             accept_reply(
                 &mut memory,
@@ -996,6 +1055,7 @@ mod tests {
                     &threaded(),
                     &decision(2, AiDifficulty::Medium),
                     &log(3),
+                    NOW_MS,
                 )
                 .unwrap()
                 .request
@@ -1014,7 +1074,7 @@ mod tests {
         let mut memory = LlmThreadMemory::new();
         let first = decision(1, AiDifficulty::Medium);
         memory
-            .decision_request(SEAT, &threaded(), &first, &log(2))
+            .decision_request(SEAT, &threaded(), &first, &log(2), NOW_MS)
             .unwrap();
         let cached = json!({
             "id": "msg_1",
@@ -1035,6 +1095,7 @@ mod tests {
                 &threaded(),
                 &decision(2, AiDifficulty::Medium),
                 &log(3),
+                NOW_MS,
             )
             .unwrap()
             .request;
@@ -1046,7 +1107,7 @@ mod tests {
         let mut memory = LlmThreadMemory::new();
         let first = decision(1, AiDifficulty::Medium);
         memory
-            .decision_request(SEAT, &threaded(), &first, &log(2))
+            .decision_request(SEAT, &threaded(), &first, &log(2), NOW_MS)
             .unwrap();
         let unmeasured = json!({
             "id": "msg_1",
@@ -1061,6 +1122,7 @@ mod tests {
                 &threaded(),
                 &decision(2, AiDifficulty::Medium),
                 &log(3),
+                NOW_MS,
             )
             .unwrap()
             .request;
@@ -1089,7 +1151,7 @@ mod tests {
                 "msg_1",
             );
             let next = memory
-                .decision_request(SEAT, &config, &decision(2, difficulty), &log(3))
+                .decision_request(SEAT, &config, &decision(2, difficulty), &log(3), NOW_MS)
                 .unwrap()
                 .request;
             assert!(is_create(&next), "a new {change} must start a new thread");
@@ -1111,6 +1173,7 @@ mod tests {
                 &longer_replies,
                 &decision(2, AiDifficulty::Medium),
                 &log(3),
+                NOW_MS,
             )
             .unwrap()
             .request;
@@ -1126,7 +1189,7 @@ mod tests {
             for revision in 1..=2 {
                 let decision = decision(revision, difficulty);
                 let sent = memory
-                    .decision_request(SEAT, &threaded(), &decision, &log(4))
+                    .decision_request(SEAT, &threaded(), &decision, &log(4), NOW_MS)
                     .unwrap();
                 assert_eq!(
                     sent.request,
@@ -1161,6 +1224,7 @@ mod tests {
                     &threaded(),
                     &decision(2, AiDifficulty::Medium),
                     &log(4 + unseen),
+                    NOW_MS,
                 )
                 .unwrap()
                 .request
@@ -1182,6 +1246,7 @@ mod tests {
                 &threaded(),
                 &decision_in_game(2, AiDifficulty::Medium, 1),
                 &log(6),
+                NOW_MS,
             )
             .unwrap()
             .request;
@@ -1195,6 +1260,7 @@ mod tests {
                 &threaded(),
                 &decision_in_game(2, AiDifficulty::Medium, 2),
                 &log(6),
+                NOW_MS,
             )
             .unwrap()
             .request;
@@ -1236,7 +1302,7 @@ mod tests {
         )
         .unwrap();
         let sent = memory
-            .decision_request(SEAT, &threaded(), &game_two, &history)
+            .decision_request(SEAT, &threaded(), &game_two, &history, NOW_MS)
             .unwrap()
             .request;
         assert!(is_create(&sent));
@@ -1263,7 +1329,7 @@ mod tests {
         between.match_phase = engine::types::match_config::MatchPhase::BetweenGames;
         let play_draw = decision_on(&between, 2, AiDifficulty::Medium);
         let sent = memory
-            .decision_request(SEAT, &threaded(), &play_draw, &log(5))
+            .decision_request(SEAT, &threaded(), &play_draw, &log(5), NOW_MS)
             .unwrap()
             .request;
         assert_eq!(
@@ -1279,6 +1345,7 @@ mod tests {
                 &threaded(),
                 &decision_in_game(3, AiDifficulty::Medium, 2),
                 &log(6),
+                NOW_MS,
             )
             .unwrap()
             .request;
@@ -1292,7 +1359,7 @@ mod tests {
         let mut memory = LlmThreadMemory::new();
         let first = decision_in_game(1, AiDifficulty::Medium, 1);
         memory
-            .decision_request(SEAT, &threaded(), &first, &log(2))
+            .decision_request(SEAT, &threaded(), &first, &log(2), NOW_MS)
             .unwrap();
         lose_thread(&mut memory, ThreadErrorCode::UnsupportedRequest);
 
@@ -1305,12 +1372,13 @@ mod tests {
                 &threaded(),
                 &decision_on(&between, 2, AiDifficulty::Medium),
                 &log(3),
+                NOW_MS,
             )
             .unwrap();
 
         let next_game = decision_in_game(3, AiDifficulty::Medium, 2);
         let sent = memory
-            .decision_request(SEAT, &threaded(), &next_game, &log(4))
+            .decision_request(SEAT, &threaded(), &next_game, &log(4), NOW_MS)
             .unwrap()
             .request;
         assert_eq!(
@@ -1336,7 +1404,13 @@ mod tests {
             "msg_1",
         );
         let after_accept = memory
-            .decision_request(SEAT, &new_key, &decision(2, AiDifficulty::Medium), &log(3))
+            .decision_request(
+                SEAT,
+                &new_key,
+                &decision(2, AiDifficulty::Medium),
+                &log(3),
+                NOW_MS,
+            )
             .unwrap()
             .request;
         assert!(is_create(&after_accept));
@@ -1348,59 +1422,73 @@ mod tests {
                 &threaded(),
                 &decision(1, AiDifficulty::Medium),
                 &log(2),
+                NOW_MS,
             )
             .unwrap();
         lose_thread(&mut memory, ThreadErrorCode::UnsupportedRequest);
         let after_refusal = memory
-            .decision_request(SEAT, &new_key, &decision(2, AiDifficulty::Medium), &log(3))
+            .decision_request(
+                SEAT,
+                &new_key,
+                &decision(2, AiDifficulty::Medium),
+                &log(3),
+                NOW_MS,
+            )
             .unwrap()
             .request;
         assert!(is_create(&after_refusal));
     }
 
-    /// The recovery contract: when the first continue of a thread created to
-    /// recover a lost one is lost too, the seat goes self-contained instead
-    /// of paying a lost continue and a create on every decision.
-    #[test]
-    fn a_recovery_thread_lost_at_its_first_continue_makes_the_seat_self_contained() {
-        let mut memory = LlmThreadMemory::new();
+    /// Lose the seat's thread on `threaded()` in game one, then recover it with
+    /// a create built at `recovered_at_ms`, whose reply `msg_2` is accepted.
+    fn lose_and_recover(memory: &mut LlmThreadMemory, recovered_at_ms: u64) {
         answer(
-            &mut memory,
+            memory,
             &threaded(),
             &decision(1, AiDifficulty::Medium),
             &log(2),
             "msg_1",
         );
-        // A thread lost after ordinary use is recovered with a create.
         memory
             .decision_request(
                 SEAT,
                 &threaded(),
                 &decision(2, AiDifficulty::Medium),
                 &log(3),
+                NOW_MS,
             )
             .unwrap();
-        lose_thread(&mut memory, ThreadErrorCode::NotFound);
+        lose_thread(memory, ThreadErrorCode::NotFound);
         let recovery = memory
             .decision_request(
                 SEAT,
                 &threaded(),
                 &decision(2, AiDifficulty::Medium),
                 &log(3),
+                recovered_at_ms,
             )
             .unwrap()
             .request;
         assert!(is_create(&recovery));
-        accept_reply(&mut memory, LlmProvider::Anthropic, &reply("msg_2", 900));
+        accept_reply(memory, LlmProvider::Anthropic, &reply("msg_2", 900));
+    }
 
-        // Its first continue is lost as well: the API cannot keep this
-        // conversation, and every later decision is today's request.
+    /// The recovery contract: when the first continue of a thread created to
+    /// recover a lost one is lost too, before the thread could have expired,
+    /// the API cannot store that conversation. Its decisions are self-contained
+    /// from then on, instead of a lost continue and a create each; every other
+    /// conversation, on the same endpoint, still uses threads.
+    #[test]
+    fn a_recovery_thread_lost_before_it_could_expire_makes_its_conversation_self_contained() {
+        let mut memory = LlmThreadMemory::new();
+        lose_and_recover(&mut memory, 1_000);
         let first_continue = memory
             .decision_request(
                 SEAT,
                 &threaded(),
                 &decision(3, AiDifficulty::Medium),
                 &log(4),
+                1_000 + THREAD_IDLE_EXPIRY_MS - 1,
             )
             .unwrap()
             .request;
@@ -1409,7 +1497,13 @@ mod tests {
         for revision in 3..=5 {
             let decision = decision(revision, AiDifficulty::Medium);
             let sent = memory
-                .decision_request(SEAT, &threaded(), &decision, &log(revision as u32 + 2))
+                .decision_request(
+                    SEAT,
+                    &threaded(),
+                    &decision,
+                    &log(revision as u32 + 2),
+                    NOW_MS,
+                )
                 .unwrap()
                 .request;
             assert_eq!(
@@ -1417,6 +1511,80 @@ mod tests {
                 build_chat_request(&threaded(), &decision.prompt).unwrap()
             );
         }
+
+        // The endpoint is not given up: the match's next game threads again.
+        let next_game = memory
+            .decision_request(
+                SEAT,
+                &threaded(),
+                &decision_in_game(6, AiDifficulty::Medium, 2),
+                &log(9),
+                NOW_MS,
+            )
+            .unwrap()
+            .request;
+        assert!(is_create(&next_game));
+    }
+
+    /// A replacement thread left idle past the API's expiry before its first
+    /// continue has simply expired: it is recovered again, and the endpoint is
+    /// never treated as one that cannot store the conversation.
+    #[test]
+    fn a_recovery_thread_that_expired_before_its_first_continue_is_recovered_again() {
+        let mut memory = LlmThreadMemory::new();
+        lose_and_recover(&mut memory, 1_000);
+        let after_the_pause = 1_000 + THREAD_IDLE_EXPIRY_MS;
+        let first_continue = memory
+            .decision_request(
+                SEAT,
+                &threaded(),
+                &decision(3, AiDifficulty::Medium),
+                &log(4),
+                after_the_pause,
+            )
+            .unwrap()
+            .request;
+        assert_eq!(continued_from(&first_continue), Some("msg_2".to_string()));
+        lose_thread(&mut memory, ThreadErrorCode::NotFound);
+        let recovered = memory
+            .decision_request(
+                SEAT,
+                &threaded(),
+                &decision(3, AiDifficulty::Medium),
+                &log(4),
+                after_the_pause,
+            )
+            .unwrap()
+            .request;
+        assert!(is_create(&recovered));
+
+        // That recovery is bounded like the first: lost again right away, its
+        // conversation is self-contained.
+        accept_reply(&mut memory, LlmProvider::Anthropic, &reply("msg_3", 900));
+        memory
+            .decision_request(
+                SEAT,
+                &threaded(),
+                &decision(4, AiDifficulty::Medium),
+                &log(5),
+                after_the_pause + 1,
+            )
+            .unwrap();
+        lose_thread(&mut memory, ThreadErrorCode::NotFound);
+        let after = memory
+            .decision_request(
+                SEAT,
+                &threaded(),
+                &decision(4, AiDifficulty::Medium),
+                &log(5),
+                NOW_MS,
+            )
+            .unwrap()
+            .request;
+        assert_eq!(
+            after,
+            build_chat_request(&threaded(), &decision(4, AiDifficulty::Medium).prompt).unwrap()
+        );
     }
 
     /// A recovery belongs to the conversation it replaces. The seat's thread
@@ -1433,11 +1601,11 @@ mod tests {
         let lose_and_fail_the_recovery = |memory: &mut LlmThreadMemory| {
             answer(memory, &threaded(), &game_one(1), &log(2), "msg_1");
             memory
-                .decision_request(SEAT, &threaded(), &game_one(2), &log(3))
+                .decision_request(SEAT, &threaded(), &game_one(2), &log(3), NOW_MS)
                 .unwrap();
             lose_thread(memory, ThreadErrorCode::NotFound);
             let recovery = memory
-                .decision_request(SEAT, &threaded(), &game_one(2), &log(3))
+                .decision_request(SEAT, &threaded(), &game_one(2), &log(3), NOW_MS)
                 .unwrap()
                 .request;
             assert!(is_create(&recovery));
@@ -1457,11 +1625,11 @@ mod tests {
             lose_and_fail_the_recovery(&mut memory);
             answer(&mut memory, config, &next, &log(4), "msg_2");
             memory
-                .decision_request(SEAT, config, &next, &log(5))
+                .decision_request(SEAT, config, &next, &log(5), NOW_MS)
                 .unwrap();
             lose_thread(&mut memory, ThreadErrorCode::NotFound);
             let recovered = memory
-                .decision_request(SEAT, config, &next, &log(5))
+                .decision_request(SEAT, config, &next, &log(5), NOW_MS)
                 .unwrap()
                 .request;
             assert!(is_create(&recovered), "{}", body(&recovered));
@@ -1473,11 +1641,11 @@ mod tests {
         lose_and_fail_the_recovery(&mut memory);
         answer(&mut memory, &threaded(), &game_one(2), &log(3), "msg_2");
         memory
-            .decision_request(SEAT, &threaded(), &game_one(3), &log(4))
+            .decision_request(SEAT, &threaded(), &game_one(3), &log(4), NOW_MS)
             .unwrap();
         lose_thread(&mut memory, ThreadErrorCode::NotFound);
         let after = memory
-            .decision_request(SEAT, &threaded(), &game_one(3), &log(4))
+            .decision_request(SEAT, &threaded(), &game_one(3), &log(4), NOW_MS)
             .unwrap()
             .request;
         assert_eq!(
@@ -1504,6 +1672,7 @@ mod tests {
                 &threaded(),
                 &decision(2, AiDifficulty::Medium),
                 &log(3),
+                NOW_MS,
             )
             .unwrap();
         lose_thread(&mut memory, ThreadErrorCode::NotFound);
@@ -1513,6 +1682,7 @@ mod tests {
                 &threaded(),
                 &decision(2, AiDifficulty::Medium),
                 &log(3),
+                NOW_MS,
             )
             .unwrap();
         accept_reply(&mut memory, LlmProvider::Anthropic, &reply("msg_2", 900));
@@ -1531,6 +1701,7 @@ mod tests {
                 &threaded(),
                 &decision(4, AiDifficulty::Medium),
                 &log(5),
+                NOW_MS,
             )
             .unwrap();
         lose_thread(&mut memory, ThreadErrorCode::NotFound);
@@ -1540,6 +1711,7 @@ mod tests {
                 &threaded(),
                 &decision(4, AiDifficulty::Medium),
                 &log(5),
+                NOW_MS,
             )
             .unwrap()
             .request;
@@ -1572,6 +1744,7 @@ mod tests {
                     &threaded(),
                     &decision(2, AiDifficulty::Medium),
                     &log(3),
+                    NOW_MS,
                 )
                 .unwrap();
             lose_thread(&mut memory, code);
@@ -1589,6 +1762,7 @@ mod tests {
                     &threaded(),
                     &decision(3, AiDifficulty::Medium),
                     &log(4),
+                    NOW_MS,
                 )
                 .unwrap()
                 .request;
@@ -1604,6 +1778,7 @@ mod tests {
                     &threaded(),
                     &decision(3, AiDifficulty::Medium),
                     &log(4),
+                    NOW_MS,
                 )
                 .unwrap()
                 .request;
@@ -1625,11 +1800,11 @@ mod tests {
         );
         let second = decision(2, AiDifficulty::Medium);
         let cancelled = memory
-            .decision_request(SEAT, &threaded(), &second, &log(3))
+            .decision_request(SEAT, &threaded(), &second, &log(3), NOW_MS)
             .unwrap()
             .thread_turn;
         let live = memory
-            .decision_request(SEAT, &threaded(), &second, &log(3))
+            .decision_request(SEAT, &threaded(), &second, &log(3), NOW_MS)
             .unwrap()
             .thread_turn;
         assert_ne!(cancelled, live);
@@ -1655,6 +1830,7 @@ mod tests {
                 &threaded(),
                 &decision(3, AiDifficulty::Medium),
                 &log(4),
+                NOW_MS,
             )
             .unwrap()
             .request;
@@ -1672,6 +1848,7 @@ mod tests {
                 &threaded(),
                 &decision(1, AiDifficulty::Medium),
                 &log(2),
+                NOW_MS,
             )
             .unwrap();
         let oversized = json!({
@@ -1688,6 +1865,7 @@ mod tests {
                 &threaded(),
                 &decision(2, AiDifficulty::Medium),
                 &log(3),
+                NOW_MS,
             )
             .unwrap()
             .request;
@@ -1713,6 +1891,7 @@ mod tests {
                     &threaded(),
                     &decision(2, AiDifficulty::Medium),
                     &history,
+                    NOW_MS,
                 )
                 .unwrap()
                 .request
@@ -1747,7 +1926,7 @@ mod tests {
         )
         .unwrap();
         let sent = memory
-            .decision_request(SEAT, &threaded(), &controlled, &log(3))
+            .decision_request(SEAT, &threaded(), &controlled, &log(3), NOW_MS)
             .unwrap()
             .request;
         assert_eq!(
@@ -1763,6 +1942,7 @@ mod tests {
                 &threaded(),
                 &decision(3, AiDifficulty::Medium),
                 &log(4),
+                NOW_MS,
             )
             .unwrap()
             .request;
@@ -1791,7 +1971,7 @@ mod tests {
             for revision in 1..=3 {
                 let decision = decision(revision, AiDifficulty::Medium);
                 let spec = memory
-                    .decision_request(SEAT, &config, &decision, &log(revision as u32 * 2))
+                    .decision_request(SEAT, &config, &decision, &log(revision as u32 * 2), NOW_MS)
                     .unwrap()
                     .request;
                 assert_eq!(
@@ -1819,7 +1999,13 @@ mod tests {
         );
         let off = endpoint(LlmProvider::Anthropic, DecisionContext::SelfContained);
         memory
-            .decision_request(SEAT, &off, &decision(2, AiDifficulty::Medium), &log(3))
+            .decision_request(
+                SEAT,
+                &off,
+                &decision(2, AiDifficulty::Medium),
+                &log(3),
+                NOW_MS,
+            )
             .unwrap();
         assert!(!memory.has_open_thread(SEAT));
         let back_on = memory
@@ -1828,6 +2014,7 @@ mod tests {
                 &threaded(),
                 &decision(3, AiDifficulty::Medium),
                 &log(4),
+                NOW_MS,
             )
             .unwrap()
             .request;
@@ -1839,7 +2026,7 @@ mod tests {
         let mut memory = LlmThreadMemory::new();
         let first = decision(1, AiDifficulty::Medium);
         memory
-            .decision_request(SEAT, &threaded(), &first, &log(2))
+            .decision_request(SEAT, &threaded(), &first, &log(2), NOW_MS)
             .unwrap();
         let refused = json!({
             "id": "msg_1",
@@ -1868,6 +2055,7 @@ mod tests {
                 &threaded(),
                 &decision(2, AiDifficulty::Medium),
                 &log(3),
+                NOW_MS,
             )
             .unwrap()
             .request;
@@ -1892,6 +2080,7 @@ mod tests {
                 &threaded(),
                 &decision(2, AiDifficulty::Medium),
                 &log(3),
+                NOW_MS,
             )
             .unwrap()
             .request;
