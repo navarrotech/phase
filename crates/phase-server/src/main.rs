@@ -13358,6 +13358,7 @@ mod state_transport_derived_tests {
             let logs: Vec<_> = (0..=MAX_RESOLVE_ALL_LOG_ENTRIES)
                 .map(|seq| GameLogEntry {
                     seq: seq as u32,
+                    game_number: 1,
                     turn: 1,
                     phase: Phase::PreCombatMain,
                     category: LogCategory::Game,
@@ -13399,6 +13400,7 @@ mod state_transport_derived_tests {
             let batch_logs: Vec<_> = (0..=MAX_RESOLVE_ALL_LOG_ENTRIES)
                 .map(|seq| GameLogEntry {
                     seq: seq as u32,
+                    game_number: 1,
                     turn: 1,
                     phase: Phase::PreCombatMain,
                     category: LogCategory::Game,
@@ -13409,6 +13411,7 @@ mod state_transport_derived_tests {
             let ai_logs: Vec<_> = (0..2)
                 .map(|seq| GameLogEntry {
                     seq: (100 + seq) as u32,
+                    game_number: 1,
                     turn: 1,
                     phase: Phase::PreCombatMain,
                     category: LogCategory::Game,

@@ -638,6 +638,7 @@ mod tests {
         (0..count)
             .map(|seq| GameLogEntry {
                 seq,
+                game_number: 1,
                 turn: 1,
                 phase: Phase::PreCombatMain,
                 category: LogCategory::Stack,
@@ -1268,11 +1269,18 @@ mod tests {
     }
 
     /// The client's log runs on across the games of a match, so the next
-    /// game's first decision is handed the last game's entries too. Its new
-    /// thread is created with the game in progress only.
+    /// game's first decision is handed the last game's entries too, even a
+    /// game that ended before its first turn (game one here logs only at turn
+    /// 0). Its new thread is created with the game in progress only.
     #[test]
     fn the_next_games_thread_is_created_with_that_games_history_only() {
-        let game_one = log(4);
+        let game_one: Vec<GameLogEntry> = log(4)
+            .into_iter()
+            .map(|mut entry| {
+                entry.turn = 0;
+                entry
+            })
+            .collect();
         let mut memory = LlmThreadMemory::new();
         answer(
             &mut memory,
@@ -1286,6 +1294,7 @@ mod tests {
         let mut history = game_one;
         for (seq, turn, text) in [(4, 0, "game two started"), (5, 1, "game two land")] {
             let mut entry = log(seq + 1).pop().unwrap();
+            entry.game_number = 2;
             entry.turn = turn;
             entry.segments = vec![LogSegment::Text(text.to_string())];
             history.push(entry);

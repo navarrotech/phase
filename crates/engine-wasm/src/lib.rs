@@ -5076,15 +5076,11 @@ mod restored_card_db_requirements_tests {
         clear_game_state();
     }
 
-    /// Start game 1 of a legal two-player best-of-three through the public
-    /// initializer: 60 Forests and a 15-card sideboard a seat, P0 on the play,
-    /// both seats at their mulligan decision. Returns the log as the client
-    /// accumulates it.
-    fn start_a_best_of_three() -> Vec<engine::types::log::GameLogEntry> {
+    /// The best-of-three tests' card database, installed as the engine's: one
+    /// basic Forest, legal in Standard.
+    fn install_forest_database() -> Arc<CardDatabase> {
         use engine::types::card_type::{CardType, CoreType, Supertype};
 
-        clear_game_state();
-        set_multiplayer_mode(false);
         let forest = engine::types::card::CardFace {
             name: "Forest".to_string(),
             card_type: CardType {
@@ -5098,23 +5094,37 @@ mod restored_card_db_requirements_tests {
         let mut printed = serde_json::to_value(&forest).expect("a face serializes");
         printed["legalities"] = serde_json::json!({ "standard": "legal" });
         let database = serde_json::json!({ "forest": printed }).to_string();
-        CARD_DB.with(|cell| {
-            *cell.borrow_mut() = Some(Arc::new(
-                CardDatabase::from_json_str(&database).expect("the card database loads"),
-            ));
-        });
+        let database =
+            Arc::new(CardDatabase::from_json_str(&database).expect("the card database loads"));
+        CARD_DB.with(|cell| *cell.borrow_mut() = Some(Arc::clone(&database)));
+        database
+    }
+
+    /// 60 Forests and a 15-card Forest sideboard a seat.
+    fn forest_decks() -> DeckList {
         let seat = || PlayerDeckList {
             main_deck: vec!["Forest".to_string(); 60],
             sideboard: vec!["Forest".to_string(); 15],
             ..Default::default()
         };
-        let decks = DeckList {
+        DeckList {
             player: seat(),
             opponent: seat(),
             ..Default::default()
-        };
+        }
+    }
+
+    /// Start game 1 of a legal two-player best-of-three through the public
+    /// initializer: 60 Forests and a 15-card sideboard a seat. `first_player`
+    /// is the initializer's own argument: `Some(0)` puts P0 on the play at both
+    /// seats' mulligan decision, `None` leaves the game at its CR 103.1
+    /// starting-player choice. Returns the log as the client accumulates it.
+    fn start_a_best_of_three(first_player: Option<u8>) -> Vec<engine::types::log::GameLogEntry> {
+        clear_game_state();
+        set_multiplayer_mode(false);
+        install_forest_database();
         let started = initialize_game_inner(
-            Some(Ok(decks)),
+            Some(Ok(forest_decks())),
             42,
             None,
             MatchConfig {
@@ -5122,7 +5132,7 @@ mod restored_card_db_requirements_tests {
                 ..MatchConfig::default()
             },
             2,
-            Some(0),
+            first_player,
             InitSessionKind::Local,
         )
         .expect("game 1 starts");
@@ -5171,9 +5181,8 @@ mod restored_card_db_requirements_tests {
         );
     }
 
-    /// P0 concedes game 1 during the mulligans and both seats keep their
-    /// decks, which leaves P0, who lost, to choose whether to play or draw.
-    fn end_game_one(log: &mut Vec<engine::types::log::GameLogEntry>) {
+    /// Both seats keep their decks for the next game (CR 100.4).
+    fn keep_both_decks(log: &mut Vec<engine::types::log::GameLogEntry>) {
         let unchanged = || GameAction::SubmitSideboard {
             main: vec![engine::types::match_config::DeckCardCount {
                 name: "Forest".to_string(),
@@ -5184,6 +5193,14 @@ mod restored_card_db_requirements_tests {
                 count: 15,
             }],
         };
+        submit_logged(log, PlayerId(0), unchanged());
+        submit_logged(log, PlayerId(1), unchanged());
+    }
+
+    /// P0 concedes game 1 wherever it stands (CR 104.3a) and both seats keep
+    /// their decks, which leaves P0, who lost, to choose whether to play or
+    /// draw (CR 103.1).
+    fn end_game_one(log: &mut Vec<engine::types::log::GameLogEntry>) {
         submit_logged(
             log,
             PlayerId(0),
@@ -5191,8 +5208,7 @@ mod restored_card_db_requirements_tests {
                 player_id: PlayerId(0),
             },
         );
-        submit_logged(log, PlayerId(0), unchanged());
-        submit_logged(log, PlayerId(1), unchanged());
+        keep_both_decks(log);
         let waiting_for =
             with_state(|state| state.waiting_for.clone()).expect("the game is installed");
         assert!(
@@ -5234,7 +5250,7 @@ mod restored_card_db_requirements_tests {
     #[test]
     fn the_next_game_of_a_match_starts_a_fresh_thread_with_its_own_history() {
         let seat = PlayerId(1);
-        let mut log = start_a_best_of_three();
+        let mut log = start_a_best_of_three(Some(0));
         open_a_thread_in_game_one(seat, &log);
         end_game_one(&mut log);
         let game_two_from = log.len();
@@ -5270,7 +5286,7 @@ mod restored_card_db_requirements_tests {
     #[test]
     fn the_play_draw_choice_between_games_uses_no_thread() {
         let seat = PlayerId(0);
-        let mut log = start_a_best_of_three();
+        let mut log = start_a_best_of_three(Some(0));
         open_a_thread_in_game_one(seat, &log);
         end_game_one(&mut log);
 
@@ -5306,6 +5322,208 @@ mod restored_card_db_requirements_tests {
             thread_of(&next_game),
             serde_json::json!({ "type": "create" })
         );
+
+        clear_game_state();
+    }
+
+    /// Game 1 ends at its CR 103.1 starting-player choice, where P0 concedes
+    /// (CR 104.3a), so its whole log precedes any numbered turn and only the
+    /// game each entry names keeps it out of game 2's first request. The
+    /// sibling whose game 1 reached a numbered turn is
+    /// `the_next_game_of_a_match_starts_a_fresh_thread_with_its_own_history`.
+    #[test]
+    fn a_game_conceded_at_its_starting_player_choice_stays_out_of_the_next_games_request() {
+        let mut log = start_a_best_of_three(None);
+        let waiting_for =
+            with_state(|state| state.waiting_for.clone()).expect("the game is installed");
+        assert!(
+            matches!(waiting_for, WaitingFor::ChooseStartingPlayer { .. }),
+            "game 1 rests at its starting-player choice: {waiting_for:?}"
+        );
+
+        end_game_one(&mut log);
+        let game_one = log.clone();
+        assert!(!game_one.is_empty());
+        assert!(
+            game_one.iter().all(|entry| entry.turn == 0),
+            "game 1 ended before its first turn: {game_one:?}"
+        );
+        assert!(logs_text(&game_one, "is eliminated"), "{game_one:?}");
+        assert!(logs_text(&game_one, "Game over"), "{game_one:?}");
+
+        // The loser's play/draw choice is game 1's, and so is its history.
+        let play_draw = build_llm_decision(PlayerId(0), &log);
+        assert!(
+            user_prompt_of(&play_draw).contains("Game over"),
+            "{play_draw}"
+        );
+
+        submit_logged(
+            &mut log,
+            PlayerId(0),
+            GameAction::ChoosePlayDraw { play_first: true },
+        );
+        let game_number = with_state(|state| state.game_number).expect("the game is installed");
+        assert_eq!(game_number, 2);
+
+        let next_game = build_llm_decision(PlayerId(1), &log);
+        assert_eq!(
+            thread_of(&next_game),
+            serde_json::json!({ "type": "create" })
+        );
+        let prompt = user_prompt_of(&next_game);
+        assert_eq!(prompt.matches("Game started").count(), 1, "{prompt}");
+        assert!(!prompt.contains("Game over"), "game 1 leaked: {prompt}");
+        assert!(!prompt.contains("is eliminated"), "game 1 leaked: {prompt}");
+
+        clear_game_state();
+    }
+
+    const EYE_TO_EYE: &str =
+        "You and target creature's controller have a staring contest. If you win, destroy that creature.";
+    const PLATINUM_ANGEL: &str =
+        "Flying\nYou can't lose the game and your opponents can't win the game.";
+
+    /// CR 704.3 + CR 704.5a: a host-driven contest settle runs the
+    /// state-based-action check that can end the game. Platinum Angel keeps P1
+    /// in the game at 0 life until Eye to Eye destroys it, so game 1 ends
+    /// inside the settle, whose host logs the step with the state it left as
+    /// `before` and `after` alike. Those entries are game 1's: the loser's
+    /// play/draw request reads them, and game 2's first request does not.
+    #[test]
+    fn a_game_ended_at_a_contest_settle_keeps_its_end_in_that_game() {
+        use engine::game::scenario::{GameScenario, P0, P1};
+        use engine::types::log::LogSegment;
+        use engine::types::match_config::MatchPhase;
+        use engine::types::zones::Zone;
+
+        clear_game_state();
+        set_multiplayer_mode(false);
+        let database = install_forest_database();
+
+        let mut scenario = GameScenario::new_with_format(FormatConfig::freeform(), 2, 42);
+        scenario.at_phase(Phase::PreCombatMain).with_life(P1, 0);
+        let angel = scenario
+            .add_creature_from_oracle(P1, "Platinum Angel", 4, 4, PLATINUM_ANGEL)
+            .as_artifact_creature()
+            .id();
+        let spell = scenario
+            .add_spell_to_hand_from_oracle(P0, "Eye to Eye", true, EYE_TO_EYE)
+            .id();
+
+        // A best-of-three with both seats' decks, as the initializer makes one.
+        let mut runner = scenario.build();
+        runner.state_mut().set_match_config(MatchConfig {
+            match_type: MatchType::Bo3,
+            ..MatchConfig::default()
+        });
+        load_and_hydrate_decks(
+            runner.state_mut(),
+            &resolve_deck_list(&database, &forest_decks()),
+            Some(&*database),
+        );
+        engine::game::install_card_db(runner.state_mut(), Arc::clone(&database));
+
+        runner.cast(spell).target_objects(&[angel]).resolve();
+        let mut state = runner.state().clone();
+        assert!(
+            matches!(state.waiting_for, WaitingFor::PhysicalContest { .. }),
+            "the cast parks the game on its staring contest: {:?}",
+            state.waiting_for
+        );
+
+        // The local host's ticks, as `drive_contest_js` runs them. GO is at
+        // 3000 and both deadlines at 5000; P0's click stamped 4999 is judged
+        // before the delayed tick at 5151, so only P1 has lapsed.
+        let tick = |state: &mut GameState, now: u64, clicks: Vec<ContestClickInput>| {
+            run_contest_drive(
+                state,
+                now,
+                &[],
+                &[],
+                clicks,
+                &mut phase_ai::contest::AiContestants::default(),
+                &mut ChaCha20Rng::seed_from_u64(1),
+            )
+        };
+        let mut log = Vec::new();
+        for now in [0, 3_000] {
+            keep_log(&mut log, &tick(&mut state, now, Vec::new()).log_entries);
+        }
+        let WaitingFor::PhysicalContest { contest, .. } = &state.waiting_for else {
+            panic!("the contest is running: {:?}", state.waiting_for);
+        };
+        let click = ContestClickInput {
+            contest: contest.id,
+            player: P0.0,
+            seq: 1,
+            at_ms: 4_999.0,
+        };
+        let settled = tick(&mut state, 5_151, vec![click]);
+        keep_log(&mut log, &settled.log_entries);
+
+        assert_eq!(settled.step, "Settled");
+        assert_eq!(state.match_phase, MatchPhase::BetweenGames);
+        assert_eq!(state.game_number, 2);
+        assert_ne!(state.objects[&angel].zone, Zone::Battlefield);
+        assert!(
+            settled.log_entries.iter().any(|entry| matches!(
+                entry.segments.as_slice(),
+                [LogSegment::CardName { name, .. }, LogSegment::Text(text)]
+                    if name == "Platinum Angel" && text == " is destroyed"
+            )),
+            "{:?}",
+            settled.log_entries
+        );
+        assert!(
+            logs_text(&settled.log_entries, "Game over"),
+            "{:?}",
+            settled.log_entries
+        );
+        assert!(
+            settled
+                .log_entries
+                .iter()
+                .all(|entry| entry.game_number == 1),
+            "game 1's end is logged in game 1: {:?}",
+            settled.log_entries
+        );
+
+        // The loser chooses whether to play or draw (CR 103.1), from game 1's
+        // history; game 2's first request carries none of it.
+        install_game_state(Some(state));
+        keep_both_decks(&mut log);
+        let waiting_for =
+            with_state(|state| state.waiting_for.clone()).expect("the game is installed");
+        assert!(
+            matches!(
+                waiting_for,
+                WaitingFor::BetweenGamesChoosePlayDraw {
+                    player: PlayerId(1),
+                    ..
+                }
+            ),
+            "P1, who lost game 1, chooses next: {waiting_for:?}"
+        );
+        let play_draw = build_llm_decision(PlayerId(1), &log);
+        assert!(
+            user_prompt_of(&play_draw).contains("Game over"),
+            "{play_draw}"
+        );
+
+        submit_logged(
+            &mut log,
+            PlayerId(1),
+            GameAction::ChoosePlayDraw { play_first: true },
+        );
+        let game_number = with_state(|state| state.game_number).expect("the game is installed");
+        assert_eq!(game_number, 2);
+
+        let next_game = build_llm_decision(PlayerId(1), &log);
+        let prompt = user_prompt_of(&next_game);
+        assert_eq!(prompt.matches("Game started").count(), 1, "{prompt}");
+        assert!(!prompt.contains("Game over"), "game 1 leaked: {prompt}");
+        assert!(!prompt.contains("is destroyed"), "game 1 leaked: {prompt}");
 
         clear_game_state();
     }
