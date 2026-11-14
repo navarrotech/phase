@@ -297,10 +297,11 @@ pub fn handle_game_over_transition(state: &mut GameState) {
 /// or, between games, the game that just ended.
 ///
 /// `handle_game_over_transition` numbers the next game as soon as one ends,
-/// while the board, the log and the decisions taken before the restart (the
-/// sideboarding, CR 100.4, and the loser's play/draw choice, CR 103.1) still
-/// belong to the game that ended. A match a game's end completes keeps that
-/// game's number. One a trusted forfeit completes between games
+/// while the board and the log still hold the game that ended, and the
+/// decisions taken before the restart (the sideboarding, CR 100.4, and the
+/// loser's play/draw choice, CR 103.1) are made on that position. A match a
+/// game's end completes keeps that game's number. One a trusted forfeit
+/// completes between games
 /// (`apply_trusted_match_forfeit`) keeps the number of a game that never
 /// began, but no caller logs its events and a completed match asks no
 /// decision.

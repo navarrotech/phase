@@ -2146,9 +2146,10 @@ mod tests {
     }
 
     /// CR 100.4 + CR 103.1: between games the state already numbers the next
-    /// game, while the board and the decisions taken before the restart (the
-    /// sideboarding and the loser's play/draw choice) belong to the game that
-    /// just ended. That game's history is the one such a decision reads.
+    /// game, while the board still holds the game that just ended, and the
+    /// decisions taken before the restart (the sideboarding and the loser's
+    /// play/draw choice) are made on that position. That game's history is the
+    /// one such a decision reads.
     #[test]
     fn a_decision_between_games_reads_the_game_that_just_ended() {
         let user_prompt_between_games = |game_number: u8, history: &[GameLogEntry]| {

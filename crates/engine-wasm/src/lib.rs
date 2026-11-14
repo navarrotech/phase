@@ -5351,7 +5351,8 @@ mod restored_card_db_requirements_tests {
         assert!(logs_text(&game_one, "is eliminated"), "{game_one:?}");
         assert!(logs_text(&game_one, "Game over"), "{game_one:?}");
 
-        // The loser's play/draw choice is game 1's, and so is its history.
+        // The loser's play/draw choice is made on game 1's position, so it
+        // reads game 1's history.
         let play_draw = build_llm_decision(PlayerId(0), &log);
         assert!(
             user_prompt_of(&play_draw).contains("Game over"),
