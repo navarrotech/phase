@@ -5076,6 +5076,83 @@ mod restored_card_db_requirements_tests {
         clear_game_state();
     }
 
+    /// A message thread expires five idle minutes after its last request
+    /// (Anthropic: "It expires 5 minutes after its last request"), timed on the
+    /// caller's wall clock, which the entry point hands on to the seat's thread.
+    /// A recovery thread lost at a first continue sent after that expiry has
+    /// simply expired, and the resend recovers it again. Lost sooner, the API
+    /// cannot store the conversation, and its next decision is self-contained.
+    #[test]
+    fn the_entry_point_times_a_threads_idle_expiry_on_the_callers_clock() {
+        /// Anthropic's idle expiry for a message thread.
+        const IDLE_EXPIRY_MS: u64 = 5 * 60 * 1000;
+        let seat = PlayerId(1);
+        install_llm_decision(seat);
+        let choice = non_pass_choice(seat);
+        let build_at = |now_ms: u64| {
+            build_llm_decision_request_inner("Medium", seat.0, THREADED_ENDPOINT, "[]", now_ms)
+                .expect("the decision request builds")
+        };
+        let lost = serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": "not_found_error",
+                "message": "thread: not found",
+                "details": { "error_code": "thread_not_found" },
+            },
+        });
+
+        // The seat's thread is lost, and a create at 1 000 ms recovers it.
+        let first = build_at(0);
+        resolve_llm_reply(seat, &first, 200, &anthropic_reply("msg_1", choice));
+        let second = build_at(500);
+        resolve_llm_reply(seat, &second, 404, &lost);
+        let recovery = build_at(1_000);
+        assert_eq!(
+            thread_of(&recovery),
+            serde_json::json!({ "type": "create" })
+        );
+        resolve_llm_reply(seat, &recovery, 200, &anthropic_reply("msg_2", choice));
+
+        // Its first continue goes out once the recovery has idled past the
+        // expiry, and is lost: an ordinary expiry, recovered again.
+        let after_expiry = 1_000 + IDLE_EXPIRY_MS;
+        let continued = build_at(after_expiry);
+        assert_eq!(
+            thread_of(&continued),
+            serde_json::json!({ "type": "continue", "previous_message_id": "msg_2" })
+        );
+        resolve_llm_reply(seat, &continued, 404, &lost);
+        let recovered_again = build_at(after_expiry);
+        assert_eq!(
+            thread_of(&recovered_again),
+            serde_json::json!({ "type": "create" })
+        );
+
+        // That recovery's first continue is lost a moment later, within the
+        // expiry: the conversation is one the API cannot store.
+        resolve_llm_reply(
+            seat,
+            &recovered_again,
+            200,
+            &anthropic_reply("msg_3", choice),
+        );
+        let soon_after = build_at(after_expiry + 1);
+        assert_eq!(
+            thread_of(&soon_after),
+            serde_json::json!({ "type": "continue", "previous_message_id": "msg_3" })
+        );
+        resolve_llm_reply(seat, &soon_after, 404, &lost);
+        let self_contained = build_at(after_expiry + 1);
+        assert!(
+            self_contained["request"].is_object(),
+            "a request is built: {self_contained}"
+        );
+        assert_eq!(thread_of(&self_contained), serde_json::Value::Null);
+
+        clear_game_state();
+    }
+
     /// The best-of-three tests' card database, installed as the engine's: one
     /// basic Forest, legal in Standard.
     fn install_forest_database() -> Arc<CardDatabase> {
